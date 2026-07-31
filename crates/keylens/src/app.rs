@@ -4,18 +4,25 @@ use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
 use keylens_conn::{
     ClientInfo, ClusterTopology, KeyMeta, KeyValue, Kind, PubSubChannel, ServerInfo, SlowEntry,
 };
+use keylens_bullmq::{JobRef, QueueSummary, State, Throughput};
+use keylens_lens::Detection;
 use keylens_ui::KeyTree;
 use keylens_ui::tree::Row;
 use keylens_ui::PaneState;
 use ratatui::widgets::ListState;
 use tokio::sync::mpsc::Sender;
 
-use crate::worker::{Request, Update};
+use crate::worker::{JobDetail, Request, Update};
 
 /// The top-level tabs.
+///
+/// [`View::Queues`] only appears once a lens has detected a queue system. That is the
+/// lens idea showing up in the chrome: keylens grows a tab because of what's *in* your
+/// keyspace, not because someone turned a feature flag on.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum View {
     Keys,
+    Queues,
     Stats,
     Slowlog,
     Clients,
@@ -24,12 +31,20 @@ pub enum View {
 }
 
 impl View {
-    pub const ALL: [View; 6] =
-        [View::Keys, View::Stats, View::Slowlog, View::Clients, View::Cluster, View::PubSub];
+    pub const ALL: [View; 7] = [
+        View::Keys,
+        View::Queues,
+        View::Stats,
+        View::Slowlog,
+        View::Clients,
+        View::Cluster,
+        View::PubSub,
+    ];
 
     pub fn label(&self) -> &'static str {
         match self {
             View::Keys => "keys",
+            View::Queues => "queues",
             View::Stats => "stats",
             View::Slowlog => "slowlog",
             View::Clients => "clients",
@@ -37,22 +52,14 @@ impl View {
             View::PubSub => "pubsub",
         }
     }
+}
 
-    /// Digit that selects this view.
-    pub fn digit(&self) -> char {
-        match self {
-            View::Keys => '1',
-            View::Stats => '2',
-            View::Slowlog => '3',
-            View::Clients => '4',
-            View::Cluster => '5',
-            View::PubSub => '6',
-        }
-    }
-
-    pub fn from_digit(c: char) -> Option<View> {
-        View::ALL.into_iter().find(|v| v.digit() == c)
-    }
+/// How deep into the queue view we are.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum QueueLevel {
+    Queues,
+    Jobs,
+    Job,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -108,6 +115,18 @@ pub struct App {
     pub cluster: PaneState<Box<ClusterTopology>>,
     pub pubsub: PaneState<Vec<PubSubChannel>>,
 
+    /// Lenses that matched this keyspace. Non-empty is what makes the queues tab appear.
+    pub detections: Vec<Detection>,
+    pub level: QueueLevel,
+    pub queues: PaneState<Vec<QueueSummary>>,
+    pub queue_selected: usize,
+    pub job_state: State,
+    pub jobs: PaneState<Vec<JobRef>>,
+    pub job_selected: usize,
+    pub job: PaneState<Option<Box<JobDetail>>>,
+    /// Live per-queue throughput, fed by the events-stream reader.
+    pub throughput: Throughput,
+
     pub server: ServerInfo,
     pub url: String,
     pub status: String,
@@ -143,6 +162,16 @@ impl App {
             clients: PaneState::Idle,
             cluster: PaneState::Idle,
             pubsub: PaneState::Idle,
+            detections: Vec::new(),
+            level: QueueLevel::Queues,
+            queues: PaneState::Idle,
+            queue_selected: 0,
+            // Failed is the state people open a queue dashboard to look at.
+            job_state: State::Failed,
+            jobs: PaneState::Idle,
+            job_selected: 0,
+            job: PaneState::Idle,
+            throughput: Throughput::default(),
             server,
             url,
             // The connection is already established by the time the TUI starts, so the
@@ -229,7 +258,63 @@ impl App {
             Update::Clients(s) => self.clients = s,
             Update::Cluster(s) => self.cluster = s,
             Update::PubSub(s) => self.pubsub = s,
+
+            Update::Detected(d) => self.detections = d,
+            Update::EventsAttached => self.throughput.attached = true,
+            Update::Events(events) => {
+                for e in events {
+                    self.throughput.record(&e.queue, e.kind, e.at_ms);
+                }
+            }
+            Update::Queues(s) => {
+                if let Some(list) = s.ready() {
+                    self.queue_selected = self.queue_selected.min(list.len().saturating_sub(1));
+                }
+                self.queues = s;
+            }
+            Update::Jobs { state, data } => {
+                // Ignore a page for a state the user has already cycled away from.
+                if state == self.job_state {
+                    if let Some(list) = data.ready() {
+                        self.job_selected = self.job_selected.min(list.len().saturating_sub(1));
+                    }
+                    self.jobs = data;
+                }
+            }
+            Update::Job(s) => self.job = s,
         }
+    }
+
+    /// The tabs currently on offer.
+    ///
+    /// `queues` is present only when a lens matched, so a plain cache server never shows a
+    /// queue tab it can't fill.
+    pub fn views(&self) -> Vec<View> {
+        View::ALL
+            .into_iter()
+            .filter(|v| *v != View::Queues || !self.detections.is_empty())
+            .collect()
+    }
+
+    /// Digits are assigned by position, so they stay contiguous whether or not the queues
+    /// tab exists.
+    pub fn digit_for(&self, view: View) -> Option<char> {
+        let idx = self.views().iter().position(|v| *v == view)?;
+        char::from_digit(idx as u32 + 1, 10)
+    }
+
+    fn view_from_digit(&self, c: char) -> Option<View> {
+        let idx = c.to_digit(10)?.checked_sub(1)? as usize;
+        self.views().get(idx).copied()
+    }
+
+    /// The queue the cursor is on.
+    pub fn selected_queue(&self) -> Option<&QueueSummary> {
+        self.queues.ready()?.get(self.queue_selected)
+    }
+
+    pub fn selected_job(&self) -> Option<&JobRef> {
+        self.jobs.ready()?.get(self.job_selected)
     }
 
     /// Switch tabs, loading the target pane the first time it's opened.
@@ -281,7 +366,116 @@ impl App {
                     self.send(Request::LoadPubSub).await;
                 }
             }
+            View::Queues => match self.level {
+                QueueLevel::Queues => {
+                    if force || self.queues.is_idle() {
+                        self.queues = PaneState::Loading;
+                        self.send(Request::LoadQueues).await;
+                    }
+                }
+                QueueLevel::Jobs => self.load_jobs().await,
+                QueueLevel::Job => self.load_job().await,
+            },
         }
+    }
+
+    async fn load_jobs(&mut self) {
+        let Some(queue) = self.selected_queue().map(|q| q.name.clone()) else { return };
+        self.jobs = PaneState::Loading;
+        let state = self.job_state;
+        self.send(Request::LoadJobs { queue, state, offset: 0 }).await;
+    }
+
+    async fn load_job(&mut self) {
+        let Some(queue) = self.selected_queue().map(|q| q.name.clone()) else { return };
+        let Some(id) = self.selected_job().map(|j| j.id.clone()) else { return };
+        self.job = PaneState::Loading;
+        self.send(Request::LoadJob { queue, id }).await;
+    }
+
+    async fn handle_queues_key(&mut self, key: KeyEvent) {
+        match key.code {
+            KeyCode::Down | KeyCode::Char('j') => self.move_queue_cursor(1),
+            KeyCode::Up | KeyCode::Char('k') => self.move_queue_cursor(-1),
+            KeyCode::PageDown => self.move_queue_cursor(10),
+            KeyCode::PageUp => self.move_queue_cursor(-10),
+            KeyCode::Home | KeyCode::Char('g') => self.move_queue_cursor(isize::MIN / 2),
+            KeyCode::End | KeyCode::Char('G') => self.move_queue_cursor(isize::MAX / 2),
+
+            // Cycle which state's jobs are listed. Bracket keys because h/l are already
+            // in/out navigation and arrows would be ambiguous here.
+            KeyCode::Char('[') | KeyCode::Char(']') => {
+                if self.level != QueueLevel::Queues {
+                    let delta: isize = if key.code == KeyCode::Char(']') { 1 } else { -1 };
+                    let i = State::ALL.iter().position(|s| *s == self.job_state).unwrap_or(0);
+                    let next = (i as isize + delta).rem_euclid(State::ALL.len() as isize) as usize;
+                    self.job_state = State::ALL[next];
+                    self.job_selected = 0;
+                    self.level = QueueLevel::Jobs;
+                    self.load_jobs().await;
+                }
+            }
+
+            KeyCode::Enter | KeyCode::Char(' ') | KeyCode::Right | KeyCode::Char('l') => {
+                match self.level {
+                    QueueLevel::Queues => {
+                        if self.selected_queue().is_some() {
+                            self.level = QueueLevel::Jobs;
+                            self.job_selected = 0;
+                            self.load_jobs().await;
+                        }
+                    }
+                    QueueLevel::Jobs => {
+                        if self.selected_job().is_some() {
+                            self.level = QueueLevel::Job;
+                            self.pane_scroll = 0;
+                            self.load_job().await;
+                        }
+                    }
+                    QueueLevel::Job => {}
+                }
+            }
+
+            KeyCode::Esc | KeyCode::Left | KeyCode::Char('h') => match self.level {
+                QueueLevel::Job => {
+                    self.level = QueueLevel::Jobs;
+                    self.pane_scroll = 0;
+                }
+                QueueLevel::Jobs => {
+                    self.level = QueueLevel::Queues;
+                    self.pane_scroll = 0;
+                }
+                QueueLevel::Queues => {}
+            },
+
+            _ => {}
+        }
+    }
+
+    fn move_queue_cursor(&mut self, delta: isize) {
+        let (len, cursor) = match self.level {
+            QueueLevel::Queues => {
+                (self.queues.ready().map(|q| q.len()).unwrap_or(0), &mut self.queue_selected)
+            }
+            QueueLevel::Jobs => {
+                (self.jobs.ready().map(|j| j.len()).unwrap_or(0), &mut self.job_selected)
+            }
+            // The job detail is scrolled, not stepped through.
+            QueueLevel::Job => {
+                self.pane_scroll = if delta > 0 {
+                    self.pane_scroll.saturating_add(delta.min(20) as u16)
+                } else {
+                    self.pane_scroll.saturating_sub((-delta).min(20) as u16)
+                };
+                return;
+            }
+        };
+
+        if len == 0 {
+            return;
+        }
+        let last = (len - 1) as isize;
+        *cursor = (*cursor as isize).saturating_add(delta).clamp(0, last) as usize;
     }
 
     async fn send(&mut self, req: Request) {
@@ -370,7 +564,7 @@ impl App {
                 return;
             }
             KeyCode::Char(c) if c.is_ascii_digit() => {
-                if let Some(view) = View::from_digit(c) {
+                if let Some(view) = self.view_from_digit(c) {
                     self.goto(view).await;
                 }
                 return;
@@ -382,12 +576,11 @@ impl App {
             _ => {}
         }
 
-        if self.view != View::Keys {
-            self.handle_pane_key(key);
-            return;
+        match self.view {
+            View::Keys => self.handle_keys_view_key(key).await,
+            View::Queues => self.handle_queues_key(key).await,
+            _ => self.handle_pane_key(key),
         }
-
-        self.handle_keys_view_key(key).await;
     }
 
     /// Scrolling for the server panes, which are plain scrollable text.
@@ -722,6 +915,137 @@ mod tests {
         a.pane_scroll = 42;
         a.goto(View::Cluster).await;
         assert_eq!(a.pane_scroll, 0);
+    }
+
+    fn detection() -> Detection {
+        Detection {
+            lens_id: "bullmq",
+            confidence: keylens_lens::Confidence::Certain,
+            version: Some("6.0.2".into()),
+            prefix: "bull".into(),
+            summary: "bullmq 6.0.2 - 2 queues".into(),
+            targets: vec!["emails".into(), "reports".into()],
+        }
+    }
+
+    fn summary(name: &str, paused: bool) -> QueueSummary {
+        QueueSummary {
+            name: name.into(),
+            paused,
+            counts: State::ALL.iter().map(|s| (*s, 3)).collect(),
+        }
+    }
+
+    #[test]
+    fn queues_tab_appears_only_once_a_lens_matches() {
+        let mut a = app();
+        assert!(!a.views().contains(&View::Queues), "no lens, no queue tab");
+        assert_eq!(a.digit_for(View::Stats), Some('2'));
+
+        a.apply(Update::Detected(vec![detection()]));
+        assert!(a.views().contains(&View::Queues));
+        // Digits stay contiguous: stats shifts along rather than leaving a gap.
+        assert_eq!(a.digit_for(View::Queues), Some('2'));
+        assert_eq!(a.digit_for(View::Stats), Some('3'));
+    }
+
+    #[tokio::test]
+    async fn digits_follow_the_visible_tabs_not_the_enum() {
+        let mut a = app();
+        // Without a lens, `2` is stats.
+        a.handle_normal_key(KeyEvent::from(KeyCode::Char('2'))).await;
+        assert_eq!(a.view, View::Stats);
+
+        a.apply(Update::Detected(vec![detection()]));
+        a.handle_normal_key(KeyEvent::from(KeyCode::Char('2'))).await;
+        assert_eq!(a.view, View::Queues, "the same digit now means queues");
+    }
+
+    #[tokio::test]
+    async fn drilling_in_and_back_out_walks_the_levels() {
+        let mut a = app();
+        a.apply(Update::Detected(vec![detection()]));
+        a.view = View::Queues;
+        a.apply(Update::Queues(PaneState::Ready(vec![summary("emails", false)])));
+        assert_eq!(a.level, QueueLevel::Queues);
+
+        a.handle_queues_key(KeyEvent::from(KeyCode::Enter)).await;
+        assert_eq!(a.level, QueueLevel::Jobs);
+
+        a.apply(Update::Jobs {
+            state: a.job_state,
+            data: PaneState::Ready(vec![JobRef { id: "42".into(), score: Some(1.0) }]),
+        });
+        a.handle_queues_key(KeyEvent::from(KeyCode::Enter)).await;
+        assert_eq!(a.level, QueueLevel::Job);
+
+        a.handle_queues_key(KeyEvent::from(KeyCode::Esc)).await;
+        assert_eq!(a.level, QueueLevel::Jobs);
+        a.handle_queues_key(KeyEvent::from(KeyCode::Esc)).await;
+        assert_eq!(a.level, QueueLevel::Queues);
+        // Already at the top: further backing out is a no-op, not an underflow.
+        a.handle_queues_key(KeyEvent::from(KeyCode::Esc)).await;
+        assert_eq!(a.level, QueueLevel::Queues);
+    }
+
+    #[tokio::test]
+    async fn cannot_drill_into_an_empty_queue_list() {
+        let mut a = app();
+        a.view = View::Queues;
+        a.apply(Update::Queues(PaneState::Ready(vec![])));
+        a.handle_queues_key(KeyEvent::from(KeyCode::Enter)).await;
+        assert_eq!(a.level, QueueLevel::Queues, "nothing selected, nothing to open");
+    }
+
+    #[tokio::test]
+    async fn bracket_keys_cycle_job_state_and_wrap() {
+        let mut a = app();
+        a.view = View::Queues;
+        a.apply(Update::Queues(PaneState::Ready(vec![summary("emails", false)])));
+        a.level = QueueLevel::Jobs;
+        assert_eq!(a.job_state, State::Failed);
+
+        // Failed is last in the ordering, so forward wraps to the first.
+        a.handle_queues_key(KeyEvent::from(KeyCode::Char(']'))).await;
+        assert_eq!(a.job_state, State::Waiting);
+        a.handle_queues_key(KeyEvent::from(KeyCode::Char('['))).await;
+        assert_eq!(a.job_state, State::Failed);
+    }
+
+    #[tokio::test]
+    async fn state_cycling_does_nothing_at_the_queue_list_level() {
+        let mut a = app();
+        a.view = View::Queues;
+        a.apply(Update::Queues(PaneState::Ready(vec![summary("emails", false)])));
+        a.handle_queues_key(KeyEvent::from(KeyCode::Char(']'))).await;
+        assert_eq!(a.job_state, State::Failed, "no job list open to re-filter");
+        assert_eq!(a.level, QueueLevel::Queues);
+    }
+
+    #[test]
+    fn job_pages_for_a_stale_state_are_dropped() {
+        // Cycling states faster than the server answers must not paint the old page under
+        // the new heading.
+        let mut a = app();
+        a.job_state = State::Waiting;
+        a.apply(Update::Jobs {
+            state: State::Failed,
+            data: PaneState::Ready(vec![JobRef { id: "stale".into(), score: None }]),
+        });
+        assert!(a.jobs.ready().is_none(), "reply for `failed` must not render under `waiting`");
+    }
+
+    #[test]
+    fn a_shrinking_queue_list_clamps_the_cursor() {
+        let mut a = app();
+        a.apply(Update::Queues(PaneState::Ready(vec![
+            summary("a", false),
+            summary("b", false),
+            summary("c", false),
+        ])));
+        a.queue_selected = 2;
+        a.apply(Update::Queues(PaneState::Ready(vec![summary("a", false)])));
+        assert_eq!(a.queue_selected, 0, "cursor must not point past the end");
     }
 
     #[tokio::test]

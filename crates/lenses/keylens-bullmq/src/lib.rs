@@ -11,8 +11,12 @@
 //! ported Lua scripts -- composing `ZREM` + `LPUSH` by hand corrupts queues under
 //! concurrent workers.
 
+pub mod events;
+pub mod job;
 pub mod keys;
 pub mod lens;
 
+pub use events::{EventKind, Throughput};
+pub use job::{Job, JobRef};
 pub use keys::{QueueKeys, State};
 pub use lens::{BullMqLens, QueueSummary};

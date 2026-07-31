@@ -11,7 +11,7 @@ use ratatui::text::{Line, Span};
 use ratatui::widgets::{Block, BorderType, Clear, List, ListItem, Paragraph, Wrap};
 
 use crate::app::{App, Focus, Mode, View};
-use crate::panes;
+use crate::{panes, queues};
 
 pub fn draw(frame: &mut Frame, app: &mut App) {
     if app.splash {
@@ -108,10 +108,11 @@ fn draw_status(frame: &mut Frame, app: &App, area: Rect) {
 
 fn draw_tabs(frame: &mut Frame, app: &App, area: Rect) {
     let mut spans = vec![Span::raw(" ")];
-    for view in View::ALL {
+    // Tabs are whatever this keyspace earned: `queues` shows up only once a lens matched.
+    for (i, view) in app.views().into_iter().enumerate() {
         let active = view == app.view;
         spans.push(Span::styled(
-            format!(" {} {} ", view.digit(), view.label()),
+            format!(" {} {} ", i + 1, view.label()),
             if active { Theme::tab_active() } else { Theme::tab_inactive() },
         ));
         spans.push(Span::raw(" "));
@@ -120,17 +121,19 @@ fn draw_tabs(frame: &mut Frame, app: &App, area: Rect) {
 }
 
 fn draw_server_pane(frame: &mut Frame, app: &App, area: Rect, view: View) {
-    let lines = match view {
-        View::Stats => panes::stats(&app.server, area.width),
-        View::Slowlog => panes::slowlog(app),
-        View::Clients => panes::clients(app),
-        View::Cluster => panes::cluster(app),
-        View::PubSub => panes::pubsub(app),
+    let (title, lines) = match view {
+        View::Stats => (view.label().to_string(), panes::stats(&app.server, area.width)),
+        View::Slowlog => (view.label().to_string(), panes::slowlog(app)),
+        View::Clients => (view.label().to_string(), panes::clients(app)),
+        View::Cluster => (view.label().to_string(), panes::cluster(app)),
+        View::PubSub => (view.label().to_string(), panes::pubsub(app)),
+        // -2 for the panel border.
+        View::Queues => (queues::title(app), queues::render(app, area.width.saturating_sub(2))),
         View::Keys => unreachable!("the keys view has its own split layout"),
     };
 
     frame.render_widget(
-        Paragraph::new(lines).block(Theme::panel(view.label(), true)).scroll((app.pane_scroll, 0)),
+        Paragraph::new(lines).block(Theme::panel(&title, true)).scroll((app.pane_scroll, 0)),
         area,
     );
 }
@@ -353,10 +356,20 @@ fn draw_hint(frame: &mut Frame, app: &App, area: Rect) {
             ("?", "help"),
             ("q", "quit"),
         ],
+        _ if app.view == View::Queues => &[
+            ("j/k", "move"),
+            ("↵", "open"),
+            ("h", "back"),
+            ("[/]", "state"),
+            ("r", "reload"),
+            ("1-7", "view"),
+            ("?", "help"),
+            ("q", "quit"),
+        ],
         _ => &[
             ("j/k", "scroll"),
             ("r", "reload"),
-            ("1-6", "view"),
+            ("1-7", "view"),
             ("?", "help"),
             ("q", "quit"),
         ],
@@ -386,8 +399,9 @@ fn draw_hint(frame: &mut Frame, app: &App, area: Rect) {
 
 fn draw_help(frame: &mut Frame, area: Rect) {
     let rows = [
-        ("1 - 6", "switch view"),
+        ("1 - 7", "switch view"),
         ("r", "reload the current view"),
+        ("[ / ]", "queues: cycle job state"),
         ("j / k, ↓ / ↑", "move or scroll"),
         ("g / G", "top / bottom"),
         ("enter, space, →", "expand branch or open key"),

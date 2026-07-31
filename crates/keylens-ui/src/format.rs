@@ -30,6 +30,17 @@ pub fn ttl(ms: Option<i64>) -> String {
     if out.is_empty() { format!("{secs}s") } else { out }
 }
 
+/// Relative time between two millisecond timestamps.
+///
+/// A raw epoch is unreadable and an absolute clock time makes you do the subtraction
+/// yourself; "3m ago" is the thing you actually wanted to know. Future timestamps read as
+/// "in 3m", which is what `delayed` jobs need.
+pub fn ago(timestamp_ms: i64, now_ms: i64) -> String {
+    let delta = now_ms - timestamp_ms;
+    let magnitude = ttl(Some(delta.abs()));
+    if delta >= 0 { format!("{magnitude} ago") } else { format!("in {magnitude}") }
+}
+
 pub fn bytes(n: Option<u64>) -> String {
     match n {
         Some(n) => bytesize::ByteSize(n).to_string(),
@@ -81,6 +92,34 @@ pub fn single_line(s: &str) -> String {
     s.replace(['\n', '\r'], " ")
 }
 
+/// Eight levels of vertical block, plus a blank for "no data".
+const SPARK_LEVELS: [char; 8] = ['▁', '▂', '▃', '▄', '▅', '▆', '▇', '█'];
+
+/// A unicode sparkline over `values`, scaled to the largest value present.
+///
+/// Scaling is per-series and relative, which is the point: the question a throughput graph
+/// answers is "is this queue spiking *right now*", not "how does it compare to a fixed
+/// axis". A flat series renders flat rather than maxed out.
+pub fn sparkline(values: &[u64]) -> String {
+    let max = values.iter().copied().max().unwrap_or(0);
+    if max == 0 {
+        // All-zero is a real state and must not render as a full bar.
+        return "·".repeat(values.len());
+    }
+
+    values
+        .iter()
+        .map(|v| {
+            if *v == 0 {
+                return '·';
+            }
+            // -1 so the max lands on the top level rather than overflowing the index.
+            let idx = ((*v as f64 / max as f64) * (SPARK_LEVELS.len() - 1) as f64).round() as usize;
+            SPARK_LEVELS[idx.min(SPARK_LEVELS.len() - 1)]
+        })
+        .collect()
+}
+
 /// A text meter, e.g. `████████░░░░░░░░`.
 ///
 /// `fraction` is clamped: a `used_memory` above `maxmemory` is a real state Redis can be
@@ -112,6 +151,16 @@ mod tests {
     }
 
     #[test]
+    fn relative_time_reads_forwards_and_backwards() {
+        let now = 1_785_515_393_000_i64;
+        assert_eq!(ago(now - 5_000, now), "5s ago");
+        assert_eq!(ago(now - 180_000, now), "3m ago");
+        assert_eq!(ago(now - 7_200_000, now), "2h ago");
+        // Delayed jobs are scheduled for the future.
+        assert_eq!(ago(now + 180_000, now), "in 3m");
+    }
+
+    #[test]
     fn counts_get_separators() {
         assert_eq!(count(0), "0");
         assert_eq!(count(999), "999");
@@ -139,6 +188,33 @@ mod tests {
     #[test]
     fn single_line_flattens() {
         assert_eq!(single_line("a\nb\r\nc"), "a b  c");
+    }
+
+    #[test]
+    fn sparkline_is_one_cell_per_value() {
+        assert_eq!(sparkline(&[1, 2, 3]).chars().count(), 3);
+        assert_eq!(sparkline(&[]).chars().count(), 0);
+    }
+
+    #[test]
+    fn an_idle_series_is_not_a_full_bar() {
+        // Scaling to a zero max would divide by zero or paint every cell solid; an idle
+        // queue must look idle.
+        assert_eq!(sparkline(&[0, 0, 0]), "···");
+    }
+
+    #[test]
+    fn sparkline_scales_to_the_series_maximum() {
+        let s: Vec<char> = sparkline(&[0, 1, 10]).chars().collect();
+        assert_eq!(s[0], '·', "zero is a gap, not a low bar");
+        assert_eq!(s[2], '█', "the max reaches the top level");
+        assert!(s[1] < s[2], "a smaller value renders lower");
+    }
+
+    #[test]
+    fn a_flat_nonzero_series_renders_flat() {
+        let s = sparkline(&[5, 5, 5]);
+        assert!(s.chars().all(|c| c == '█'), "got {s}");
     }
 
     #[test]

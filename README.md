@@ -51,6 +51,53 @@ Six views, switched with `1`–`6`:
  j/k move  ↵ open  / filter  t type  m more  r rescan  1-6 view  ? help  q quit
 ```
 
+The **queues** tab only exists when a lens matched — keylens grows a tab because of what's
+in your keyspace, not because a flag was flipped. The sparklines are **live**, driven by
+BullMQ's events stream rather than by polling:
+
+```
+╭ queues — bullmq 6.0.2 - 5 queues ────────────────────────────────────────────────────────╮
+│  queue             status       wait   active     done   failed  last 8s            ev/s│
+│                                                                                          │
+│▶ emails            running         0        0      300       56  █▄▅▅·▄▇·            8.5│
+│  exports           running         0        0      300       69  ▆▇▃▅█▅▅·           11.9│
+│  image-processing  running         0        2      300      500  ▃▇▄▇▆▄█▂           10.8│
+│  reports           paused      6,389        0      300      146  ·█▇▄▃▅▄·            4.9│
+│                                                                                          │
+│  5 queues, 1 paused   ● live · 44.1 events/sec across all queues                        │
+╰──────────────────────────────────────────────────────────────────────────────────────────╯
+```
+
+BullBoard polls `getJobCounts` on a timer, which is why its graphs are coarse. BullMQ
+already writes every state transition to a Redis STREAM, so **one blocking `XREAD` across
+every queue** gives event-level throughput at sub-second resolution and near-zero server
+load. The graph moves the instant a job fails.
+
+Narrow panes drop columns deliberately — least useful first — rather than clipping the
+graph off the right-hand edge.
+
+Drill in for the failed job, and you get the trace for **each attempt**:
+
+```
+╭ job 7012 ──────────────────────────────────────────────────────────────────────────╮
+│  7012  image-processing                                                            │
+│  attempts      2/2                                                                 │
+│  waited        1s                                                                  │
+│  ran for       378ms                                                               │
+│                                                                                    │
+│ ▌failure                                                                           │
+│  offset is out of bounds: requested 16384, buffer length 1024                       │
+│                                                                                    │
+│  attempt 1                                                                         │
+│  RangeError: offset is out of bounds: requested 16384, buffer length 1024           │
+│      at decodeFrame (file:///app/producer.mjs:59:9)                                │
+│      at resizeImage (file:///app/producer.mjs:65:10)                               │
+╰────────────────────────────────────────────────────────────────────────────────────╯
+```
+
+Queue counts are one pipelined round trip for the whole table, not eight commands per
+queue — the difference between instant and twenty seconds on a remote server.
+
 The stats view is an `INFO` dashboard with meters — no extra commands, and the meters only
 appear when there's a real denominator (a memory bar means nothing without `maxmemory`):
 

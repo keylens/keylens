@@ -4,6 +4,7 @@ use keylens_conn::Conn;
 use keylens_lens::{Confidence, Detection, Lens, Result};
 use tracing::debug;
 
+use crate::job::{self, Job, JobRef};
 use crate::keys::{
     is_paused, parse_meta_version, queue_name_from_meta_key, QueueKeys, State,
 };
@@ -102,31 +103,160 @@ impl BullMqLens {
     }
 
     /// Per-state counts for one queue.
-    ///
-    /// Sequential for now -- M4 should batch these into a pipeline, since this is
-    /// 7 round trips per queue and the queue list refreshes on a tick.
     pub async fn queue_summary(&self, conn: &Conn, name: &str) -> Result<QueueSummary> {
-        let keys = QueueKeys::new(&self.prefix, name);
-        let (_, paused) = self.read_meta(conn, name).await?;
+        Ok(self
+            .summaries(conn, std::slice::from_ref(&name.to_string()))
+            .await?
+            .pop()
+            .unwrap_or_else(|| QueueSummary {
+                name: name.to_string(),
+                paused: false,
+                counts: Vec::new(),
+            }))
+    }
 
-        let mut counts = Vec::with_capacity(State::ALL.len());
-        for state in State::ALL {
-            let reply = conn.cmd(state.count_cmd(), vec![Value::from(keys.state(state))]).await?;
-            // A missing key counts as zero; only a genuinely odd reply is worth flagging.
-            let n = reply.as_u64().unwrap_or(0);
-            counts.push((state, n));
+    /// Counts and paused state for many queues in a single round trip.
+    ///
+    /// Sequentially this is 8 commands per queue; on a queue system with 40 queues and a
+    /// server 60ms away that's 20 seconds for one refresh. The queue list refreshes on a
+    /// tick, so it has to be one pipeline.
+    async fn summaries(&self, conn: &Conn, names: &[String]) -> Result<Vec<QueueSummary>> {
+        if names.is_empty() {
+            return Ok(Vec::new());
         }
 
-        Ok(QueueSummary { name: name.to_string(), paused, counts })
+        // Per queue: one HMGET for meta, then one count per state. Order is what maps the
+        // flat reply list back onto queues, so it must match exactly on the way out.
+        const PER_QUEUE: usize = 1 + State::ALL.len();
+        let mut cmds: Vec<(&'static str, Vec<Value>)> = Vec::with_capacity(names.len() * PER_QUEUE);
+
+        for name in names {
+            let keys = QueueKeys::new(&self.prefix, name);
+            cmds.push((
+                "HMGET",
+                vec![Value::from(keys.meta()), Value::from("version"), Value::from("paused")],
+            ));
+            for state in State::ALL {
+                cmds.push((state.count_cmd(), vec![Value::from(keys.state(state))]));
+            }
+        }
+
+        let replies = conn.pipeline(&cmds).await?;
+
+        Ok(names
+            .iter()
+            .enumerate()
+            .map(|(i, name)| {
+                let base = i * PER_QUEUE;
+
+                let paused = match replies.get(base) {
+                    Some(Value::Array(fields)) => {
+                        is_paused(fields.get(1).and_then(|v| v.as_string()).as_deref())
+                    }
+                    _ => false,
+                };
+
+                let counts = State::ALL
+                    .iter()
+                    .enumerate()
+                    .map(|(j, state)| {
+                        let n = replies.get(base + 1 + j).and_then(|v| v.as_u64()).unwrap_or(0);
+                        (*state, n)
+                    })
+                    .collect();
+
+                QueueSummary { name: name.clone(), paused, counts }
+            })
+            .collect())
     }
 
     pub async fn all_queues(&self, conn: &Conn) -> Result<Vec<QueueSummary>> {
         let names = self.scan_meta_keys(conn).await?;
-        let mut out = Vec::with_capacity(names.len());
-        for name in names {
-            out.push(self.queue_summary(conn, &name).await?);
+        self.summaries(conn, &names).await
+    }
+
+    /// A page of job ids from one state.
+    ///
+    /// List-backed states (`wait`, `active`) use `LRANGE`; the rest are ZSETs and carry a
+    /// score worth showing -- finish time for `completed`/`failed`, due time for `delayed`.
+    pub async fn jobs(
+        &self,
+        conn: &Conn,
+        queue: &str,
+        state: State,
+        offset: usize,
+        limit: usize,
+    ) -> Result<Vec<JobRef>> {
+        let keys = QueueKeys::new(&self.prefix, queue);
+        let key = keys.state(state);
+        let start = offset as i64;
+        let stop = start + limit as i64 - 1;
+
+        let reply = match state.count_cmd() {
+            "LLEN" => conn.cmd("LRANGE", vec![key.into(), start.into(), stop.into()]).await?,
+            _ => {
+                conn.cmd(
+                    // Newest first: for completed and failed, the recent end is the one
+                    // anyone actually wants to look at.
+                    "ZREVRANGE",
+                    vec![key.into(), start.into(), stop.into(), "WITHSCORES".into()],
+                )
+                .await?
+            }
+        };
+
+        let Value::Array(items) = reply else { return Ok(Vec::new()) };
+
+        Ok(match state.count_cmd() {
+            "LLEN" => items
+                .iter()
+                .filter_map(|v| v.as_string())
+                .map(|id| JobRef { id, score: None })
+                .collect(),
+            _ => items
+                .chunks_exact(2)
+                .filter_map(|c| {
+                    c[0].as_string().map(|id| JobRef { id, score: c[1].as_f64() })
+                })
+                .collect(),
+        })
+    }
+
+    /// One job's fields. Returns `None` when the job has been removed, which happens
+    /// constantly on a live queue with retention configured.
+    pub async fn job(&self, conn: &Conn, queue: &str, id: &str) -> Result<Option<Job>> {
+        let keys = QueueKeys::new(&self.prefix, queue);
+        let mut args: Vec<Value> = vec![Value::from(keys.job(id))];
+        args.extend(job::JOB_FIELDS.iter().map(|f| Value::from(*f)));
+
+        let reply = conn.cmd("HMGET", args).await?;
+        let Value::Array(values) = reply else { return Ok(None) };
+
+        let fields: Vec<Option<String>> = values.iter().map(|v| v.as_string()).collect();
+        if fields.iter().all(|f| f.is_none()) {
+            return Ok(None);
         }
-        Ok(out)
+
+        Ok(Some(job::from_fields(id, &fields)))
+    }
+
+    /// Per-job logs, newest last.
+    pub async fn job_logs(
+        &self,
+        conn: &Conn,
+        queue: &str,
+        id: &str,
+        limit: usize,
+    ) -> Result<Vec<String>> {
+        let keys = QueueKeys::new(&self.prefix, queue);
+        let reply = conn
+            .cmd(
+                "LRANGE",
+                vec![Value::from(keys.job_logs(id)), 0.into(), (limit as i64 - 1).into()],
+            )
+            .await?;
+        let Value::Array(items) = reply else { return Ok(Vec::new()) };
+        Ok(items.iter().filter_map(|v| v.as_string()).collect())
     }
 }
 

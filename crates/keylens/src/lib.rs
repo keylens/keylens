@@ -5,7 +5,9 @@
 pub mod app;
 pub mod browse;
 pub mod config;
+pub mod events;
 pub mod panes;
 pub mod probe;
+pub mod queues;
 pub mod ui;
 pub mod worker;

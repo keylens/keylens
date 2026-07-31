@@ -6,8 +6,11 @@
 
 use keylens::app::{App, Mode, View};
 use keylens::ui;
-use keylens::worker::{Request, Update};
+use keylens::worker::{JobDetail, Request, Update};
+use keylens::events::StreamEvent;
+use keylens_bullmq::{EventKind, JobRef, QueueSummary, State};
 use keylens_conn::{KeyMeta, KeyValue, Kind, ServerInfo, StreamEntry};
+use keylens_lens::{Confidence, Detection};
 use keylens_ui::PaneState;
 use ratatui::Terminal;
 use ratatui::backend::TestBackend;
@@ -219,6 +222,219 @@ fn empty_slowlog_says_so_and_says_why() {
     let out = render(&mut app, 110, 30);
     assert!(out.contains("no slow commands logged"), "{out}");
     assert!(out.contains("slowlog-log-slower-than"), "should hint at the threshold:\n{out}");
+}
+
+fn with_bullmq(keys: &[&str]) -> (App, Receiver<Request>) {
+    let (mut app, rx) = app_with(keys);
+    app.apply(Update::Detected(vec![Detection {
+        lens_id: "bullmq",
+        confidence: Confidence::Certain,
+        version: Some("6.0.2".into()),
+        prefix: "bull".into(),
+        summary: "bullmq 6.0.2 - 2 queues".into(),
+        targets: vec!["emails".into()],
+    }]));
+    app.view = View::Queues;
+    (app, rx)
+}
+
+fn queue(name: &str, paused: bool, failed: u64) -> QueueSummary {
+    QueueSummary {
+        name: name.into(),
+        paused,
+        counts: State::ALL
+            .iter()
+            .map(|s| (*s, if *s == State::Failed { failed } else { 0 }))
+            .collect(),
+    }
+}
+
+#[test]
+fn queue_table_shows_counts_and_true_paused_state() {
+    let (mut app, _rx) = with_bullmq(&[]);
+    app.apply(Update::Queues(PaneState::Ready(vec![
+        queue("emails", false, 18),
+        queue("reports", true, 0),
+    ])));
+
+    let out = render(&mut app, 120, 24);
+    assert!(out.contains("bullmq 6.0.2"), "detection summary belongs in the title:\n{out}");
+    assert!(out.contains("emails"));
+    assert!(out.contains("running"));
+    assert!(out.contains("paused"), "paused state must be visible:\n{out}");
+    assert!(out.contains("18"));
+    assert!(out.contains("1 paused"));
+}
+
+#[test]
+fn queue_columns_do_not_run_into_each_other() {
+    // `prioritized` and `waiting-children` at full length overflowed their columns.
+    let (mut app, _rx) = with_bullmq(&[]);
+    app.apply(Update::Queues(PaneState::Ready(vec![queue("image-processing", false, 500)])));
+
+    let out = render(&mut app, 120, 24);
+    let header = out.lines().find(|l| l.contains("queue") && l.contains("status")).unwrap();
+    assert!(header.contains("prio"), "short labels expected:\n{header}");
+    assert!(!header.contains("prioritized"), "full label overflows:\n{header}");
+    // The name column needs a gap before status.
+    let row = out.lines().find(|l| l.contains("image-processing")).unwrap();
+    assert!(!row.contains("image-processingrunning"), "name butts into status:\n{row}");
+}
+
+#[test]
+fn throughput_column_distinguishes_idle_from_not_yet_watching() {
+    let (mut app, _rx) = with_bullmq(&[]);
+    app.apply(Update::Queues(PaneState::Ready(vec![queue("emails", false, 0)])));
+
+    // Before the reader attaches, the graph is unknown -- not idle.
+    let out = render(&mut app, 130, 24);
+    assert!(out.contains("attaching to event streams"), "{out}");
+
+    app.apply(Update::EventsAttached);
+    let out = render(&mut app, 130, 24);
+    assert!(out.contains("live"), "{out}");
+    assert!(out.contains("idle"), "an attached-but-silent queue reads as idle:\n{out}");
+}
+
+#[test]
+fn throughput_column_draws_a_sparkline_from_stream_events() {
+    let (mut app, _rx) = with_bullmq(&[]);
+    app.apply(Update::Queues(PaneState::Ready(vec![queue("emails", false, 0)])));
+    app.apply(Update::EventsAttached);
+
+    // Events timestamped "now" so they land inside the rendered window.
+    let now_ms = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap()
+        .as_millis() as i64;
+    app.apply(Update::Events(
+        (0..12)
+            .map(|i| StreamEvent {
+                queue: "emails".into(),
+                kind: EventKind::Completed,
+                at_ms: now_ms - i * 100,
+            })
+            .collect(),
+    ));
+
+    let out = render(&mut app, 130, 24);
+    assert!(
+        out.contains('█') || out.contains('▇') || out.contains('▄'),
+        "a burst should draw sparkline blocks:\n{out}"
+    );
+
+    // Assert on the summary line specifically -- a substring search for "0.0" over the
+    // whole screen matches the `127.0.0.1` in the connection URL.
+    let summary = out.lines().find(|l| l.contains("events/sec")).expect("summary line");
+    assert!(summary.contains("live"), "{summary}");
+    assert!(
+        !summary.contains("0.0 events/sec"),
+        "rate should be non-zero after a burst: {summary}"
+    );
+}
+
+#[test]
+fn the_queue_table_fits_its_pane() {
+    // The sparkline is sized from the remaining width; getting that budget wrong clipped
+    // the ev/s column off the right-hand edge.
+    let (mut app, _rx) = with_bullmq(&[]);
+    app.apply(Update::Queues(PaneState::Ready(vec![queue("image-processing", false, 500)])));
+    app.apply(Update::EventsAttached);
+
+    for width in [80u16, 100, 120, 160, 200] {
+        let out = render(&mut app, width, 20);
+
+        // No rendered line may exceed the terminal width at any size.
+        for line in out.lines() {
+            assert!(
+                line.chars().count() <= width as usize,
+                "line overflows at width {width}: {line}"
+            );
+        }
+
+        // The columns that justify the view must survive every width.
+        let header = out.lines().find(|l| l.contains("queue") && l.contains("status")).unwrap();
+        for required in ["wait", "active", "failed"] {
+            assert!(header.contains(required), "lost `{required}` at width {width}:\n{header}");
+        }
+
+        // Once there's room, the graph and rate appear.
+        if width >= 140 {
+            assert!(out.contains("ev/s"), "graph should fit at width {width}:\n{out}");
+        }
+    }
+}
+
+#[test]
+fn a_narrow_pane_drops_columns_instead_of_clipping_them() {
+    let (mut app, _rx) = with_bullmq(&[]);
+    app.apply(Update::Queues(PaneState::Ready(vec![queue("emails", false, 7)])));
+
+    let narrow = render(&mut app, 80, 20);
+    let wide = render(&mut app, 200, 20);
+
+    // `children` is the least useful column, so it goes first.
+    assert!(!narrow.contains("children"), "narrow pane should drop it:\n{narrow}");
+    assert!(wide.contains("children"), "wide pane has room for it:\n{wide}");
+    // But the failed count is never dropped -- it's why the view exists.
+    assert!(narrow.contains("failed"));
+}
+
+#[test]
+fn job_detail_renders_a_stack_trace_per_attempt() {
+    let (mut app, _rx) = with_bullmq(&[]);
+    app.apply(Update::Queues(PaneState::Ready(vec![queue("image-processing", false, 1)])));
+    app.apply(Update::Jobs {
+        state: State::Failed,
+        data: PaneState::Ready(vec![JobRef { id: "7012".into(), score: Some(1.0) }]),
+    });
+
+    let job = keylens_bullmq::job::from_fields(
+        "7012",
+        &field_values(&[
+            ("name", "image-processing"),
+            ("atm", "2"),
+            ("opts", r#"{"attempts":2}"#),
+            ("failedReason", "offset is out of bounds"),
+            (
+                "stacktrace",
+                r#"["RangeError: boom\n    at decodeFrame (file:///app/p.mjs:59:9)","RangeError: boom again\n    at decodeFrame (file:///app/p.mjs:59:9)"]"#,
+            ),
+            ("data", r#"{"assetId":"asset_1","width":2560}"#),
+            ("timestamp", "1000"),
+            ("processedOn", "1500"),
+            ("finishedOn", "2200"),
+        ]),
+    );
+    app.apply(Update::Job(PaneState::Ready(Some(Box::new(JobDetail { job, logs: vec![] })))));
+    app.level = keylens::app::QueueLevel::Job;
+
+    let out = render(&mut app, 120, 40);
+    assert!(out.contains("2/2"), "attempts should show made/allowed:\n{out}");
+    assert!(out.contains("waited"), "{out}");
+    assert!(out.contains("ran for"), "{out}");
+    assert!(out.contains("offset is out of bounds"));
+    assert!(out.contains("attempt 1") && out.contains("attempt 2"), "one trace per attempt:\n{out}");
+    assert!(out.contains("at decodeFrame"), "frames should be real lines, not escaped:\n{out}");
+    assert!(!out.contains("\\n"), "escaped newlines mean the JSON array wasn't parsed:\n{out}");
+    assert!(out.contains("\"assetId\""), "payload should render:\n{out}");
+}
+
+#[test]
+fn a_job_removed_by_retention_explains_itself() {
+    let (mut app, _rx) = with_bullmq(&[]);
+    app.apply(Update::Job(PaneState::Ready(None)));
+    app.level = keylens::app::QueueLevel::Job;
+
+    let out = render(&mut app, 120, 24);
+    assert!(out.contains("no longer exists"), "{out}");
+}
+
+fn field_values(pairs: &[(&str, &str)]) -> Vec<Option<String>> {
+    keylens_bullmq::job::JOB_FIELDS
+        .iter()
+        .map(|f| pairs.iter().find(|(k, _)| k == f).map(|(_, v)| v.to_string()))
+        .collect()
 }
 
 #[test]

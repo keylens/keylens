@@ -9,6 +9,8 @@ use keylens_conn::{
     ClientInfo, ClusterTopology, Conn, Feature, KeyMeta, KeyValue, Kind, PubSubChannel,
     ServerInfo, SlowEntry, Value,
 };
+use keylens_bullmq::{BullMqLens, Job, JobRef, QueueSummary, State};
+use keylens_lens::{Detection, Lens};
 use keylens_ui::PaneState;
 use tokio::sync::mpsc::{Receiver, Sender};
 use tracing::warn;
@@ -23,6 +25,9 @@ const SCAN_COUNT: u32 = 500;
 const MAX_TYPED: usize = 1_000;
 const SLOWLOG_ENTRIES: u32 = 128;
 const PUBSUB_CHANNELS: usize = 200;
+/// Job ids fetched per state page.
+const JOB_PAGE: usize = 200;
+const JOB_LOG_LINES: usize = 200;
 
 #[derive(Debug)]
 pub enum Request {
@@ -38,6 +43,12 @@ pub enum Request {
     LoadClients,
     LoadCluster,
     LoadPubSub,
+
+    /// Run every lens detector. Cheap, and it decides whether the queues tab exists.
+    Detect,
+    LoadQueues,
+    LoadJobs { queue: String, state: State, offset: usize },
+    LoadJob { queue: String, id: String },
 }
 
 #[derive(Debug)]
@@ -61,6 +72,23 @@ pub enum Update {
     Clients(PaneState<Vec<ClientInfo>>),
     Cluster(PaneState<Box<ClusterTopology>>),
     PubSub(PaneState<Vec<PubSubChannel>>),
+
+    Detected(Vec<Detection>),
+    /// The stream reader has attached, so an empty graph means "idle", not "not watching".
+    EventsAttached,
+    Events(Vec<crate::events::StreamEvent>),
+    Queues(PaneState<Vec<QueueSummary>>),
+    Jobs { state: State, data: PaneState<Vec<JobRef>> },
+    /// `None` inside `Ready` means the job was removed between listing and reading, which
+    /// happens constantly on a live queue with retention configured.
+    Job(PaneState<Option<Box<JobDetail>>>),
+}
+
+/// A job plus its logs, which are a separate key.
+#[derive(Debug, Clone)]
+pub struct JobDetail {
+    pub job: Job,
+    pub logs: Vec<String>,
 }
 
 pub struct Worker {
@@ -69,11 +97,21 @@ pub struct Worker {
     pattern: Option<String>,
     kind: Option<Kind>,
     complete: bool,
+    /// Re-created with the detected prefix once detection runs, so a keyspace using a
+    /// custom BullMQ prefix works without configuration.
+    bullmq: BullMqLens,
 }
 
 impl Worker {
     pub fn new(conn: Conn) -> Self {
-        Self { conn, cursor: "0".into(), pattern: None, kind: None, complete: false }
+        Self {
+            conn,
+            cursor: "0".into(),
+            pattern: None,
+            kind: None,
+            complete: false,
+            bullmq: BullMqLens::default(),
+        }
     }
 
     pub async fn run(mut self, mut rx: Receiver<Request>, tx: Sender<Update>) {
@@ -108,6 +146,43 @@ impl Worker {
                 Request::LoadPubSub => Update::PubSub(
                     self.pane(Feature::PubSub, self.conn.pubsub_channels(PUBSUB_CHANNELS)).await,
                 ),
+
+                Request::Detect => {
+                    let detections = match self.bullmq.detect(&self.conn).await {
+                        Ok(Some(d)) => {
+                            // Adopt the detected prefix for every later query.
+                            self.bullmq = BullMqLens::new(d.prefix.clone());
+                            vec![d]
+                        }
+                        Ok(None) => Vec::new(),
+                        Err(e) => {
+                            warn!(error = %e, "bullmq detection failed");
+                            Vec::new()
+                        }
+                    };
+                    Update::Detected(detections)
+                }
+
+                Request::LoadQueues => {
+                    Update::Queues(match self.bullmq.all_queues(&self.conn).await {
+                        Ok(q) => PaneState::Ready(q),
+                        Err(e) => PaneState::Failed(e.to_string()),
+                    })
+                }
+
+                Request::LoadJobs { queue, state, offset } => Update::Jobs {
+                    state,
+                    data: match self
+                        .bullmq
+                        .jobs(&self.conn, &queue, state, offset, JOB_PAGE)
+                        .await
+                    {
+                        Ok(j) => PaneState::Ready(j),
+                        Err(e) => PaneState::Failed(e.to_string()),
+                    },
+                },
+
+                Request::LoadJob { queue, id } => Update::Job(self.job(&queue, &id).await),
             };
 
             // A closed channel means the UI is gone; stop rather than spin.
@@ -218,6 +293,24 @@ impl Worker {
             self.conn.cluster_topology().await.map(Box::new)
         })
         .await
+    }
+
+    async fn job(&self, queue: &str, id: &str) -> PaneState<Option<Box<JobDetail>>> {
+        let job = match self.bullmq.job(&self.conn, queue, id).await {
+            Ok(Some(j)) => j,
+            Ok(None) => return PaneState::Ready(None),
+            Err(e) => return PaneState::Failed(e.to_string()),
+        };
+
+        // Logs live in a separate key and are usually absent; their absence is not a
+        // reason to fail the whole job view.
+        let logs = self
+            .bullmq
+            .job_logs(&self.conn, queue, id, JOB_LOG_LINES)
+            .await
+            .unwrap_or_default();
+
+        PaneState::Ready(Some(Box::new(JobDetail { job, logs })))
     }
 
     async fn detail(&self, key: &str, offset: usize) -> Update {

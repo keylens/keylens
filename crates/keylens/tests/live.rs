@@ -147,11 +147,22 @@ async fn pipelined_typing_matches_individual_typing() {
     let piped = conn.pipeline(&cmds).await.unwrap();
     assert_eq!(piped.len(), sample.len(), "pipeline must return one reply per command");
 
+    let mut compared = 0;
     for (i, key) in sample.iter().enumerate() {
         let individual = conn.key_meta(key).await.unwrap().kind;
         let pipelined = Kind::parse(&keylens_conn::value::display_string(&piped[i]));
+
+        // The fixture churns constantly: a job can be removed by retention between the
+        // pipelined read and the individual one. A key that has since vanished says
+        // nothing about reply ordering, which is the invariant under test.
+        if individual == Kind::None || pipelined == Kind::None {
+            continue;
+        }
+
         assert_eq!(pipelined, individual, "type mismatch for {key} at index {i}");
+        compared += 1;
     }
+    assert!(compared >= 5, "only {compared} keys survived long enough to compare");
 }
 
 #[tokio::test]
@@ -204,6 +215,215 @@ async fn pubsub_channels_parse() {
     for c in &channels {
         assert!(!c.name.is_empty());
     }
+}
+
+#[tokio::test]
+#[ignore = "requires docker compose fixtures"]
+async fn pipelined_queue_counts_match_individual_counts() {
+    // The queue table is one pipeline of 8 commands per queue. If the reply order ever
+    // drifted, every count in the dashboard would be attributed to the wrong queue --
+    // and it would look completely plausible.
+    use keylens_bullmq::{BullMqLens, State};
+    use keylens_conn::Value;
+
+    let conn = conn().await;
+    let lens = BullMqLens::default();
+    let queues = lens.all_queues(&conn).await.unwrap();
+    assert!(queues.len() >= 2, "need a few queues to catch a misalignment");
+
+    for q in &queues {
+        for state in State::ALL {
+            let key = format!("bull:{}:{}", q.name, state.suffix());
+            let direct = conn
+                .cmd(state.count_cmd(), vec![Value::from(key.as_str())])
+                .await
+                .unwrap()
+                .as_u64()
+                .unwrap_or(0);
+
+            // Counts move constantly on a live queue, so compare loosely -- the failure
+            // this guards against is a wholesale mix-up, not a few jobs of drift.
+            let piped = q.count(state);
+            let delta = piped.abs_diff(direct);
+            assert!(
+                delta < 500,
+                "{}/{} pipelined {piped} vs direct {direct} -- reply misalignment?",
+                q.name,
+                state.label()
+            );
+        }
+    }
+}
+
+#[tokio::test]
+#[ignore = "requires docker compose fixtures"]
+async fn reads_a_failed_job_end_to_end() {
+    use keylens_bullmq::{BullMqLens, State};
+
+    let conn = conn().await;
+    let lens = BullMqLens::default();
+
+    let jobs = lens.jobs(&conn, "image-processing", State::Failed, 0, 5).await.unwrap();
+    assert!(!jobs.is_empty(), "producer should have failed some jobs");
+    // Failed is a ZSET scored by finish time.
+    assert!(jobs[0].score.is_some_and(|s| s > 1.0e12), "expected a ms timestamp score");
+
+    let job = lens
+        .job(&conn, "image-processing", &jobs[0].id)
+        .await
+        .unwrap()
+        .expect("job should still exist");
+
+    assert_eq!(job.id, jobs[0].id);
+    assert!(job.has_failed());
+    assert!(!job.failed_reason.is_empty());
+    // The trap this guards: `stacktrace` is a JSON array, and `attemptsMade` is `atm`.
+    assert!(!job.stacktrace.is_empty(), "stacktrace should parse out of the JSON array");
+    assert!(job.stacktrace[0].contains("at "), "frames expected: {}", job.stacktrace[0]);
+    assert!(job.attempts_made > 0, "v6 stores attempts as `atm`, not `attemptsMade`");
+    assert!(job.data.starts_with('{'), "payload should be JSON");
+    assert!(job.duration_ms().is_some(), "a finished job has both timestamps");
+}
+
+#[tokio::test]
+#[ignore = "requires docker compose fixtures"]
+async fn list_backed_states_return_ids_without_scores() {
+    use keylens_bullmq::{BullMqLens, State};
+
+    let conn = conn().await;
+    let lens = BullMqLens::default();
+    // `reports` carries a deep backlog thanks to the pause cycle.
+    let jobs = lens.jobs(&conn, "reports", State::Waiting, 0, 5).await.unwrap();
+    for j in &jobs {
+        assert!(j.score.is_none(), "wait is a LIST and has no score");
+        assert!(!j.id.is_empty());
+    }
+}
+
+#[tokio::test]
+#[ignore = "requires docker compose fixtures"]
+async fn a_missing_job_reads_as_none_not_an_error() {
+    use keylens_bullmq::BullMqLens;
+    let conn = conn().await;
+    let lens = BullMqLens::default();
+    assert!(lens.job(&conn, "emails", "does-not-exist-99999").await.unwrap().is_none());
+}
+
+#[tokio::test]
+#[ignore = "requires docker compose fixtures"]
+async fn the_events_stream_delivers_live_throughput() {
+    // The M5 kill gate, tested rather than eyeballed: attach to the events streams and
+    // confirm real events arrive with usable timestamps within a few seconds.
+    use keylens::events::run;
+    use keylens::worker::Update;
+    use keylens_bullmq::events::EventKind;
+    use tokio::sync::mpsc;
+
+    let conn = conn().await;
+    let queues = vec![
+        "emails".to_string(),
+        "image-processing".to_string(),
+        "webhooks".to_string(),
+    ];
+
+    let (tx, mut rx) = mpsc::channel::<Update>(64);
+    let reader = tokio::spawn(run(conn, "bull".into(), queues.clone(), tx));
+
+    let mut events = Vec::new();
+    let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(15);
+
+    while events.len() < 20 && tokio::time::Instant::now() < deadline {
+        match tokio::time::timeout_at(deadline, rx.recv()).await {
+            Ok(Some(Update::Events(batch))) => events.extend(batch),
+            Ok(Some(_)) => {}
+            Ok(None) | Err(_) => break,
+        }
+    }
+    reader.abort();
+
+    assert!(
+        events.len() >= 20,
+        "expected a stream of events from a running producer, got {}",
+        events.len()
+    );
+
+    // Events must be attributed to a watched queue, not to the wrong stream.
+    for e in &events {
+        assert!(queues.contains(&e.queue), "unexpected queue {}", e.queue);
+    }
+
+    // Timestamps come from the entry ids, so they must be plausible wall-clock ms.
+    let now_ms = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap()
+        .as_millis() as i64;
+    for e in &events {
+        let age = now_ms - e.at_ms;
+        assert!(
+            (-5_000..60_000).contains(&age),
+            "event timestamp {} is {age}ms from now -- entry id parsing is wrong",
+            e.at_ms
+        );
+    }
+
+    // The producer completes and fails jobs constantly, so both should appear.
+    assert!(
+        events.iter().any(|e| e.kind == EventKind::Completed),
+        "expected completed events"
+    );
+    assert!(
+        events.iter().any(|e| matches!(e.kind, EventKind::Active | EventKind::Added)),
+        "expected lifecycle events"
+    );
+}
+
+#[tokio::test]
+#[ignore = "requires docker compose fixtures"]
+async fn throughput_buckets_populate_from_a_live_stream() {
+    use keylens::events::run;
+    use keylens::worker::Update;
+    use keylens_bullmq::Throughput;
+    use tokio::sync::mpsc;
+
+    let conn = conn().await;
+    let (tx, mut rx) = mpsc::channel::<Update>(64);
+    let reader = tokio::spawn(run(conn, "bull".into(), vec!["emails".into()], tx));
+
+    let mut throughput = Throughput::default();
+    let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(15);
+
+    while tokio::time::Instant::now() < deadline {
+        match tokio::time::timeout_at(deadline, rx.recv()).await {
+            Ok(Some(Update::Events(batch))) => {
+                for e in batch {
+                    throughput.record(&e.queue, e.kind, e.at_ms);
+                }
+                if throughput.series("emails").is_some_and(|s| s.seen >= 10) {
+                    break;
+                }
+            }
+            Ok(Some(_)) => {}
+            Ok(None) | Err(_) => break,
+        }
+    }
+    reader.abort();
+
+    let series = throughput.series("emails").expect("emails should have produced events");
+    assert!(series.seen >= 10, "only saw {} events", series.seen);
+
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap()
+        .as_secs() as i64;
+
+    // The window must actually contain the events -- this is what caught the graph
+    // rendering empty while the rate counter read non-zero.
+    let window = series.window(now, 30, |b| b.total);
+    assert!(
+        window.iter().sum::<u64>() > 0,
+        "events were recorded but the 30s window is empty -- bucket/now mismatch"
+    );
+    assert!(series.rate(now, 10) > 0.0, "rate should be non-zero right after a burst");
 }
 
 #[tokio::test]

@@ -1114,6 +1114,7 @@ dependencies = [
  "fred",
  "keylens-conn",
  "keylens-lens",
+ "serde_json",
  "tracing",
 ]
 

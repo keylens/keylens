@@ -77,6 +77,34 @@ impl State {
         }
     }
 
+    /// Abbreviated label for the queue table, where seven columns have to share a row.
+    ///
+    /// `prioritized` and `waiting-children` are 11 and 16 characters; at full length they
+    /// run into the neighbouring column.
+    pub fn short_label(&self) -> &'static str {
+        match self {
+            State::Waiting => "wait",
+            State::Active => "active",
+            State::Prioritized => "prio",
+            State::Delayed => "delayed",
+            State::WaitingChildren => "children",
+            State::Completed => "done",
+            State::Failed => "failed",
+        }
+    }
+
+    /// What this state's ZSET score actually means, so the job list can label the column
+    /// instead of showing a bare float.
+    pub fn score_label(&self) -> &'static str {
+        match self {
+            State::Waiting | State::Active => "position",
+            State::Completed | State::Failed => "finished",
+            State::Delayed => "due",
+            State::Prioritized => "priority",
+            State::WaitingChildren => "added",
+        }
+    }
+
     /// The command that counts this state, which depends on the underlying Redis type.
     pub fn count_cmd(&self) -> &'static str {
         match self {
@@ -175,6 +203,29 @@ mod tests {
         // always-zero waiting count.
         assert_eq!(State::Waiting.label(), "waiting");
         assert_eq!(State::Waiting.suffix(), "wait");
+    }
+
+    #[test]
+    fn short_labels_fit_the_queue_table_column() {
+        // The table gives each state 10 columns including the gap; a longer label runs
+        // into its neighbour, which is exactly what full names did.
+        for s in State::ALL {
+            assert!(
+                s.short_label().len() <= 8,
+                "{} is too wide at {} chars",
+                s.short_label(),
+                s.short_label().len()
+            );
+        }
+    }
+
+    #[test]
+    fn short_labels_are_unique() {
+        let mut seen = Vec::new();
+        for s in State::ALL {
+            assert!(!seen.contains(&s.short_label()), "{:?} reuses a label", s);
+            seen.push(s.short_label());
+        }
     }
 
     #[test]

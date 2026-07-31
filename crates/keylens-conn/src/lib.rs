@@ -16,6 +16,8 @@ pub mod value;
 /// cross the boundary. Keeping the re-export here means a future client swap touches this
 /// line and this crate, not every call site.
 pub use fred::prelude::Value;
+/// Re-exported for building RESP3 map replies (tests, and any caller that needs one).
+pub use fred::types::Map;
 
 pub use capability::{Availability, Capabilities, Feature};
 pub use conn::{Conn, ScanPage};
