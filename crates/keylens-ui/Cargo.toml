@@ -1,0 +1,15 @@
+[package]
+name = "keylens-ui"
+description = "Shared UI model and widgets for keylens"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+authors.workspace = true
+
+[dependencies]
+keylens-conn.workspace = true
+ratatui.workspace = true
+serde_json.workspace = true
+bytesize.workspace = true

@@ -1,0 +1,17 @@
+[package]
+name = "keylens-conn"
+description = "Connection, capability probing and vendor detection for keylens"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+authors.workspace = true
+
+[dependencies]
+fred.workspace = true
+tokio.workspace = true
+futures.workspace = true
+serde.workspace = true
+thiserror.workspace = true
+tracing.workspace = true

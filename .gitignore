@@ -1,0 +1,13 @@
+/target
+**/*.rs.bk
+*.pdb
+
+# fixtures
+node_modules/
+fixtures/package-lock.json
+
+# local config / logs
+keylens.log
+.keylens/
+.DS_Store
+PLAN.md

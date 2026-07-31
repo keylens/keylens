@@ -1,0 +1,50 @@
+# Dev fixtures for keylens.
+#
+# Two servers, because vendor is a runtime-detected property and the detection path needs
+# a real Valkey to test against -- not a Redis we assume behaves the same.
+#
+#   redis   -> localhost:6379
+#   valkey  -> localhost:6380
+#
+# The producer drives BullMQ against Redis continuously so the events stream has real
+# traffic to graph and the failed set has real stack traces to render.
+
+services:
+  redis:
+    image: redis:8-alpine
+    container_name: keylens-redis
+    ports:
+      - "6379:6379"
+    # Persistence off: these are throwaway fixtures, and disabling it keeps restarts fast.
+    command: ["redis-server", "--save", "", "--appendonly", "no"]
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 2s
+      timeout: 2s
+      retries: 15
+
+  valkey:
+    image: valkey/valkey:8-alpine
+    container_name: keylens-valkey
+    ports:
+      - "6380:6379"
+    command: ["valkey-server", "--save", "", "--appendonly", "no"]
+    healthcheck:
+      test: ["CMD", "valkey-cli", "ping"]
+      interval: 2s
+      timeout: 2s
+      retries: 15
+
+  producer:
+    build: ./fixtures
+    container_name: keylens-producer
+    depends_on:
+      redis:
+        condition: service_healthy
+    environment:
+      REDIS_HOST: redis
+      REDIS_PORT: "6379"
+      # Raise to make the throughput sparkline busier.
+      JOBS_PER_TICK: "6"
+      TICK_MS: "700"
+    restart: unless-stopped

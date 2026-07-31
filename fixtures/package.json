@@ -1,0 +1,13 @@
+{
+  "name": "keylens-fixtures",
+  "private": true,
+  "type": "module",
+  "description": "Drives a realistic BullMQ workload for keylens development",
+  "scripts": {
+    "start": "node producer.mjs"
+  },
+  "dependencies": {
+    "bullmq": "^6.0.2",
+    "ioredis": "^5.4.1"
+  }
+}

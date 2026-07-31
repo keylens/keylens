@@ -1,0 +1,16 @@
+[package]
+name = "keylens-lens"
+description = "The lens extension point for keylens: detect a known keyspace pattern, render domain UI"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+authors.workspace = true
+
+[dependencies]
+keylens-conn.workspace = true
+async-trait.workspace = true
+thiserror.workspace = true
+tracing.workspace = true
+futures.workspace = true

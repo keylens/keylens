@@ -1,0 +1,40 @@
+[package]
+name = "keylens"
+description = "A TUI for Redis and Valkey that understands your keys"
+keywords = ["redis", "valkey", "tui", "bullmq", "cli"]
+categories = ["command-line-utilities", "database"]
+readme = "../../README.md"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+homepage.workspace = true
+authors.workspace = true
+
+[lib]
+name = "keylens"
+path = "src/lib.rs"
+
+[[bin]]
+name = "keylens"
+path = "src/main.rs"
+
+[dependencies]
+keylens-conn.workspace = true
+keylens-lens.workspace = true
+keylens-ui.workspace = true
+keylens-bullmq.workspace = true
+
+ratatui.workspace = true
+crossterm.workspace = true
+futures.workspace = true
+tokio.workspace = true
+clap.workspace = true
+color-eyre.workspace = true
+tracing.workspace = true
+tracing-subscriber.workspace = true
+serde.workspace = true
+toml.workspace = true
+directories.workspace = true
+bytesize.workspace = true
