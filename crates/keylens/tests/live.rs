@@ -623,11 +623,10 @@ async fn a_stream_without_groups_reports_none_rather_than_failing() {
     );
 }
 
-/// Recached runs behind a compose profile that needs a sibling checkout, so these skip
-/// unless the URL is provided:
+/// Recached runs behind a compose profile, so these skip unless the URL is provided:
 ///
 /// ```sh
-/// docker compose --profile recached up -d --build
+/// docker compose --profile recached up -d
 /// KEYLENS_TEST_RECACHED_URL=redis://127.0.0.1:6381 \
 ///   cargo test --test live -- --ignored
 /// ```

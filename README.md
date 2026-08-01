@@ -14,7 +14,7 @@ BullMQ is the first one.
 
 Every capability is **probed at connect, never assumed**, so keylens works against any
 RESP server and tells you plainly what that server can't do. Verified against Redis 8,
-Valkey 8, and [Recached](https://github.com/thinkgrid-labs/recached) — see
+Valkey 8, and [Recached](https://github.com/recached-dev/recached) — see
 [compatibility](#compatibility).
 
 > **v0.1 is read-only.** That's a feature — you can point it at production on day one.
@@ -408,7 +408,8 @@ the reason.
 | | Redis 8 | Valkey 8 | Recached |
 |---|---|---|---|
 | Key browser, all 6 value types | ✅ | ✅ | ✅ |
-| Stats / slowlog / clients / cluster / pub-sub | ✅ | ✅ | — no `INFO` etc. |
+| Server stats (`INFO`) | ✅ | ✅ | ✅ since 0.2.3 |
+| Slowlog / clients / cluster / pub-sub | ✅ | ✅ | — not implemented |
 | Streams + consumer groups | ✅ | ✅ | — no stream types |
 | BullMQ lens | ✅ | ✅ | — needs streams |
 
