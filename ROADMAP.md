@@ -2,10 +2,6 @@
 
 Where keylens is going and, more usefully, what it is knowingly missing today.
 
-[`PLAN.md`](PLAN.md) is the internal build plan that got v0.1 shipped and is largely
-historical now. This file is the forward-looking one, and it is where to argue with the
-priorities.
-
 **Today: v0.1.4 — read-only, single binary, one lens (BullMQ).**
 
 Nothing here has a date. Items are ordered within each section by how much they undercut
