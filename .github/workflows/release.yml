@@ -162,10 +162,9 @@ jobs:
     name: Update Homebrew tap
     runs-on: ubuntu-latest
     needs: release
-    if: >-
-      github.repository_owner == 'keylens'
-      && !contains(github.ref_name, '-')
-      && secrets.HOMEBREW_TAP_TOKEN != ''
+    # `secrets` is not an allowed context in a job-level `if` (only github, needs, vars
+    # and inputs are), so the token check lives in the push step instead.
+    if: github.repository_owner == 'keylens' && !contains(github.ref_name, '-')
     steps:
       - uses: actions/checkout@v4
 
@@ -203,6 +202,14 @@ jobs:
           GH_TOKEN: ${{ secrets.HOMEBREW_TAP_TOKEN }}
         run: |
           set -euo pipefail
+          # Skips cleanly until the tap repo and its token exist, so the release still
+          # succeeds on the first run.
+          if [ -z "${GH_TOKEN:-}" ]; then
+            echo "HOMEBREW_TAP_TOKEN is not set — skipping the tap update."
+            echo "The formula is rendered above; copy it to keylens/homebrew-tap by hand,"
+            echo "or add the secret to automate this."
+            exit 0
+          fi
           TAG="${{ github.event.inputs.tag || github.ref_name }}"
           git clone "https://x-access-token:${GH_TOKEN}@github.com/keylens/homebrew-tap.git" tap
           mkdir -p tap/Formula
