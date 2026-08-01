@@ -26,6 +26,13 @@ pub enum ConnError {
         source: fred::error::Error,
     },
 
+    /// The handshake never completed.
+    ///
+    /// Its own variant because the client retries internally: without a deadline this is
+    /// a hang, not an error, and a frozen terminal is worse than any message.
+    #[error("{0}")]
+    ConnectTimeout(String),
+
     #[error("command `{cmd}` failed: {source}")]
     Command {
         cmd: &'static str,
@@ -51,11 +58,41 @@ pub fn classify_connect(url: &str, source: fred::error::Error) -> ConnError {
     ConnError::Connect(source)
 }
 
-fn looks_like_plaintext_to_tls(url: &str, source: &fred::error::Error) -> bool {
-    let scheme_is_plaintext = url.starts_with("redis://")
+/// Build the message for a handshake that ran out of time.
+///
+/// A TLS-only port accepts the TCP connection and then closes it, so a plaintext client
+/// reconnects in a loop and never reports anything. That silence is the single most
+/// likely reason to end up here, so the TLS hint is offered for plaintext urls.
+pub fn connect_timeout(url: &str, after: std::time::Duration) -> ConnError {
+    let mut msg = format!(
+        "connection failed: no response after {}s.\n\n\
+         The server accepted the connection but never completed a RESP handshake.",
+        after.as_secs()
+    );
+
+    if is_plaintext_scheme(url) {
+        msg.push_str(&format!(
+            "\n\nThe usual cause is a TLS-only port reached over plaintext — it accepts \
+             the connection, then closes it.\nTry `rediss://`:\n\n    {}\n\n\
+             Managed hosts — DigitalOcean, Upstash, Aiven, ElastiCache with encryption \
+             in transit — are TLS-only.",
+            to_tls_url(url)
+        ));
+    } else {
+        msg.push_str("\n\nCheck the host, port, and that the server is reachable.");
+    }
+
+    ConnError::ConnectTimeout(msg)
+}
+
+fn is_plaintext_scheme(url: &str) -> bool {
+    url.starts_with("redis://")
         || url.starts_with("redis-sentinel://")
-        || url.starts_with("redis-cluster://");
-    if !scheme_is_plaintext {
+        || url.starts_with("redis-cluster://")
+}
+
+fn looks_like_plaintext_to_tls(url: &str, source: &fred::error::Error) -> bool {
+    if !is_plaintext_scheme(url) {
         return false;
     }
 
@@ -122,6 +159,24 @@ mod tests {
             classify_connect("redis://127.0.0.1:6379", refused),
             ConnError::Connect(_)
         ));
+    }
+
+    #[test]
+    fn a_handshake_timeout_on_a_plaintext_url_suggests_tls() {
+        // A TLS-only port accepts the TCP connection then closes it, so the client
+        // reconnects forever. Silence is the symptom; TLS is the usual cause.
+        let err = connect_timeout("redis://host:6390", std::time::Duration::from_secs(10));
+        let msg = err.to_string();
+        assert!(msg.contains("no response after 10s"));
+        assert!(msg.contains("rediss://host:6390"));
+    }
+
+    #[test]
+    fn a_handshake_timeout_over_tls_does_not_blame_tls() {
+        let err = connect_timeout("rediss://host:6390", std::time::Duration::from_secs(10));
+        let msg = err.to_string();
+        assert!(!msg.contains("Try `rediss://`"));
+        assert!(msg.contains("reachable"));
     }
 
     #[test]

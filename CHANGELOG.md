@@ -10,12 +10,17 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
-- Connecting to a TLS-only port with `redis://` reported `Protocol Error: Expected
-  string`, which gave no clue what was wrong. It now explains that the port requires TLS
-  and prints the corrected `rediss://` url ready to paste. This is the first thing anyone
-  hits pointing keylens at DigitalOcean, Aiven, Upstash or ElastiCache with encryption in
-  transit. The hint is offered only for plaintext urls — over `rediss://` a protocol error
-  means something else, and guessing would send you the wrong way.
+- **Connecting to a TLS-only port with `redis://` could hang forever.** The connection is
+  accepted and then closed, after which the client queued commands and retried in the
+  background instead of failing them — so `INFO` never returned and keylens sat there with
+  no error at all. The whole handshake now has a 10s deadline and reports what happened.
+- Where the same mistake produced an error rather than a hang, it was `Protocol Error:
+  Expected string`, which gave no clue what was wrong. Both paths now explain that the
+  port requires TLS and print the corrected `rediss://` url ready to paste. This is the
+  first thing anyone hits pointing keylens at DigitalOcean, Aiven, Upstash or ElastiCache
+  with encryption in transit. The hint is offered only for plaintext urls — over
+  `rediss://` these failures mean something else, and guessing would send you the wrong
+  way.
 
 ## [0.1.1] — 2026-08-01
 

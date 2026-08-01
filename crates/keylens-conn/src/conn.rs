@@ -12,7 +12,7 @@ use fred::types::{ClusterHash, CustomCommand};
 use tracing::debug;
 
 use crate::capability::{Availability, Capabilities, Feature, classify};
-use crate::error::{ConnError, Result, classify_connect};
+use crate::error::{ConnError, Result, classify_connect, connect_timeout};
 use crate::server_info::ServerInfo;
 
 /// A page of `SCAN` results plus the cursor to resume from.
@@ -29,6 +29,9 @@ impl ScanPage {
         self.cursor == "0"
     }
 }
+
+/// Ceiling on the whole connect handshake, retries included.
+const CONNECT_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(10);
 
 pub struct Conn {
     client: Client,
@@ -50,26 +53,53 @@ impl Conn {
             .build()
             .map_err(ConnError::Connect)?;
 
-        // A plaintext url against a TLS-only port fails here with an unhelpful
-        // protocol error; `classify_connect` turns that into a usable hint.
-        client.init().await.map_err(|e| classify_connect(url, e))?;
+        // The whole handshake gets one deadline, not just `init`.
+        //
+        // `init` can report success while the connection is already dead -- a TLS-only
+        // port accepts the TCP connection, then closes it -- after which fred *queues*
+        // commands and retries in the background rather than failing them. So `INFO`
+        // never returns and the tool hangs with no error at all, which is worse than any
+        // message. Bounding only `init` was not enough; this covers everything that must
+        // succeed before the UI can open.
+        let handshake = async {
+            // A server answering with non-RESP bytes (a TLS alert, say) fails here with
+            // `Protocol Error: Expected string`, which tells the user nothing on its own.
+            client.init().await.map_err(|e| classify_connect(url, e))?;
 
-        // A missing `INFO` must not stop us connecting. Some Redis-compatible servers
-        // don't implement it at all, and locked-down managed hosts block it -- in both
-        // cases the key browser still works perfectly, so failing the whole connection
-        // over a stats pane would be absurd.
-        let (server, mut caps) = match raw_info(&client).await {
-            Ok(raw) => (ServerInfo::parse(&raw), probe(&client).await),
-            Err(e) => {
-                debug!(error = %e, "INFO unavailable; continuing without server metadata");
-                let mut caps = probe(&client).await;
-                caps.set(Feature::ServerInfo, classify_from(&e));
-                (ServerInfo::unknown(), caps)
+            // A missing `INFO` must not stop us connecting. Some Redis-compatible servers
+            // don't implement it at all, and locked-down managed hosts block it -- in both
+            // cases the key browser still works perfectly, so failing the whole connection
+            // over a stats pane would be absurd.
+            let (server, mut caps) = match raw_info(&client).await {
+                Ok(raw) => (ServerInfo::parse(&raw), probe(&client).await),
+                Err(e) => {
+                    debug!(error = %e, "INFO unavailable; continuing without server metadata");
+                    let mut caps = probe(&client).await;
+                    caps.set(Feature::ServerInfo, classify_from(&e));
+                    (ServerInfo::unknown(), caps)
+                }
+            };
+            if caps.get(Feature::ServerInfo) == Availability::Unsupported
+                && !server.fields.is_empty()
+            {
+                caps.set(Feature::ServerInfo, Availability::Available);
+            }
+            Ok::<_, ConnError>((server, caps))
+        };
+
+        let (server, caps) = match tokio::time::timeout(CONNECT_TIMEOUT, handshake).await {
+            Ok(Ok(v)) => v,
+            Ok(Err(e)) => {
+                // Stop the background reconnect loop, or it keeps the process alive after
+                // we return and the error is never seen.
+                let _ = client.quit().await;
+                return Err(e);
+            }
+            Err(_) => {
+                let _ = client.quit().await;
+                return Err(connect_timeout(url, CONNECT_TIMEOUT));
             }
         };
-        if caps.get(Feature::ServerInfo) == Availability::Unsupported && !server.fields.is_empty() {
-            caps.set(Feature::ServerInfo, Availability::Available);
-        }
 
         Ok(Self {
             client,

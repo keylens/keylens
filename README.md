@@ -114,8 +114,17 @@ keylens --url redis-sentinel://host:26379/mymaster
 keylens --url redis-cluster://node1:6379
 ```
 
-Managed hosts work as-is — Upstash, ElastiCache, MemoryDB, Dragonfly, KeyDB. Copy the
-connection string your provider gives you.
+Managed hosts work as-is — DigitalOcean, Aiven, Upstash, ElastiCache, MemoryDB, Dragonfly,
+KeyDB. Copy the connection string your provider gives you.
+
+**Most managed hosts are TLS-only, so the scheme is `rediss://`, not `redis://`.** Using
+the plaintext scheme against a TLS port is the single most common connection mistake;
+keylens detects it and prints the corrected url rather than leaving you with a protocol
+error. If your server uses a private CA, point at it with `SSL_CERT_FILE`:
+
+```sh
+SSL_CERT_FILE=/path/to/ca.crt keylens --url rediss://redis.internal:6379
+```
 
 Since a URL on the command line lands in your shell history and in `ps`, prefer the
 environment variable or a named connection for anything with a password:
@@ -231,6 +240,7 @@ A bare search term becomes a substring match (`emails` → `*emails*`). Type you
 | `NO_COLOR` | Disable colour (any value). `--no-color` does the same |
 | `KEYLENS_LOG` | Log filter, e.g. `debug` or `keylens_conn=trace` |
 | `KEYLENS_LOG_FILE` | Where to write logs in the browser |
+| `SSL_CERT_FILE` | CA bundle for `rediss://` against a private CA |
 
 Logs never go to stderr while the browser is running — they'd paint over the frame. Set
 `KEYLENS_LOG_FILE` to capture them:
