@@ -12,7 +12,7 @@ use fred::types::{ClusterHash, CustomCommand};
 use tracing::debug;
 
 use crate::capability::{Availability, Capabilities, Feature, classify};
-use crate::error::{ConnError, Result};
+use crate::error::{ConnError, Result, classify_connect};
 use crate::server_info::ServerInfo;
 
 /// A page of `SCAN` results plus the cursor to resume from.
@@ -50,7 +50,9 @@ impl Conn {
             .build()
             .map_err(ConnError::Connect)?;
 
-        client.init().await.map_err(ConnError::Connect)?;
+        // A plaintext url against a TLS-only port fails here with an unhelpful
+        // protocol error; `classify_connect` turns that into a usable hint.
+        client.init().await.map_err(|e| classify_connect(url, e))?;
 
         // A missing `INFO` must not stop us connecting. Some Redis-compatible servers
         // don't implement it at all, and locked-down managed hosts block it -- in both

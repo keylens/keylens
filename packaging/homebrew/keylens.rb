@@ -4,8 +4,12 @@
 # (github.com/keylens/homebrew-tap) as `Formula/keylens.rb`, and the release
 # workflow regenerates it with the version and checksums from each release.
 #
-# Users install with:
+# Users will install with:
 #   brew install keylens/tap/keylens
+#
+# NOTE: github.com/keylens/homebrew-tap does not exist yet, and until it does the
+# path 301-redirects to an unrelated org that once held the `keylens` name. Creating
+# the tap repo overrides that redirect.
 #
 # Plain `brew install keylens` needs homebrew-core, which has a notability bar
 # (roughly 75+ stars / 30+ forks, or comparable evidence of use). Until then the
@@ -13,7 +17,7 @@
 class Keylens < Formula
   desc "TUI for Redis, Valkey and Recached that understands your keys"
   homepage "https://github.com/keylens/keylens"
-  version "0.1.1"
+  version "0.1.2"
   license "Apache-2.0"
 
   on_macos do

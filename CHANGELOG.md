@@ -6,6 +6,17 @@ The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 
+## [0.1.2] — 2026-08-01
+
+### Fixed
+
+- Connecting to a TLS-only port with `redis://` reported `Protocol Error: Expected
+  string`, which gave no clue what was wrong. It now explains that the port requires TLS
+  and prints the corrected `rediss://` url ready to paste. This is the first thing anyone
+  hits pointing keylens at DigitalOcean, Aiven, Upstash or ElastiCache with encryption in
+  transit. The hint is offered only for plaintext urls — over `rediss://` a protocol error
+  means something else, and guessing would send you the wrong way.
+
 ## [0.1.1] — 2026-08-01
 
 Documentation and presentation. No behaviour changes to the browser, the lens system, or
@@ -98,6 +109,7 @@ First release. **Read-only by construction** — safe to point at production.
 - In the browser, logs go to `KEYLENS_LOG_FILE` or nowhere — never to stderr, which would
   paint over the rendered frame.
 
-[Unreleased]: https://github.com/keylens/keylens/compare/v0.1.1...HEAD
+[Unreleased]: https://github.com/keylens/keylens/compare/v0.1.2...HEAD
+[0.1.2]: https://github.com/keylens/keylens/releases/tag/v0.1.2
 [0.1.1]: https://github.com/keylens/keylens/releases/tag/v0.1.1
 [0.1.0]: https://github.com/keylens/keylens/releases/tag/v0.1.0

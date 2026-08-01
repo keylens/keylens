@@ -273,11 +273,6 @@ jobs:
             curl -fsSL https://github.com/keylens/keylens/releases/latest/download/install.sh | bash
             ```
 
-            **Homebrew**
-            ```bash
-            brew install keylens/tap/keylens
-            ```
-
             **Cargo**
             ```bash
             cargo install keylens

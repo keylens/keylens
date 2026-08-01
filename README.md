@@ -23,13 +23,7 @@ Valkey 8, and [Recached](https://github.com/thinkgrid-labs/recached) — see
 
 ## Installation
 
-A single binary, no runtime, nothing to deploy. Pick whichever line you like.
-
-**Homebrew** — macOS and Linux:
-
-```sh
-brew install keylens/tap/keylens
-```
+A single binary, no runtime, nothing to deploy.
 
 **Install script** — macOS and Linux, detects your platform:
 
@@ -50,6 +44,10 @@ INSTALL_DIR=~/.local/bin curl -fsSL .../install.sh | bash
 ```sh
 cargo install keylens
 ```
+
+**Homebrew** — not yet. A tap is coming; plain `brew install keylens` additionally needs
+homebrew-core, which has a notability bar this project hasn't cleared yet. Use the install
+script or `cargo install` meanwhile.
 
 **Manual** — grab an archive from
 [releases](https://github.com/keylens/keylens/releases/latest):
