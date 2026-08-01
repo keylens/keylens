@@ -499,6 +499,12 @@ These are enforced, not aspirational:
 See [docs/LENS.md](docs/LENS.md). A lens is a detector, a model, and a view; you can add
 Sidekiq, Celery, RQ or Horizon support without touching core.
 
+## Roadmap
+
+[ROADMAP.md](ROADMAP.md) covers what's next and, more usefully, what keylens knowingly
+doesn't do yet — value paging past the first 200 elements, mutations, and the second lens.
+The ordering there is a judgement call and the issue tracker is where to argue with it.
+
 ## License
 
 [Apache-2.0](LICENSE)
