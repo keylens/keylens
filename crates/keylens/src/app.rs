@@ -103,6 +103,13 @@ pub struct App {
     /// Key whose detail we asked for most recently. Replies for anything else are stale
     /// -- they arrive when the user scrolls faster than the server answers.
     pending_key: Option<String>,
+    /// The cursor moved and the key under it has not been fetched yet.
+    ///
+    /// Cursor movement marks; the event loop fetches once the keys stop coming. Firing a
+    /// request per keypress meant holding `j` queued one five-round-trip fetch per row --
+    /// against a remote server that is a backlog measured in tens of seconds, of which
+    /// every reply but the last is discarded as stale on arrival.
+    selection_dirty: bool,
 
     pub focus: Focus,
     pub mode: Mode,
@@ -155,6 +162,7 @@ impl App {
             stream: None,
             detail_scroll: 0,
             pending_key: None,
+            selection_dirty: false,
             focus: Focus::Tree,
             mode: Mode::Normal,
             search_input: String::new(),
@@ -358,37 +366,37 @@ impl App {
                 }
             }
             View::Stats => {
-                self.send(Request::RefreshInfo).await;
+                let _ = self.send(Request::RefreshInfo).await;
             }
             View::Slowlog => {
                 if force || self.slowlog.is_idle() {
                     self.slowlog = PaneState::Loading;
-                    self.send(Request::LoadSlowlog).await;
+                    let _ = self.send(Request::LoadSlowlog).await;
                 }
             }
             View::Clients => {
                 if force || self.clients.is_idle() {
                     self.clients = PaneState::Loading;
-                    self.send(Request::LoadClients).await;
+                    let _ = self.send(Request::LoadClients).await;
                 }
             }
             View::Cluster => {
                 if force || self.cluster.is_idle() {
                     self.cluster = PaneState::Loading;
-                    self.send(Request::LoadCluster).await;
+                    let _ = self.send(Request::LoadCluster).await;
                 }
             }
             View::PubSub => {
                 if force || self.pubsub.is_idle() {
                     self.pubsub = PaneState::Loading;
-                    self.send(Request::LoadPubSub).await;
+                    let _ = self.send(Request::LoadPubSub).await;
                 }
             }
             View::Queues => match self.level {
                 QueueLevel::Queues => {
                     if force || self.queues.is_idle() {
                         self.queues = PaneState::Loading;
-                        self.send(Request::LoadQueues).await;
+                        let _ = self.send(Request::LoadQueues).await;
                     }
                 }
                 QueueLevel::Jobs => self.load_jobs().await,
@@ -403,7 +411,7 @@ impl App {
         };
         self.jobs = PaneState::Loading;
         let state = self.job_state;
-        self.send(Request::LoadJobs { queue, state }).await;
+        let _ = self.send(Request::LoadJobs { queue, state }).await;
     }
 
     async fn load_job(&mut self) {
@@ -414,7 +422,7 @@ impl App {
             return;
         };
         self.job = PaneState::Loading;
-        self.send(Request::LoadJob { queue, id }).await;
+        let _ = self.send(Request::LoadJob { queue, id }).await;
     }
 
     async fn handle_queues_key(&mut self, key: KeyEvent) {
@@ -511,21 +519,49 @@ impl App {
         *cursor = (*cursor as isize).saturating_add(delta).clamp(0, last) as usize;
     }
 
-    async fn send(&mut self, req: Request) {
-        if self.tx.send(req).await.is_err() {
-            self.error = Some("worker stopped".into());
+    /// Queue a request for the worker. Returns whether it was accepted.
+    ///
+    /// Deliberately non-blocking. `send().await` on a bounded channel parks the *UI task*
+    /// until the worker drains one — so a saturated worker stopped keystrokes and redraws
+    /// entirely, which looks exactly like a hang. Backpressure belongs on the request, not
+    /// on the render loop.
+    async fn send(&mut self, req: Request) -> bool {
+        use tokio::sync::mpsc::error::TrySendError;
+        match self.tx.try_send(req) {
+            Ok(()) => true,
+            Err(TrySendError::Full(_)) => false,
+            Err(TrySendError::Closed(_)) => {
+                self.error = Some("worker stopped".into());
+                false
+            }
         }
     }
 
-    async fn load_selected(&mut self) {
+    /// Note that the cursor moved, without fetching yet.
+    ///
+    /// The fetch happens in [`flush_selection`](Self::flush_selection) once input goes
+    /// quiet, so a held-down `j` costs one request instead of one per row.
+    fn touch_selection(&mut self) {
+        self.selection_dirty = true;
+        // Retire the previous key's failure immediately, though -- not on the next fetch.
+        // Otherwise the old error sits under the new selection and reads as though *that*
+        // key failed too.
+        self.error = None;
+    }
+
+    /// Whether a selection is waiting to be fetched.
+    pub fn selection_pending(&self) -> bool {
+        self.selection_dirty
+    }
+
+    /// Fetch the key under the cursor. Called by the event loop after a short idle gap,
+    /// and directly on `enter`, where the user has said exactly which key they mean.
+    pub async fn flush_selection(&mut self) {
+        self.selection_dirty = false;
+
         let Some((path, is_key)) = self.selected_row().map(|r| (r.path.clone(), r.is_key)) else {
             return;
         };
-
-        // Moving the cursor retires the previous key's failure. Without this the error
-        // stays on screen through the whole load of the *next* key, which reads as though
-        // the new key failed too.
-        self.error = None;
 
         if !is_key {
             self.detail = None;
@@ -533,8 +569,20 @@ impl App {
             self.pending_key = None;
             return;
         }
+
+        // Already showing it, or already asked for it: a repeat keypress on the same row
+        // must not re-fetch.
+        if self.pending_key.as_deref() == Some(path.as_str()) {
+            return;
+        }
+
         self.pending_key = Some(path.clone());
-        self.send(Request::Select { key: path }).await;
+        if !self.send(Request::Select { key: path }).await {
+            // The worker is saturated. Leave it dirty so the next idle tick retries
+            // rather than the pane sitting on `loading…` for a request that never went.
+            self.pending_key = None;
+            self.selection_dirty = true;
+        }
     }
 
     async fn rescan(&mut self) {
@@ -542,7 +590,7 @@ impl App {
         self.status = "scanning…".into();
         self.scan_complete = false;
         let (pattern, kind) = (self.pattern.clone(), self.kind_filter);
-        self.send(Request::Rescan { pattern, kind }).await;
+        let _ = self.send(Request::Rescan { pattern, kind }).await;
     }
 
     pub async fn handle_key(&mut self, key: KeyEvent) {
@@ -674,7 +722,7 @@ impl App {
             KeyCode::Char('m') => {
                 if !self.scan_complete {
                     self.loading = true;
-                    self.send(Request::More).await;
+                    let _ = self.send(Request::More).await;
                 }
             }
 
@@ -701,11 +749,13 @@ impl App {
             KeyCode::PageUp => self.move_cursor(-10).await,
             KeyCode::Home | KeyCode::Char('g') => {
                 self.selected = 0;
-                self.load_selected().await;
+                self.touch_selection();
+                self.flush_selection().await;
             }
             KeyCode::End | KeyCode::Char('G') => {
                 self.selected = self.rows.len().saturating_sub(1);
-                self.load_selected().await;
+                self.touch_selection();
+                self.flush_selection().await;
             }
 
             KeyCode::Enter | KeyCode::Char(' ') | KeyCode::Right | KeyCode::Char('l') => {
@@ -715,7 +765,8 @@ impl App {
                         self.tree.toggle(&path);
                         self.rebuild();
                     } else {
-                        self.load_selected().await;
+                        self.touch_selection();
+                        self.flush_selection().await;
                     }
                 }
             }
@@ -770,7 +821,7 @@ impl App {
         let next = (self.selected as isize + delta).clamp(0, last as isize) as usize;
         if next != self.selected {
             self.selected = next;
-            self.load_selected().await;
+            self.touch_selection();
         }
     }
 }

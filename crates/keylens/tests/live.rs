@@ -1017,3 +1017,44 @@ async fn a_configured_prefix_reaches_the_lens() {
 
     setup.cmd("DEL", vec![meta.into()]).await.ok();
 }
+
+#[tokio::test]
+#[ignore = "requires docker compose fixtures"]
+async fn the_batched_key_read_agrees_with_the_sequential_one() {
+    // `TYPE`/`PTTL`/`MEMORY USAGE` moved into one pipeline and the size now overlaps the
+    // value read. That is a change to *when* commands are issued, so the thing to prove is
+    // that it did not change *what* they return.
+    let conn = conn().await;
+
+    for (key, seed) in [
+        ("keylens:rtt:hash", vec![("HSET", vec!["f", "v"])]),
+        ("keylens:rtt:list", vec![("RPUSH", vec!["a", "b", "c"])]),
+        ("keylens:rtt:str", vec![("SET", vec!["hello"])]),
+    ] {
+        conn.cmd("DEL", vec![key.into()]).await.ok();
+        for (cmd, args) in seed {
+            let mut full: Vec<keylens_conn::Value> = vec![key.into()];
+            full.extend(args.iter().map(|a| keylens_conn::Value::from(*a)));
+            conn.cmd(cmd, full).await.unwrap();
+        }
+        conn.cmd("PEXPIRE", vec![key.into(), 600_000.into()])
+            .await
+            .unwrap();
+
+        let sequential = conn.key_meta(key).await.unwrap();
+
+        let head = conn.key_head(key).await.unwrap();
+        let size = conn.key_size(key, head.kind).await.unwrap();
+
+        assert_eq!(head.kind, sequential.kind, "{key}: type");
+        assert_eq!(size, sequential.size, "{key}: size");
+        assert!(head.ttl_ms.is_some(), "{key}: ttl should be read");
+        assert_eq!(
+            head.memory.is_some(),
+            sequential.memory.is_some(),
+            "{key}: memory availability must not change"
+        );
+
+        conn.cmd("DEL", vec![key.into()]).await.ok();
+    }
+}

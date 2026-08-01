@@ -883,3 +883,152 @@ fn a_server_without_streams_says_so_instead_of_attaching_forever() {
     // The counts above are still real -- only the graph is unavailable.
     assert!(out.contains("emails"), "{out}");
 }
+
+/// Drain the worker channel and report which requests were queued.
+fn drained(rx: &mut Receiver<Request>) -> Vec<Request> {
+    let mut out = Vec::new();
+    while let Ok(req) = rx.try_recv() {
+        out.push(req);
+    }
+    out
+}
+
+fn selects(reqs: &[Request]) -> Vec<String> {
+    reqs.iter()
+        .filter_map(|r| match r {
+            Request::Select { key } => Some(key.clone()),
+            _ => None,
+        })
+        .collect()
+}
+
+#[tokio::test]
+async fn scrolling_costs_one_fetch_not_one_per_row() {
+    // Reading a key is several round trips. Firing one per cursor move meant holding `j`
+    // queued a fetch per row, and against a remote server every reply but the last is
+    // discarded as stale on arrival -- a backlog paid for and thrown away.
+    let (mut app, mut rx) = app_with(&["k1", "k2", "k3", "k4", "k5"]);
+    let _ = drained(&mut rx);
+
+    for _ in 0..4 {
+        app.handle_key(KeyEvent::from(KeyCode::Char('j'))).await;
+    }
+
+    assert!(
+        selects(&drained(&mut rx)).is_empty(),
+        "cursor movement alone must not hit the server"
+    );
+    assert!(app.selection_pending(), "but it must be remembered");
+
+    // The event loop flushes once the keys stop coming.
+    app.flush_selection().await;
+    assert_eq!(
+        selects(&drained(&mut rx)),
+        vec!["k5"],
+        "exactly one fetch, for the row actually landed on"
+    );
+    assert!(!app.selection_pending());
+}
+
+#[tokio::test]
+async fn enter_fetches_immediately_without_waiting_for_the_debounce() {
+    // Debouncing is for movement. `enter` is the user naming the key they want, and it
+    // should not feel like it lagged.
+    let (mut app, mut rx) = app_with(&["solo"]);
+    let _ = drained(&mut rx);
+
+    app.handle_key(KeyEvent::from(KeyCode::Enter)).await;
+    assert_eq!(selects(&drained(&mut rx)), vec!["solo"]);
+    assert!(!app.selection_pending());
+}
+
+#[tokio::test]
+async fn re_selecting_the_same_row_does_not_re_fetch() {
+    let (mut app, mut rx) = app_with(&["a", "b"]);
+    let _ = drained(&mut rx);
+
+    app.handle_key(KeyEvent::from(KeyCode::Char('j'))).await;
+    app.flush_selection().await;
+    assert_eq!(selects(&drained(&mut rx)), vec!["b"]);
+
+    // Pressing enter on the row already in flight must not queue a duplicate.
+    app.handle_key(KeyEvent::from(KeyCode::Enter)).await;
+    assert!(
+        selects(&drained(&mut rx)).is_empty(),
+        "the same key is already pending"
+    );
+}
+
+#[tokio::test]
+async fn a_saturated_worker_never_blocks_the_ui() {
+    // `send().await` on a bounded channel parks the *UI task* until the worker drains one,
+    // so a busy worker froze keystrokes and redraws entirely -- indistinguishable from a
+    // hang. The request is dropped and retried instead.
+    let (tx, _rx) = mpsc::channel(1);
+    let mut app = App::new(
+        ServerInfo::parse("redis_version:8.0.0\r\n"),
+        "redis://x".into(),
+        tx,
+    );
+    app.apply(Update::Batch {
+        keys: vec![("k1".into(), None), ("k2".into(), None)],
+        reset: true,
+        complete: true,
+        scanned_pages: 1,
+    });
+
+    // Fill the single channel slot, then keep going. Each of these would previously have
+    // parked forever; the test simply completing is the assertion.
+    for _ in 0..20 {
+        app.handle_key(KeyEvent::from(KeyCode::Char('j'))).await;
+        app.flush_selection().await;
+        app.handle_key(KeyEvent::from(KeyCode::Char('k'))).await;
+        app.flush_selection().await;
+    }
+
+    assert!(
+        app.selection_pending(),
+        "a dropped fetch stays pending so the next idle tick retries it"
+    );
+    assert!(
+        app.error.is_none(),
+        "a full queue is backpressure, not an error: {:?}",
+        app.error
+    );
+}
+
+#[tokio::test]
+async fn a_dropped_fetch_does_not_leave_the_pane_claiming_to_load_forever() {
+    // If the request never went out, `pending_key` must not be set -- otherwise the value
+    // pane sits on `loading…` waiting for a reply to something nobody asked.
+    let (tx, mut rx) = mpsc::channel(1);
+    let mut app = App::new(
+        ServerInfo::parse("redis_version:8.0.0\r\n"),
+        "redis://x".into(),
+        tx,
+    );
+    app.apply(Update::Batch {
+        keys: vec![("k1".into(), None), ("k2".into(), None)],
+        reset: true,
+        complete: true,
+        scanned_pages: 1,
+    });
+
+    // One slot, already occupied.
+    app.handle_key(KeyEvent::from(KeyCode::Char('j'))).await;
+    app.flush_selection().await;
+    assert_eq!(selects(&drained(&mut rx)).len(), 1, "first one got through");
+
+    // Occupy the slot again and try to move on without draining.
+    app.handle_key(KeyEvent::from(KeyCode::Char('k'))).await;
+    app.flush_selection().await;
+    app.handle_key(KeyEvent::from(KeyCode::Char('j'))).await;
+    app.flush_selection().await;
+
+    assert!(app.selection_pending(), "the retry is queued");
+
+    // Drain and retry: the fetch now lands.
+    let _ = drained(&mut rx);
+    app.flush_selection().await;
+    assert_eq!(selects(&drained(&mut rx)), vec!["k2"]);
+}

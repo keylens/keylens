@@ -21,6 +21,14 @@ const CHANNEL_SIZE: usize = 32;
 /// Server stats refresh interval.
 const INFO_TICK: Duration = Duration::from_secs(5);
 
+/// How long the cursor must sit still before the key under it is fetched.
+///
+/// Reading a key is several round trips, so fetching on every cursor move means holding
+/// `j` for a second queues dozens of them — and against a remote server every reply but
+/// the last is thrown away as stale anyway. Short enough to feel immediate on a deliberate
+/// move, long enough that scrolling through a list costs one request at the end of it.
+const SELECT_DEBOUNCE: Duration = Duration::from_millis(90);
+
 /// Deadline for the browser's connect.
 ///
 /// Long on purpose. The browser draws what it is doing and quits on `q`, so this is only
@@ -185,31 +193,40 @@ struct StreamerHandle {
 impl StreamerHandle {
     /// Attach to the detected queues. Idempotent -- a second detection does not spawn a
     /// second reader.
-    async fn attach(&mut self, prefix: String, queues: Vec<String>) {
+    ///
+    /// Returns as soon as the task is spawned. It must: this is called from the UI event
+    /// loop, and opening the reader's connection is a TLS handshake plus a full capability
+    /// probe, bounded by a 20s timeout. Awaiting that here froze the terminal — no
+    /// keystrokes, no redraws — for the whole handshake, right at the moment the first
+    /// keys had landed and the user was starting to scroll.
+    fn attach(&mut self, prefix: String, queues: Vec<String>) {
         if self.task.is_some() || queues.is_empty() {
             return;
         }
 
-        // Its own connection: `XREAD BLOCK` holds the connection for the duration of the
-        // block, so sharing the worker's would stall every key lookup behind it.
-        let conn = match Conn::connect(&self.url, "events").await {
-            Ok(c) => c,
-            Err(e) => {
-                warn!(error = %e, "could not open a connection for the event stream");
-                // Say so in the UI. Interactive logs go to a sink, so a silent return
-                // leaves the queue table claiming it is still "attaching…" forever.
-                self.updates
-                    .send(Update::EventsStatus(EventsStatus::Unavailable(
+        let url = self.url.clone();
+        let tx = self.updates.clone();
+
+        self.task = Some(tokio::spawn(async move {
+            // Its own connection: `XREAD BLOCK` holds the connection for the duration of
+            // the block, so sharing the worker's would stall every key lookup behind it.
+            let conn = match Conn::connect(&url, "events").await {
+                Ok(c) => c,
+                Err(e) => {
+                    warn!(error = %e, "could not open a connection for the event stream");
+                    // Say so in the UI. Interactive logs go to a sink, so a silent return
+                    // leaves the queue table claiming it is still "attaching…" forever.
+                    tx.send(Update::EventsStatus(EventsStatus::Unavailable(
                         e.to_string(),
                     )))
                     .await
                     .ok();
-                return;
-            }
-        };
+                    return;
+                }
+            };
 
-        let tx = self.updates.clone();
-        self.task = Some(tokio::spawn(crate::events::run(conn, prefix, queues, tx)));
+            crate::events::run(conn, prefix, queues, tx).await;
+        }));
     }
 }
 
@@ -232,6 +249,10 @@ async fn event_loop(
     let mut info_tick = tokio::time::interval(INFO_TICK);
     info_tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
 
+    // When the pending selection should be fetched. Pushed back by every keypress, so a
+    // run of cursor moves collapses into the one fetch the user actually meant.
+    let mut fetch_at: Option<tokio::time::Instant> = None;
+
     terminal.draw(|f| ui::draw(f, app))?;
 
     loop {
@@ -240,10 +261,29 @@ async fn event_loop(
         let mut dirty = false;
 
         tokio::select! {
+            // Disabled unless something is actually waiting, so an idle terminal stays idle.
+            () = async {
+                match fetch_at {
+                    Some(at) => tokio::time::sleep_until(at).await,
+                    None => std::future::pending().await,
+                }
+            } => {
+                fetch_at = None;
+                app.flush_selection().await;
+                // Still pending means the worker was saturated; come back to it.
+                if app.selection_pending() {
+                    fetch_at = Some(tokio::time::Instant::now() + SELECT_DEBOUNCE);
+                }
+                dirty = true;
+            }
+
             maybe_event = events.next() => {
                 match maybe_event {
                     Some(Ok(Event::Key(key))) if key.kind == KeyEventKind::Press => {
                         app.handle_key(key).await;
+                        if app.selection_pending() {
+                            fetch_at = Some(tokio::time::Instant::now() + SELECT_DEBOUNCE);
+                        }
                         dirty = true;
                     }
                     Some(Ok(Event::Resize(_, _))) => dirty = true,
@@ -259,7 +299,7 @@ async fn event_loop(
                 if let Update::Detected(detections) = &update
                     && let Some(d) = detections.first()
                 {
-                    streamer.attach(d.prefix.clone(), d.targets.clone()).await;
+                    streamer.attach(d.prefix.clone(), d.targets.clone());
                 }
                 app.apply(update);
                 dirty = true;

@@ -368,14 +368,48 @@ impl Worker {
         PaneState::Ready(Some(Box::new(JobDetail { job, logs })))
     }
 
+    /// Two round trips, not five.
+    ///
+    /// `TYPE`/`PTTL`/`MEMORY USAGE` go in one pipeline; the size and the value both need
+    /// the type but not each other, so they go out together. Sequentially this was five
+    /// round trips per keypress -- over a second each against a managed host on another
+    /// continent, which is what made scrolling the tree feel broken.
     async fn detail(&self, key: &str) -> Update {
-        let meta = match self.conn.key_meta(key).await {
-            Ok(m) => m,
+        let head = match self.conn.key_head(key).await {
+            Ok(h) => h,
             Err(e) => return Update::Error(e.to_string()),
         };
-        let value = match self.conn.read_value(key, meta.kind, 0).await {
+
+        if head.kind == Kind::None {
+            return Update::Detail {
+                meta: Box::new(KeyMeta {
+                    key: key.into(),
+                    kind: head.kind,
+                    ttl_ms: None,
+                    size: 0,
+                    memory: None,
+                }),
+                value: Box::new(KeyValue::Missing),
+                stream: None,
+            };
+        }
+
+        let (size, value) = tokio::join!(
+            self.conn.key_size(key, head.kind),
+            self.conn.read_value(key, head.kind, 0),
+        );
+
+        let value = match value {
             Ok(v) => v,
             Err(e) => return Update::Error(e.to_string()),
+        };
+        let meta = KeyMeta {
+            key: key.into(),
+            kind: head.kind,
+            ttl_ms: head.ttl_ms,
+            // A size that failed is a missing number, not a missing key.
+            size: size.unwrap_or(0),
+            memory: head.memory,
         };
 
         // Consumer-group state is the reason to open a stream at all, but it's several

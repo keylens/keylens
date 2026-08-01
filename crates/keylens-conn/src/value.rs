@@ -164,50 +164,85 @@ pub fn display_string(v: &Value) -> String {
     }
 }
 
-impl Conn {
-    /// Type, TTL, size and (when permitted) memory for one key.
-    pub async fn key_meta(&self, key: &str) -> Result<KeyMeta> {
-        let kind = Kind::parse(&display_string(&self.cmd("TYPE", vec![key.into()]).await?));
+/// Everything about a key that can be learned without first knowing its type.
+///
+/// Split out from [`KeyMeta`] because the size command *does* depend on the type -- you
+/// cannot ask `HLEN` before `TYPE` comes back. Separating the two is what lets the size
+/// lookup overlap the value read instead of queueing behind it.
+#[derive(Debug, Clone)]
+pub struct KeyHead {
+    pub kind: Kind,
+    pub ttl_ms: Option<i64>,
+    pub memory: Option<u64>,
+}
 
-        if kind == Kind::None {
+impl Conn {
+    /// Type, TTL and memory in a single round trip.
+    ///
+    /// These three are independent of each other and of the key's type, so there is no
+    /// reason to pay three round trips for them. On a managed host ~250ms away that
+    /// difference is most of the delay between pressing `j` and seeing a value.
+    pub async fn key_head(&self, key: &str) -> Result<KeyHead> {
+        let want_memory = self.capabilities().has(Feature::MemoryStats);
+
+        let mut cmds: Vec<(&'static str, Vec<Value>)> =
+            vec![("TYPE", vec![key.into()]), ("PTTL", vec![key.into()])];
+        if want_memory {
+            cmds.push(("MEMORY", vec!["USAGE".into(), key.into()]));
+        }
+
+        let replies = self.pipeline(&cmds).await?;
+        let reply = |i: usize| replies.get(i).and_then(|r| r.as_ref().ok());
+
+        let kind = reply(0)
+            .map(|v| Kind::parse(&display_string(v)))
+            .unwrap_or(Kind::None);
+
+        // PTTL: -1 = no expiry, -2 = key gone. Both mean "nothing to show".
+        let ttl_raw = reply(1).and_then(|v| v.as_i64()).unwrap_or(-1);
+
+        Ok(KeyHead {
+            kind,
+            ttl_ms: (ttl_raw >= 0).then_some(ttl_raw),
+            // MEMORY USAGE is blocked on several managed hosts; absence is not an error.
+            memory: want_memory
+                .then(|| reply(2).and_then(|v| v.as_u64()))
+                .flatten(),
+        })
+    }
+
+    /// Element count, or byte length for a string. One command, and it needs the type.
+    pub async fn key_size(&self, key: &str, kind: Kind) -> Result<u64> {
+        match kind.size_cmd() {
+            Some(cmd) => Ok(self.cmd(cmd, vec![key.into()]).await?.as_u64().unwrap_or(0)),
+            None => Ok(0),
+        }
+    }
+
+    /// Type, TTL, size and (when permitted) memory for one key.
+    ///
+    /// Two round trips: everything type-independent, then the size. Callers that also
+    /// read the value should prefer [`key_head`](Self::key_head) plus a concurrent
+    /// [`key_size`](Self::key_size), which collapses those two into one.
+    pub async fn key_meta(&self, key: &str) -> Result<KeyMeta> {
+        let head = self.key_head(key).await?;
+
+        if head.kind == Kind::None {
             return Ok(KeyMeta {
                 key: key.into(),
-                kind,
+                kind: head.kind,
                 ttl_ms: None,
                 size: 0,
                 memory: None,
             });
         }
 
-        // PTTL: -1 = no expiry, -2 = key gone.
-        let ttl_raw = self
-            .cmd("PTTL", vec![key.into()])
-            .await?
-            .as_i64()
-            .unwrap_or(-1);
-        let ttl_ms = (ttl_raw >= 0).then_some(ttl_raw);
-
-        let size = match kind.size_cmd() {
-            Some(cmd) => self.cmd(cmd, vec![key.into()]).await?.as_u64().unwrap_or(0),
-            None => 0,
-        };
-
-        // MEMORY USAGE is blocked on several managed hosts; absence is not an error.
-        let memory = if self.capabilities().has(Feature::MemoryStats) {
-            self.cmd("MEMORY", vec!["USAGE".into(), key.into()])
-                .await
-                .ok()
-                .and_then(|v| v.as_u64())
-        } else {
-            None
-        };
-
         Ok(KeyMeta {
             key: key.into(),
-            kind,
-            ttl_ms,
-            size,
-            memory,
+            kind: head.kind,
+            ttl_ms: head.ttl_ms,
+            size: self.key_size(key, head.kind).await?,
+            memory: head.memory,
         })
     }
 
