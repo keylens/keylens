@@ -10,6 +10,8 @@
 //! These are the tests that catch upstream drift and wrong assumptions about replies --
 //! the things a mock would happily confirm for you.
 
+use std::time::Duration;
+
 use keylens_conn::{Conn, KeyValue, Kind};
 
 fn url() -> String {
@@ -24,6 +26,52 @@ async fn conn() -> Conn {
     Conn::connect(&url(), "test")
         .await
         .expect("fixtures up? `docker compose up -d`")
+}
+
+/// How long to wait for the producer to terminally fail a job.
+const FAILED_JOB_WAIT: Duration = Duration::from_secs(90);
+
+/// Wait until some queue has a terminally failed job, and return that queue's `failed` set.
+///
+/// A job only reaches `failed` once every attempt is exhausted, and the producer fails
+/// each attempt at a decaying probability -- which for `emails` works out to roughly one
+/// job in a thousand. The seed creates 38 emails jobs and the tick adds about one a
+/// second, so `bull:emails:failed` does not exist for the first *quarter of an hour* after
+/// the fixtures come up. Naming that queue and asserting the key was already there was
+/// asserting that a 0.1% event had happened yet; it passed only when CI was slow enough.
+///
+/// `image-processing` and `reports` fail terminally about one job in twenty, so they get
+/// there within seconds of the seed. Ordered accordingly, and returning whichever queue
+/// arrives first keeps the test about the reply shape rather than about the odds.
+async fn await_failed_jobs(conn: &Conn) -> (String, Vec<(String, f64)>) {
+    const QUEUES: [&str; 5] = [
+        "image-processing",
+        "reports",
+        "exports",
+        "emails",
+        "webhooks",
+    ];
+
+    let started = std::time::Instant::now();
+    loop {
+        for queue in QUEUES {
+            let key = format!("bull:{queue}:failed");
+            // A queue with no failures yet has no key at all, and `ZRANGE` on a missing
+            // key is an empty array rather than an error -- so this is one check, not two.
+            if let Ok(KeyValue::ZSet(entries)) = conn.read_value(&key, Kind::ZSet, 0).await
+                && !entries.is_empty()
+            {
+                return (queue.to_string(), entries);
+            }
+        }
+
+        assert!(
+            started.elapsed() < FAILED_JOB_WAIT,
+            "no queue accumulated a terminally failed job within {FAILED_JOB_WAIT:?} -- is \
+             the producer running? (`docker compose up -d`)"
+        );
+        tokio::time::sleep(Duration::from_millis(500)).await;
+    }
 }
 
 /// Walk the keyspace the way the browser does, with a bound.
@@ -96,19 +144,12 @@ async fn reads_every_type_the_fixture_produces() {
     );
 
     // failed is a ZSET scored by finish timestamp.
-    let failed = conn.key_meta("bull:emails:failed").await.unwrap();
-    assert_eq!(failed.kind, Kind::ZSet);
-    let KeyValue::ZSet(entries) = conn
-        .read_value("bull:emails:failed", Kind::ZSet, 0)
+    let (queue, entries) = await_failed_jobs(&conn).await;
+    let failed = conn
+        .key_meta(&format!("bull:{queue}:failed"))
         .await
-        .unwrap()
-    else {
-        panic!("expected a zset");
-    };
-    assert!(
-        !entries.is_empty(),
-        "producer should have failed some jobs by now"
-    );
+        .unwrap();
+    assert_eq!(failed.kind, Kind::ZSet);
     assert!(
         entries[0].1 > 1.0e12,
         "score should be a ms timestamp, got {}",
@@ -133,17 +174,12 @@ async fn failed_jobs_carry_a_real_stack_trace() {
     // The whole point of the failed-job viewer. If stacktrace is empty, the pane is
     // useless no matter how it's rendered.
     let conn = conn().await;
-    let KeyValue::ZSet(failed) = conn
-        .read_value("bull:image-processing:failed", Kind::ZSet, 0)
-        .await
-        .unwrap()
-    else {
-        panic!("expected a zset");
-    };
-    assert!(!failed.is_empty(), "no failed image-processing jobs yet");
+    // Same hazard as above: pinning one queue asserts that *that* queue has already lost a
+    // job, which is a race against the producer rather than a property of the viewer.
+    let (queue, failed) = await_failed_jobs(&conn).await;
 
     let job_id = &failed[0].0;
-    let key = format!("bull:image-processing:{job_id}");
+    let key = format!("bull:{queue}:{job_id}");
     let KeyValue::Hash(fields) = conn.read_value(&key, Kind::Hash, 0).await.unwrap() else {
         panic!("expected a hash");
     };
