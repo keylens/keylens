@@ -33,7 +33,11 @@ pub async fn run(url: &str, show_queues: bool) -> Result<()> {
     let caps = conn.capabilities();
     for feature in Feature::ALL {
         let availability = caps.get(feature);
-        let mark = if availability.is_available() { "ok  " } else { "--  " };
+        let mark = if availability.is_available() {
+            "ok  "
+        } else {
+            "--  "
+        };
         match availability.reason() {
             None => println!("  {mark}{:<16}", feature.label()),
             Some(why) => println!(
@@ -83,7 +87,12 @@ async fn print_queue_table(lens: &BullMqLens, conn: &Conn) -> Result<()> {
         return Ok(());
     }
 
-    let name_w = queues.iter().map(|q| q.name.len()).max().unwrap_or(5).max(5);
+    let name_w = queues
+        .iter()
+        .map(|q| q.name.len())
+        .max()
+        .unwrap_or(5)
+        .max(5);
 
     print!("  {:<name_w$}  {:>7}", "queue", "status");
     for s in State::ALL {

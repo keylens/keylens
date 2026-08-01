@@ -24,9 +24,9 @@ pub const QUEUE_KEYS: &[(&str, &str)] = &[
     ("limiter", "string"),
     ("meta", "hash"),
     ("events", "stream"),
-    ("pc", "string"),     // priority counter
-    ("marker", "zset"),   // worker wakeup marker
-    ("de", "hash"),       // deduplication
+    ("pc", "string"),   // priority counter
+    ("marker", "zset"), // worker wakeup marker
+    ("de", "hash"),     // deduplication
 ];
 
 /// Job states as BullMQ defines them (`src/types/job-type.ts`).
@@ -123,7 +123,10 @@ pub struct QueueKeys {
 
 impl QueueKeys {
     pub fn new(prefix: impl Into<String>, name: impl Into<String>) -> Self {
-        Self { prefix: prefix.into(), name: name.into() }
+        Self {
+            prefix: prefix.into(),
+            name: name.into(),
+        }
     }
 
     pub fn base(&self) -> String {

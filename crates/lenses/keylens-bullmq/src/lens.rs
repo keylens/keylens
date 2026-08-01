@@ -5,9 +5,7 @@ use keylens_lens::{Confidence, Detection, Lens, Result};
 use tracing::debug;
 
 use crate::job::{self, Job, JobRef};
-use crate::keys::{
-    is_paused, parse_meta_version, queue_name_from_meta_key, QueueKeys, State,
-};
+use crate::keys::{QueueKeys, State, is_paused, parse_meta_version, queue_name_from_meta_key};
 
 /// Detection walks at most this many SCAN pages. Detection runs on every connect, so it
 /// must stay cheap even on a keyspace with millions of unrelated keys.
@@ -26,7 +24,11 @@ pub struct QueueSummary {
 
 impl QueueSummary {
     pub fn count(&self, s: State) -> u64 {
-        self.counts.iter().find(|(k, _)| *k == s).map(|(_, v)| *v).unwrap_or(0)
+        self.counts
+            .iter()
+            .find(|(k, _)| *k == s)
+            .map(|(_, v)| *v)
+            .unwrap_or(0)
     }
 
     pub fn total(&self) -> u64 {
@@ -46,7 +48,9 @@ impl Default for BullMqLens {
 
 impl BullMqLens {
     pub fn new(prefix: impl Into<String>) -> Self {
-        Self { prefix: prefix.into() }
+        Self {
+            prefix: prefix.into(),
+        }
     }
 
     pub fn prefix(&self) -> &str {
@@ -63,7 +67,9 @@ impl BullMqLens {
         let mut names = Vec::new();
 
         for _ in 0..MAX_DETECT_PAGES {
-            let page = conn.scan_page(&cursor, Some(&pattern), SCAN_COUNT, Some("hash")).await?;
+            let page = conn
+                .scan_page(&cursor, Some(&pattern), SCAN_COUNT, Some("hash"))
+                .await?;
 
             for key in &page.keys {
                 if let Some(name) = queue_name_from_meta_key(&self.prefix, key) {
@@ -89,7 +95,11 @@ impl BullMqLens {
         let reply = conn
             .cmd(
                 "HMGET",
-                vec![Value::from(keys.meta()), Value::from("version"), Value::from("paused")],
+                vec![
+                    Value::from(keys.meta()),
+                    Value::from("version"),
+                    Value::from("paused"),
+                ],
             )
             .await?;
 
@@ -134,7 +144,11 @@ impl BullMqLens {
             let keys = QueueKeys::new(&self.prefix, name);
             cmds.push((
                 "HMGET",
-                vec![Value::from(keys.meta()), Value::from("version"), Value::from("paused")],
+                vec![
+                    Value::from(keys.meta()),
+                    Value::from("version"),
+                    Value::from("paused"),
+                ],
             ));
             for state in State::ALL {
                 cmds.push((state.count_cmd(), vec![Value::from(keys.state(state))]));
@@ -160,12 +174,19 @@ impl BullMqLens {
                     .iter()
                     .enumerate()
                     .map(|(j, state)| {
-                        let n = replies.get(base + 1 + j).and_then(|v| v.as_u64()).unwrap_or(0);
+                        let n = replies
+                            .get(base + 1 + j)
+                            .and_then(|v| v.as_u64())
+                            .unwrap_or(0);
                         (*state, n)
                     })
                     .collect();
 
-                QueueSummary { name: name.clone(), paused, counts }
+                QueueSummary {
+                    name: name.clone(),
+                    paused,
+                    counts,
+                }
             })
             .collect())
     }
@@ -193,7 +214,10 @@ impl BullMqLens {
         let stop = start + limit as i64 - 1;
 
         let reply = match state.count_cmd() {
-            "LLEN" => conn.cmd("LRANGE", vec![key.into(), start.into(), stop.into()]).await?,
+            "LLEN" => {
+                conn.cmd("LRANGE", vec![key.into(), start.into(), stop.into()])
+                    .await?
+            }
             _ => {
                 conn.cmd(
                     // Newest first: for completed and failed, the recent end is the one
@@ -205,7 +229,9 @@ impl BullMqLens {
             }
         };
 
-        let Value::Array(items) = reply else { return Ok(Vec::new()) };
+        let Value::Array(items) = reply else {
+            return Ok(Vec::new());
+        };
 
         Ok(match state.count_cmd() {
             "LLEN" => items
@@ -216,7 +242,10 @@ impl BullMqLens {
             _ => items
                 .chunks_exact(2)
                 .filter_map(|c| {
-                    c[0].as_string().map(|id| JobRef { id, score: c[1].as_f64() })
+                    c[0].as_string().map(|id| JobRef {
+                        id,
+                        score: c[1].as_f64(),
+                    })
                 })
                 .collect(),
         })
@@ -230,7 +259,9 @@ impl BullMqLens {
         args.extend(job::JOB_FIELDS.iter().map(|f| Value::from(*f)));
 
         let reply = conn.cmd("HMGET", args).await?;
-        let Value::Array(values) = reply else { return Ok(None) };
+        let Value::Array(values) = reply else {
+            return Ok(None);
+        };
 
         let fields: Vec<Option<String>> = values.iter().map(|v| v.as_string()).collect();
         if fields.iter().all(|f| f.is_none()) {
@@ -252,10 +283,16 @@ impl BullMqLens {
         let reply = conn
             .cmd(
                 "LRANGE",
-                vec![Value::from(keys.job_logs(id)), 0.into(), (limit as i64 - 1).into()],
+                vec![
+                    Value::from(keys.job_logs(id)),
+                    0.into(),
+                    (limit as i64 - 1).into(),
+                ],
             )
             .await?;
-        let Value::Array(items) = reply else { return Ok(Vec::new()) };
+        let Value::Array(items) = reply else {
+            return Ok(Vec::new());
+        };
         Ok(items.iter().filter_map(|v| v.as_string()).collect())
     }
 }
@@ -325,7 +362,11 @@ mod tests {
     use super::*;
 
     fn summary(counts: Vec<(State, u64)>, paused: bool) -> QueueSummary {
-        QueueSummary { name: "emails".into(), paused, counts }
+        QueueSummary {
+            name: "emails".into(),
+            paused,
+            counts,
+        }
     }
 
     #[test]

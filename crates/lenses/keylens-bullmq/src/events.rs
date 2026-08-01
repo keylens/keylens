@@ -86,11 +86,20 @@ impl Series {
         let idx = match self.buckets.iter().rposition(|b| b.second <= second) {
             Some(i) if self.buckets[i].second == second => i,
             Some(i) => {
-                self.buckets.insert(i + 1, Bucket { second, ..Default::default() });
+                self.buckets.insert(
+                    i + 1,
+                    Bucket {
+                        second,
+                        ..Default::default()
+                    },
+                );
                 i + 1
             }
             None => {
-                self.buckets.push_front(Bucket { second, ..Default::default() });
+                self.buckets.push_front(Bucket {
+                    second,
+                    ..Default::default()
+                });
                 0
             }
         };
@@ -138,8 +147,12 @@ impl Series {
             return 0.0;
         }
         let start = now - secs + 1;
-        let total: u64 =
-            self.buckets.iter().filter(|b| b.second >= start && b.second <= now).map(|b| b.total).sum();
+        let total: u64 = self
+            .buckets
+            .iter()
+            .filter(|b| b.second >= start && b.second <= now)
+            .map(|b| b.total)
+            .sum();
         total as f64 / secs as f64
     }
 
@@ -160,7 +173,10 @@ pub struct Throughput {
 impl Throughput {
     /// `at_ms` is the event's own timestamp, taken from the stream entry id.
     pub fn record(&mut self, queue: &str, kind: EventKind, at_ms: i64) {
-        self.series.entry(queue.to_string()).or_default().record(kind, at_ms / 1000);
+        self.series
+            .entry(queue.to_string())
+            .or_default()
+            .record(kind, at_ms / 1000);
     }
 
     pub fn series(&self, queue: &str) -> Option<&Series> {

@@ -11,7 +11,7 @@ use fred::prelude::*;
 use fred::types::{ClusterHash, CustomCommand};
 use tracing::debug;
 
-use crate::capability::{classify, Availability, Capabilities, Feature};
+use crate::capability::{Availability, Capabilities, Feature, classify};
 use crate::error::{ConnError, Result};
 use crate::server_info::ServerInfo;
 
@@ -52,11 +52,34 @@ impl Conn {
 
         client.init().await.map_err(ConnError::Connect)?;
 
-        let raw = raw_info(&client).await?;
-        let server = ServerInfo::parse(&raw);
-        let caps = probe(&client).await;
+        // A missing `INFO` must not stop us connecting. Some Redis-compatible servers
+        // don't implement it at all, and locked-down managed hosts block it -- in both
+        // cases the key browser still works perfectly, so failing the whole connection
+        // over a stats pane would be absurd.
+        let (server, mut caps) = match raw_info(&client).await {
+            Ok(raw) => (ServerInfo::parse(&raw), probe(&client).await),
+            Err(e) => {
+                debug!(error = %e, "INFO unavailable; continuing without server metadata");
+                let mut caps = probe(&client).await;
+                caps.set(Feature::ServerInfo, classify_from(&e));
+                (ServerInfo::unknown(), caps)
+            }
+        };
+        if caps.get(Feature::ServerInfo) == Availability::Unsupported && !server.fields.is_empty() {
+            caps.set(Feature::ServerInfo, Availability::Available);
+        }
 
-        Ok(Self { client, server, caps, label: label.into() })
+        Ok(Self {
+            client,
+            server,
+            caps,
+            label: label.into(),
+        })
+    }
+
+    /// Whether this server answered `INFO` at all.
+    pub fn has_server_info(&self) -> bool {
+        self.caps.has(Feature::ServerInfo)
     }
 
     pub fn label(&self) -> &str {
@@ -108,9 +131,15 @@ impl Conn {
 
         let reply: Value = self
             .client
-            .custom(CustomCommand::new_static("SCAN", ClusterHash::FirstKey, false), args)
+            .custom(
+                CustomCommand::new_static("SCAN", ClusterHash::FirstKey, false),
+                args,
+            )
             .await
-            .map_err(|source| ConnError::Command { cmd: "SCAN", source })?;
+            .map_err(|source| ConnError::Command {
+                cmd: "SCAN",
+                source,
+            })?;
 
         parse_scan_reply(reply)
     }
@@ -119,7 +148,10 @@ impl Conn {
     /// the caller's job.
     pub async fn cmd(&self, name: &'static str, args: Vec<Value>) -> Result<Value> {
         self.client
-            .custom(CustomCommand::new_static(name, ClusterHash::FirstKey, false), args)
+            .custom(
+                CustomCommand::new_static(name, ClusterHash::FirstKey, false),
+                args,
+            )
             .await
             .map_err(|source| ConnError::Command { cmd: name, source })
     }
@@ -142,11 +174,24 @@ impl Conn {
                     args.clone(),
                 )
                 .await
-                .map_err(|source| ConnError::Command { cmd: "PIPELINE", source })?;
+                .map_err(|source| ConnError::Command {
+                    cmd: "PIPELINE",
+                    source,
+                })?;
         }
         pipe.all::<Vec<Value>>()
             .await
-            .map_err(|source| ConnError::Command { cmd: "PIPELINE", source })
+            .map_err(|source| ConnError::Command {
+                cmd: "PIPELINE",
+                source,
+            })
+    }
+}
+
+fn classify_from(e: &ConnError) -> Availability {
+    match e {
+        ConnError::Command { source, .. } => classify(source),
+        _ => Availability::Unsupported,
     }
 }
 
@@ -157,7 +202,10 @@ async fn raw_info(client: &Client) -> Result<String> {
             vec![],
         )
         .await
-        .map_err(|source| ConnError::Command { cmd: "INFO", source })
+        .map_err(|source| ConnError::Command {
+            cmd: "INFO",
+            source,
+        })
 }
 
 fn parse_scan_reply(reply: Value) -> Result<ScanPage> {
@@ -167,13 +215,14 @@ fn parse_scan_reply(reply: Value) -> Result<ScanPage> {
             return Err(ConnError::Reply {
                 cmd: "SCAN",
                 detail: format!("expected 2-element array, got {other:?}"),
-            })
+            });
         }
     };
 
-    let cursor = parts[0]
-        .as_string()
-        .ok_or_else(|| ConnError::Reply { cmd: "SCAN", detail: "cursor not a string".into() })?;
+    let cursor = parts[0].as_string().ok_or_else(|| ConnError::Reply {
+        cmd: "SCAN",
+        detail: "cursor not a string".into(),
+    })?;
 
     let keys = match &parts[1] {
         Value::Array(items) => items.iter().filter_map(|v| v.as_string()).collect(),
@@ -181,7 +230,7 @@ fn parse_scan_reply(reply: Value) -> Result<ScanPage> {
             return Err(ConnError::Reply {
                 cmd: "SCAN",
                 detail: format!("keys not an array, got {other:?}"),
-            })
+            });
         }
     };
 
@@ -197,17 +246,28 @@ async fn probe(client: &Client) -> Capabilities {
         (Feature::Config, "CONFIG", &["GET", "maxmemory"]),
         (Feature::ClientList, "CLIENT", &["INFO"]),
         (Feature::Slowlog, "SLOWLOG", &["LEN"]),
-        (Feature::MemoryStats, "MEMORY", &["USAGE", "keylens:__probe__"]),
+        (
+            Feature::MemoryStats,
+            "MEMORY",
+            &["USAGE", "keylens:__probe__"],
+        ),
         (Feature::Cluster, "CLUSTER", &["INFO"]),
         (Feature::Modules, "MODULE", &["LIST"]),
         (Feature::Streams, "XLEN", &["keylens:__probe__"]),
-        (Feature::PubSub, "PUBSUB", &["CHANNELS", "keylens:__probe__"]),
+        (
+            Feature::PubSub,
+            "PUBSUB",
+            &["CHANNELS", "keylens:__probe__"],
+        ),
     ];
 
     for (feature, cmd, args) in probes {
         let argv: Vec<Value> = args.iter().map(|a| Value::from(*a)).collect();
         let result: std::result::Result<Value, Error> = client
-            .custom(CustomCommand::new(cmd.to_string(), ClusterHash::FirstKey, false), argv)
+            .custom(
+                CustomCommand::new(cmd.to_string(), ClusterHash::FirstKey, false),
+                argv,
+            )
             .await;
 
         let availability = match result {
@@ -221,8 +281,13 @@ async fn probe(client: &Client) -> Capabilities {
     }
 
     // `SCAN ... TYPE` is Redis 6+; probing it needs its own shape.
-    let scan_type_args: Vec<Value> =
-        vec!["0".into(), "COUNT".into(), 1.into(), "TYPE".into(), "string".into()];
+    let scan_type_args: Vec<Value> = vec![
+        "0".into(),
+        "COUNT".into(),
+        1.into(),
+        "TYPE".into(),
+        "string".into(),
+    ];
     let scan_type: std::result::Result<Value, Error> = client
         .custom(
             CustomCommand::new_static("SCAN", ClusterHash::FirstKey, false),
@@ -288,10 +353,16 @@ mod tests {
     fn scan_page_completion_is_cursor_driven_not_emptiness() {
         // An empty page mid-iteration is normal -- SCAN can return zero keys while the
         // cursor is still non-zero. Stopping on emptiness silently truncates the tree.
-        let mid = ScanPage { cursor: "1234".into(), keys: vec![] };
+        let mid = ScanPage {
+            cursor: "1234".into(),
+            keys: vec![],
+        };
         assert!(!mid.is_complete());
 
-        let done = ScanPage { cursor: "0".into(), keys: vec!["a".into()] };
+        let done = ScanPage {
+            cursor: "0".into(),
+            keys: vec!["a".into()],
+        };
         assert!(done.is_complete());
     }
 

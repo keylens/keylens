@@ -15,6 +15,7 @@
  */
 
 import { Queue, Worker, FlowProducer } from 'bullmq';
+import Redis from 'ioredis';
 
 const connection = {
   host: process.env.REDIS_HOST ?? '127.0.0.1',
@@ -192,6 +193,92 @@ for (const def of DEFINITIONS) {
 const flow = new FlowProducer({ connection });
 
 /* -------------------------------------------------------------------------- */
+/* A stream with consumer groups                                               */
+/* -------------------------------------------------------------------------- */
+
+/**
+ * BullMQ's own events streams have no consumer groups -- workers use XREAD, not
+ * XREADGROUP -- so nothing in a plain BullMQ keyspace exercises `XINFO GROUPS`,
+ * `XINFO CONSUMERS` or `XPENDING`.
+ *
+ * This adds a realistic group workload so the stream viewer has something true to render:
+ * one healthy consumer that acknowledges, and one that reads but never acks and then
+ * stops entirely. That produces growing pending entries, real per-consumer idle time, and
+ * a group lag that keeps climbing -- exactly the situation you open a stream viewer to
+ * diagnose.
+ */
+const AUDIT_STREAM = 'keylens:audit';
+const AUDIT_GROUP = 'processors';
+
+async function auditStream() {
+  const redis = new Redis(connection);
+
+  const write = async () => {
+    await redis.xadd(
+      AUDIT_STREAM,
+      'MAXLEN',
+      '~',
+      '5000',
+      '*',
+      'actor',
+      pick(['api', 'cron', 'admin']),
+      'action',
+      pick(['create', 'update', 'delete']),
+      'entity',
+      `order:${rand(100000)}`,
+    );
+  };
+
+  // Seed before creating the group so the group starts from a known point.
+  for (let i = 0; i < 50; i++) await write();
+
+  try {
+    await redis.xgroup('CREATE', AUDIT_STREAM, AUDIT_GROUP, '0', 'MKSTREAM');
+  } catch (err) {
+    if (!String(err.message).includes('BUSYGROUP')) throw err;
+  }
+
+  // Healthy consumer: reads and acknowledges.
+  const healthy = async () => {
+    const client = new Redis(connection);
+    for (;;) {
+      const res = await client.xreadgroup(
+        'GROUP', AUDIT_GROUP, 'worker-healthy',
+        'COUNT', 10, 'BLOCK', 2000,
+        'STREAMS', AUDIT_STREAM, '>',
+      );
+      if (!res) continue;
+      for (const [, entries] of res) {
+        for (const [id] of entries) await client.xack(AUDIT_STREAM, AUDIT_GROUP, id);
+      }
+    }
+  };
+
+  // Lagging consumer: reads a burst, never acknowledges, then goes quiet. Its idle time
+  // grows and its entries stay pending forever.
+  const lagging = async () => {
+    const client = new Redis(connection);
+    for (let round = 0; round < 3; round++) {
+      await client.xreadgroup(
+        'GROUP', AUDIT_GROUP, 'worker-stuck',
+        'COUNT', 25, 'BLOCK', 1000,
+        'STREAMS', AUDIT_STREAM, '>',
+      );
+      await sleep(2000);
+    }
+    console.log('[audit] worker-stuck has gone quiet with entries still pending');
+  };
+
+  healthy().catch((e) => console.error('healthy consumer stopped:', e));
+  lagging().catch((e) => console.error('lagging consumer stopped:', e));
+
+  for (;;) {
+    await write();
+    await sleep(400);
+  }
+}
+
+/* -------------------------------------------------------------------------- */
 /* Traffic                                                                     */
 /* -------------------------------------------------------------------------- */
 
@@ -283,6 +370,7 @@ async function main() {
   console.log(`connecting to redis://${connection.host}:${connection.port}`);
   await seed();
   pauseCycle().catch((e) => console.error('pause cycle stopped:', e));
+  auditStream().catch((e) => console.error('audit stream stopped:', e));
 
   console.log(`producing ~${JOBS_PER_TICK} jobs every ${TICK_MS}ms`);
   for (;;) {

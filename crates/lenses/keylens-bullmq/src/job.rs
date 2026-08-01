@@ -154,7 +154,12 @@ mod tests {
     fn values(pairs: &[(&str, &str)]) -> Vec<Option<String>> {
         JOB_FIELDS
             .iter()
-            .map(|f| pairs.iter().find(|(k, _)| k == f).map(|(_, v)| v.to_string()))
+            .map(|f| {
+                pairs
+                    .iter()
+                    .find(|(k, _)| k == f)
+                    .map(|(_, v)| v.to_string())
+            })
             .collect()
     }
 

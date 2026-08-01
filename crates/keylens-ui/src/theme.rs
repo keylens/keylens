@@ -7,9 +7,41 @@
 //! The brand pair is magenta → cyan. Everything else is semantic: green means healthy,
 //! yellow means look at this, red means it's wrong.
 
+use std::sync::atomic::{AtomicBool, Ordering};
+
 use keylens_conn::Kind;
 use ratatui::style::{Color, Modifier, Style};
 use ratatui::widgets::{Block, BorderType};
+
+static COLOR_ENABLED: AtomicBool = AtomicBool::new(true);
+
+/// Turn colour off, per <https://no-color.org> or an explicit `--no-color`.
+pub fn set_color_enabled(enabled: bool) {
+    COLOR_ENABLED.store(enabled, Ordering::Relaxed);
+}
+
+pub fn color_enabled() -> bool {
+    COLOR_ENABLED.load(Ordering::Relaxed)
+}
+
+/// Strip colour from a style while keeping its modifiers.
+///
+/// The NO_COLOR convention is about *colour*, not about typography — bold and dim still
+/// carry the hierarchy, so a monochrome terminal keeps a readable layout instead of a flat
+/// wall of identical text.
+fn paint(style: Style) -> Style {
+    paint_with(style, color_enabled())
+}
+
+/// The pure form, so tests can exercise both modes without touching the global — which
+/// would otherwise race against every other test running in parallel.
+fn paint_with(style: Style, enabled: bool) -> Style {
+    if enabled {
+        style
+    } else {
+        Style::new().add_modifier(style.add_modifier)
+    }
+}
 
 pub struct Theme;
 
@@ -19,9 +51,23 @@ impl Theme {
     pub const BRAND_A: Color = Color::Magenta;
     pub const BRAND_B: Color = Color::Cyan;
 
+    /// The two halves of the block wordmark: `KEY` then `LENS`.
+    pub fn brand_a() -> Style {
+        paint(Style::new().fg(Self::BRAND_A).add_modifier(Modifier::BOLD))
+    }
+
+    pub fn brand_b() -> Style {
+        paint(Style::new().fg(Self::BRAND_B).add_modifier(Modifier::BOLD))
+    }
+
     /// The `KEYLENS` wordmark in the status bar.
     pub fn brand() -> Style {
-        Style::new().fg(Color::Black).bg(Self::BRAND_A).add_modifier(Modifier::BOLD)
+        paint(
+            Style::new()
+                .fg(Color::Black)
+                .bg(Self::BRAND_A)
+                .add_modifier(Modifier::BOLD),
+        )
     }
 
     // ---- text ------------------------------------------------------------------
@@ -31,75 +77,90 @@ impl Theme {
     }
 
     pub fn dim() -> Style {
-        Style::new().fg(Color::DarkGray)
+        paint(Style::new().fg(Color::DarkGray))
     }
 
     pub fn label() -> Style {
-        Style::new().fg(Color::Gray)
+        paint(Style::new().fg(Color::Gray))
     }
 
     pub fn title() -> Style {
-        Style::new().fg(Self::BRAND_B).add_modifier(Modifier::BOLD)
+        paint(Style::new().fg(Self::BRAND_B).add_modifier(Modifier::BOLD))
     }
 
     /// Section heading inside a pane.
     pub fn heading() -> Style {
-        Style::new().fg(Self::BRAND_A).add_modifier(Modifier::BOLD)
+        paint(Style::new().fg(Self::BRAND_A).add_modifier(Modifier::BOLD))
     }
 
     pub fn selected() -> Style {
-        Style::new().fg(Color::Black).bg(Self::BRAND_B).add_modifier(Modifier::BOLD)
+        paint(
+            Style::new()
+                .fg(Color::Black)
+                .bg(Self::BRAND_B)
+                .add_modifier(Modifier::BOLD),
+        )
     }
 
     pub fn branch() -> Style {
-        Style::new().fg(Color::Blue).add_modifier(Modifier::BOLD)
+        paint(Style::new().fg(Color::Blue).add_modifier(Modifier::BOLD))
     }
 
     pub fn key_name() -> Style {
-        Style::new().fg(Color::White)
+        paint(Style::new().fg(Color::White))
     }
 
     pub fn field() -> Style {
-        Style::new().fg(Color::Yellow)
+        paint(Style::new().fg(Color::Yellow))
     }
 
     pub fn value() -> Style {
-        Style::new().fg(Color::White)
+        paint(Style::new().fg(Color::White))
     }
 
     pub fn error() -> Style {
-        Style::new().fg(Color::Red).add_modifier(Modifier::BOLD)
+        paint(Style::new().fg(Color::Red).add_modifier(Modifier::BOLD))
     }
 
     pub fn ok() -> Style {
-        Style::new().fg(Color::Green)
+        paint(Style::new().fg(Color::Green))
     }
 
     pub fn warn() -> Style {
-        Style::new().fg(Color::Yellow)
+        paint(Style::new().fg(Color::Yellow))
     }
 
     pub fn accent() -> Style {
-        Style::new().fg(Self::BRAND_A)
+        paint(Style::new().fg(Self::BRAND_A))
     }
 
     pub fn number() -> Style {
-        Style::new().fg(Color::LightCyan)
+        paint(Style::new().fg(Color::LightCyan))
     }
 
     // ---- chrome ----------------------------------------------------------------
 
     /// A filled badge, e.g. the vendor name or an active filter.
     pub fn chip(color: Color) -> Style {
-        Style::new().fg(Color::Black).bg(color).add_modifier(Modifier::BOLD)
+        paint(
+            Style::new()
+                .fg(Color::Black)
+                .bg(color)
+                .add_modifier(Modifier::BOLD),
+        )
     }
 
     pub fn tab_active() -> Style {
-        Style::new().fg(Color::Black).bg(Self::BRAND_B).add_modifier(Modifier::BOLD)
+        paint(
+            Style::new()
+                .fg(Color::Black)
+                .bg(Self::BRAND_B)
+                .add_modifier(Modifier::BOLD),
+        )
     }
 
     pub fn tab_inactive() -> Style {
-        Style::new().fg(Color::DarkGray)
+        paint(Style::new().fg(Color::DarkGray))
     }
 
     /// Rounded borders throughout -- softer than the default square corners and the main
@@ -110,7 +171,11 @@ impl Theme {
             .border_style(if focused { Self::title() } else { Self::dim() })
             .title(ratatui::text::Span::styled(
                 format!(" {title} "),
-                if focused { Self::title() } else { Self::label() },
+                if focused {
+                    Self::title()
+                } else {
+                    Self::label()
+                },
             ))
     }
 
@@ -125,7 +190,7 @@ impl Theme {
             Some(Kind::Stream) => Color::LightBlue,
             _ => Color::DarkGray,
         };
-        Style::new().fg(color)
+        paint(Style::new().fg(color))
     }
 
     /// Green below 60%, yellow to 85%, red above -- used for memory and hit-rate bars.
@@ -137,7 +202,7 @@ impl Theme {
         } else {
             Color::Green
         };
-        Style::new().fg(color)
+        paint(Style::new().fg(color))
     }
 
     /// Hit rate reads the opposite way round: high is good.
@@ -165,8 +230,32 @@ mod tests {
     }
 
     #[test]
+    fn no_color_strips_colour_but_keeps_typography() {
+        // The NO_COLOR convention is about colour, not about layout: dropping bold too
+        // would flatten every heading and selection into identical text.
+        let styled = Style::new()
+            .fg(Color::Red)
+            .bg(Color::Black)
+            .add_modifier(Modifier::BOLD);
+
+        let plain = paint_with(styled, false);
+        assert_eq!(plain.fg, None);
+        assert_eq!(plain.bg, None);
+        assert!(plain.add_modifier.contains(Modifier::BOLD));
+
+        assert_eq!(paint_with(styled, true), styled, "colour mode is untouched");
+    }
+
+    #[test]
     fn every_redis_type_gets_a_distinct_colour() {
-        let kinds = [Kind::String, Kind::Hash, Kind::List, Kind::Set, Kind::ZSet, Kind::Stream];
+        let kinds = [
+            Kind::String,
+            Kind::Hash,
+            Kind::List,
+            Kind::Set,
+            Kind::ZSet,
+            Kind::Stream,
+        ];
         let mut seen = Vec::new();
         for k in kinds {
             let c = Theme::kind(Some(k)).fg.unwrap();

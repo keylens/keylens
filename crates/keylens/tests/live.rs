@@ -21,7 +21,9 @@ fn valkey_url() -> String {
 }
 
 async fn conn() -> Conn {
-    Conn::connect(&url(), "test").await.expect("fixtures up? `docker compose up -d`")
+    Conn::connect(&url(), "test")
+        .await
+        .expect("fixtures up? `docker compose up -d`")
 }
 
 /// Walk the keyspace the way the browser does, with a bound.
@@ -44,7 +46,10 @@ async fn scan_all(conn: &Conn, pattern: Option<&str>, kind: Option<&str>) -> Vec
 async fn scans_the_bullmq_keyspace() {
     let conn = conn().await;
     let keys = scan_all(&conn, Some("bull:*"), None).await;
-    assert!(!keys.is_empty(), "no bull:* keys -- is the producer running?");
+    assert!(
+        !keys.is_empty(),
+        "no bull:* keys -- is the producer running?"
+    );
     assert!(keys.iter().any(|k| k.ends_with(":meta")));
     assert!(keys.iter().any(|k| k.ends_with(":events")));
 }
@@ -54,7 +59,10 @@ async fn scans_the_bullmq_keyspace() {
 async fn type_filter_is_applied_server_side() {
     let conn = conn().await;
     let streams = scan_all(&conn, Some("bull:*"), Some("stream")).await;
-    assert!(!streams.is_empty(), "BullMQ writes an events stream per queue");
+    assert!(
+        !streams.is_empty(),
+        "BullMQ writes an events stream per queue"
+    );
 
     // Every returned key must genuinely be a stream, or the filter is a lie.
     for key in streams.iter().take(10) {
@@ -71,11 +79,17 @@ async fn reads_every_type_the_fixture_produces() {
     // meta is a hash, and it carries the version marker the lens keys off.
     let meta = conn.key_meta("bull:emails:meta").await.unwrap();
     assert_eq!(meta.kind, Kind::Hash);
-    let KeyValue::Hash(fields) = conn.read_value("bull:emails:meta", Kind::Hash, 0).await.unwrap()
+    let KeyValue::Hash(fields) = conn
+        .read_value("bull:emails:meta", Kind::Hash, 0)
+        .await
+        .unwrap()
     else {
         panic!("expected a hash");
     };
-    let version = fields.iter().find(|(f, _)| f == "version").map(|(_, v)| v.clone());
+    let version = fields
+        .iter()
+        .find(|(f, _)| f == "version")
+        .map(|(_, v)| v.clone());
     assert!(
         version.is_some_and(|v| v.starts_with("bullmq:")),
         "meta.version should carry `bullmq:<version>`"
@@ -84,16 +98,31 @@ async fn reads_every_type_the_fixture_produces() {
     // failed is a ZSET scored by finish timestamp.
     let failed = conn.key_meta("bull:emails:failed").await.unwrap();
     assert_eq!(failed.kind, Kind::ZSet);
-    let KeyValue::ZSet(entries) = conn.read_value("bull:emails:failed", Kind::ZSet, 0).await.unwrap()
+    let KeyValue::ZSet(entries) = conn
+        .read_value("bull:emails:failed", Kind::ZSet, 0)
+        .await
+        .unwrap()
     else {
         panic!("expected a zset");
     };
-    assert!(!entries.is_empty(), "producer should have failed some jobs by now");
-    assert!(entries[0].1 > 1.0e12, "score should be a ms timestamp, got {}", entries[0].1);
+    assert!(
+        !entries.is_empty(),
+        "producer should have failed some jobs by now"
+    );
+    assert!(
+        entries[0].1 > 1.0e12,
+        "score should be a ms timestamp, got {}",
+        entries[0].1
+    );
 
     // events is a stream.
-    let events = conn.read_value("bull:emails:events", Kind::Stream, 0).await.unwrap();
-    let KeyValue::Stream(entries) = events else { panic!("expected a stream") };
+    let events = conn
+        .read_value("bull:emails:events", Kind::Stream, 0)
+        .await
+        .unwrap();
+    let KeyValue::Stream(entries) = events else {
+        panic!("expected a stream")
+    };
     assert!(!entries.is_empty());
     assert!(entries[0].fields.iter().any(|(f, _)| f == "event"));
 }
@@ -104,8 +133,10 @@ async fn failed_jobs_carry_a_real_stack_trace() {
     // The whole point of the failed-job viewer. If stacktrace is empty, the pane is
     // useless no matter how it's rendered.
     let conn = conn().await;
-    let KeyValue::ZSet(failed) =
-        conn.read_value("bull:image-processing:failed", Kind::ZSet, 0).await.unwrap()
+    let KeyValue::ZSet(failed) = conn
+        .read_value("bull:image-processing:failed", Kind::ZSet, 0)
+        .await
+        .unwrap()
     else {
         panic!("expected a zset");
     };
@@ -117,7 +148,12 @@ async fn failed_jobs_carry_a_real_stack_trace() {
         panic!("expected a hash");
     };
 
-    let get = |name: &str| fields.iter().find(|(f, _)| f == name).map(|(_, v)| v.clone());
+    let get = |name: &str| {
+        fields
+            .iter()
+            .find(|(f, _)| f == name)
+            .map(|(_, v)| v.clone())
+    };
 
     let reason = get("failedReason").expect("failedReason missing");
     assert!(!reason.is_empty());
@@ -127,7 +163,10 @@ async fn failed_jobs_carry_a_real_stack_trace() {
         stacktrace.contains("at "),
         "stacktrace should have real frames, got: {stacktrace}"
     );
-    assert!(get("data").is_some_and(|d| d.starts_with('{')), "payload should be JSON");
+    assert!(
+        get("data").is_some_and(|d| d.starts_with('{')),
+        "payload should be JSON"
+    );
 }
 
 #[tokio::test]
@@ -145,7 +184,11 @@ async fn pipelined_typing_matches_individual_typing() {
         .map(|k| ("TYPE", vec![keylens_conn::Value::from(k.as_str())]))
         .collect();
     let piped = conn.pipeline(&cmds).await.unwrap();
-    assert_eq!(piped.len(), sample.len(), "pipeline must return one reply per command");
+    assert_eq!(
+        piped.len(),
+        sample.len(),
+        "pipeline must return one reply per command"
+    );
 
     let mut compared = 0;
     for (i, key) in sample.iter().enumerate() {
@@ -159,10 +202,16 @@ async fn pipelined_typing_matches_individual_typing() {
             continue;
         }
 
-        assert_eq!(pipelined, individual, "type mismatch for {key} at index {i}");
+        assert_eq!(
+            pipelined, individual,
+            "type mismatch for {key} at index {i}"
+        );
         compared += 1;
     }
-    assert!(compared >= 5, "only {compared} keys survived long enough to compare");
+    assert!(
+        compared >= 5,
+        "only {compared} keys survived long enough to compare"
+    );
 }
 
 #[tokio::test]
@@ -175,8 +224,14 @@ async fn client_list_parses_against_a_real_server() {
     assert!(!clients.is_empty(), "we are ourselves a client");
 
     // Our own connection must be in there, with the fields we actually render.
-    assert!(clients.iter().all(|c| !c.id.is_empty()), "every row needs an id");
-    assert!(clients.iter().all(|c| !c.addr.is_empty()), "every row needs an addr");
+    assert!(
+        clients.iter().all(|c| !c.id.is_empty()),
+        "every row needs an id"
+    );
+    assert!(
+        clients.iter().all(|c| !c.addr.is_empty()),
+        "every row needs an addr"
+    );
     assert!(
         clients.iter().any(|c| !c.cmd.is_empty()),
         "at least one client should report its last command"
@@ -191,7 +246,10 @@ async fn slowlog_is_readable_even_when_empty() {
     let conn = conn().await;
     let entries = conn.slowlog(64).await.unwrap();
     for e in &entries {
-        assert!(!e.command.is_empty(), "a logged entry should carry its command");
+        assert!(
+            !e.command.is_empty(),
+            "a logged entry should carry its command"
+        );
     }
 }
 
@@ -229,7 +287,10 @@ async fn pipelined_queue_counts_match_individual_counts() {
     let conn = conn().await;
     let lens = BullMqLens::default();
     let queues = lens.all_queues(&conn).await.unwrap();
-    assert!(queues.len() >= 2, "need a few queues to catch a misalignment");
+    assert!(
+        queues.len() >= 2,
+        "need a few queues to catch a misalignment"
+    );
 
     for q in &queues {
         for state in State::ALL {
@@ -263,10 +324,16 @@ async fn reads_a_failed_job_end_to_end() {
     let conn = conn().await;
     let lens = BullMqLens::default();
 
-    let jobs = lens.jobs(&conn, "image-processing", State::Failed, 0, 5).await.unwrap();
+    let jobs = lens
+        .jobs(&conn, "image-processing", State::Failed, 0, 5)
+        .await
+        .unwrap();
     assert!(!jobs.is_empty(), "producer should have failed some jobs");
     // Failed is a ZSET scored by finish time.
-    assert!(jobs[0].score.is_some_and(|s| s > 1.0e12), "expected a ms timestamp score");
+    assert!(
+        jobs[0].score.is_some_and(|s| s > 1.0e12),
+        "expected a ms timestamp score"
+    );
 
     let job = lens
         .job(&conn, "image-processing", &jobs[0].id)
@@ -278,11 +345,24 @@ async fn reads_a_failed_job_end_to_end() {
     assert!(job.has_failed());
     assert!(!job.failed_reason.is_empty());
     // The trap this guards: `stacktrace` is a JSON array, and `attemptsMade` is `atm`.
-    assert!(!job.stacktrace.is_empty(), "stacktrace should parse out of the JSON array");
-    assert!(job.stacktrace[0].contains("at "), "frames expected: {}", job.stacktrace[0]);
-    assert!(job.attempts_made > 0, "v6 stores attempts as `atm`, not `attemptsMade`");
+    assert!(
+        !job.stacktrace.is_empty(),
+        "stacktrace should parse out of the JSON array"
+    );
+    assert!(
+        job.stacktrace[0].contains("at "),
+        "frames expected: {}",
+        job.stacktrace[0]
+    );
+    assert!(
+        job.attempts_made > 0,
+        "v6 stores attempts as `atm`, not `attemptsMade`"
+    );
     assert!(job.data.starts_with('{'), "payload should be JSON");
-    assert!(job.duration_ms().is_some(), "a finished job has both timestamps");
+    assert!(
+        job.duration_ms().is_some(),
+        "a finished job has both timestamps"
+    );
 }
 
 #[tokio::test]
@@ -293,7 +373,10 @@ async fn list_backed_states_return_ids_without_scores() {
     let conn = conn().await;
     let lens = BullMqLens::default();
     // `reports` carries a deep backlog thanks to the pause cycle.
-    let jobs = lens.jobs(&conn, "reports", State::Waiting, 0, 5).await.unwrap();
+    let jobs = lens
+        .jobs(&conn, "reports", State::Waiting, 0, 5)
+        .await
+        .unwrap();
     for j in &jobs {
         assert!(j.score.is_none(), "wait is a LIST and has no score");
         assert!(!j.id.is_empty());
@@ -306,7 +389,12 @@ async fn a_missing_job_reads_as_none_not_an_error() {
     use keylens_bullmq::BullMqLens;
     let conn = conn().await;
     let lens = BullMqLens::default();
-    assert!(lens.job(&conn, "emails", "does-not-exist-99999").await.unwrap().is_none());
+    assert!(
+        lens.job(&conn, "emails", "does-not-exist-99999")
+            .await
+            .unwrap()
+            .is_none()
+    );
 }
 
 #[tokio::test]
@@ -372,7 +460,9 @@ async fn the_events_stream_delivers_live_throughput() {
         "expected completed events"
     );
     assert!(
-        events.iter().any(|e| matches!(e.kind, EventKind::Active | EventKind::Added)),
+        events
+            .iter()
+            .any(|e| matches!(e.kind, EventKind::Active | EventKind::Added)),
         "expected lifecycle events"
     );
 }
@@ -408,7 +498,9 @@ async fn throughput_buckets_populate_from_a_live_stream() {
     }
     reader.abort();
 
-    let series = throughput.series("emails").expect("emails should have produced events");
+    let series = throughput
+        .series("emails")
+        .expect("emails should have produced events");
     assert!(series.seen >= 10, "only saw {} events", series.seen);
 
     let now = std::time::SystemTime::now()
@@ -423,13 +515,201 @@ async fn throughput_buckets_populate_from_a_live_stream() {
         window.iter().sum::<u64>() > 0,
         "events were recorded but the 30s window is empty -- bucket/now mismatch"
     );
-    assert!(series.rate(now, 10) > 0.0, "rate should be non-zero right after a burst");
+    assert!(
+        series.rate(now, 10) > 0.0,
+        "rate should be non-zero right after a burst"
+    );
+}
+
+#[tokio::test]
+#[ignore = "requires docker compose fixtures"]
+async fn reads_consumer_groups_and_pending_state() {
+    // BullMQ's own events streams have no groups -- workers use XREAD -- so the fixture
+    // adds a stream with a healthy consumer and one that reads without acknowledging.
+    let conn = conn().await;
+    let info = conn.stream_info("keylens:audit").await.unwrap();
+
+    assert!(info.length > 0, "audit stream should have entries");
+    assert!(info.entries_added.is_some_and(|n| n > 0));
+    assert!(!info.last_generated_id.is_empty());
+
+    let group = info
+        .groups
+        .iter()
+        .find(|g| g.name == "processors")
+        .expect("the fixture creates a `processors` group");
+
+    assert_eq!(group.consumer_count, 2);
+    assert!(
+        group.pending > 0,
+        "worker-stuck never acks, so entries stay pending"
+    );
+    assert!(
+        !group.pending_min_id.is_empty(),
+        "XPENDING summary should give an id range"
+    );
+    assert!(!group.last_delivered_id.is_empty());
+
+    let stuck = group
+        .consumers
+        .iter()
+        .find(|c| c.name == "worker-stuck")
+        .expect("stuck consumer should be listed");
+    assert!(stuck.pending > 0, "it holds unacknowledged entries");
+
+    let healthy = group
+        .consumers
+        .iter()
+        .find(|c| c.name == "worker-healthy")
+        .expect("healthy consumer should be listed");
+    assert_eq!(healthy.pending, 0, "it acknowledges everything it reads");
+
+    // Ranking is what makes the pane useful on a group with many consumers.
+    let ranked = group.stuck_consumers();
+    assert_eq!(
+        ranked.first().map(|c| c.name.as_str()),
+        Some("worker-stuck")
+    );
+}
+
+#[tokio::test]
+#[ignore = "requires docker compose fixtures"]
+async fn a_stream_without_groups_reports_none_rather_than_failing() {
+    // XINFO GROUPS on a group-less stream returns an empty array, not an error.
+    let conn = conn().await;
+    let info = conn.stream_info("bull:emails:events").await.unwrap();
+    assert!(info.length > 0);
+    assert!(
+        info.groups.is_empty(),
+        "BullMQ events streams use XREAD, not consumer groups"
+    );
+}
+
+/// Recached runs behind a compose profile that needs a sibling checkout, so these skip
+/// unless the URL is provided:
+///
+/// ```sh
+/// docker compose --profile recached up -d --build
+/// KEYLENS_TEST_RECACHED_URL=redis://127.0.0.1:6381 \
+///   cargo test --test live -- --ignored
+/// ```
+fn recached_url() -> Option<String> {
+    std::env::var("KEYLENS_TEST_RECACHED_URL").ok()
+}
+
+#[tokio::test]
+#[ignore = "requires docker compose fixtures"]
+async fn connects_to_a_server_without_info() {
+    // The regression this guards: keylens used to call INFO during connect and return Err
+    // if it failed, so a server that doesn't implement INFO was unreachable entirely.
+    let Some(url) = recached_url() else {
+        eprintln!("skipping: set KEYLENS_TEST_RECACHED_URL");
+        return;
+    };
+
+    let conn = Conn::connect(&url, "test")
+        .await
+        .expect("must connect without INFO");
+    assert!(!conn.has_server_info(), "recached does not implement INFO");
+    assert!(
+        conn.server().fields.is_empty(),
+        "empty fields is how the stats pane knows to explain itself"
+    );
+
+    // The browser must still work, which is the whole point.
+    let keys = scan_all(&conn, None, None).await;
+    assert!(!keys.is_empty(), "SCAN should still walk the keyspace");
+}
+
+#[tokio::test]
+#[ignore = "requires docker compose fixtures"]
+async fn reads_values_without_hscan_sscan_or_getrange() {
+    let Some(url) = recached_url() else {
+        eprintln!("skipping: set KEYLENS_TEST_RECACHED_URL");
+        return;
+    };
+    let conn = Conn::connect(&url, "test").await.unwrap();
+
+    use keylens_conn::Feature;
+    assert!(!conn.capabilities().has(Feature::GetRange));
+    assert!(!conn.capabilities().has(Feature::CursorCollectionScan));
+
+    // Seed one key of each type the server supports.
+    conn.cmd("SET", vec!["keylens:t:str".into(), "hello".into()])
+        .await
+        .unwrap();
+    conn.cmd(
+        "HSET",
+        vec!["keylens:t:hash".into(), "f".into(), "v".into()],
+    )
+    .await
+    .unwrap();
+    conn.cmd("SADD", vec!["keylens:t:set".into(), "m".into()])
+        .await
+        .unwrap();
+
+    // Each of these takes the size-checked fallback path.
+    let s = conn
+        .read_value("keylens:t:str", Kind::String, 0)
+        .await
+        .unwrap();
+    assert!(
+        matches!(s, KeyValue::String(ref v) if v == "hello"),
+        "{s:?}"
+    );
+
+    let h = conn
+        .read_value("keylens:t:hash", Kind::Hash, 0)
+        .await
+        .unwrap();
+    let KeyValue::Hash(fields) = h else {
+        panic!("expected a hash")
+    };
+    assert_eq!(fields, vec![("f".to_string(), "v".to_string())]);
+
+    let set = conn
+        .read_value("keylens:t:set", Kind::Set, 0)
+        .await
+        .unwrap();
+    let KeyValue::Set(members) = set else {
+        panic!("expected a set")
+    };
+    assert_eq!(members, vec!["m".to_string()]);
+}
+
+#[tokio::test]
+#[ignore = "requires docker compose fixtures"]
+async fn an_oversized_collection_is_declined_rather_than_read_whole() {
+    // The safety property: without HSCAN, keylens measures first and refuses a big hash
+    // instead of falling back to HGETALL.
+    let Some(url) = recached_url() else {
+        eprintln!("skipping: set KEYLENS_TEST_RECACHED_URL");
+        return;
+    };
+    let conn = Conn::connect(&url, "test").await.unwrap();
+
+    let key = "keylens:t:bighash";
+    conn.cmd("DEL", vec![key.into()]).await.ok();
+    for i in 0..(keylens_conn::value::PAGE + 50) {
+        conn.cmd("HSET", vec![key.into(), format!("f{i}").into(), "v".into()])
+            .await
+            .unwrap();
+    }
+
+    let v = conn.read_value(key, Kind::Hash, 0).await.unwrap();
+    assert!(
+        matches!(v, KeyValue::TooLarge("hash", _)),
+        "an oversized hash must be declined, got {v:?}"
+    );
+    conn.cmd("DEL", vec![key.into()]).await.ok();
 }
 
 #[tokio::test]
 #[ignore = "requires docker compose fixtures"]
 async fn valkey_is_detected_as_valkey() {
-    let conn = Conn::connect(&valkey_url(), "test").await.expect("valkey fixture up?");
+    let conn = Conn::connect(&valkey_url(), "test")
+        .await
+        .expect("valkey fixture up?");
     assert_eq!(conn.server().vendor, keylens_conn::Vendor::Valkey);
     // Vendor must come from INFO, not from the port or the URL scheme.
     assert!(!conn.server().version.is_empty());

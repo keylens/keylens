@@ -72,7 +72,9 @@ impl Conn {
         if !self.capabilities().has(Feature::Slowlog) {
             return Ok(Vec::new());
         }
-        let reply = self.cmd("SLOWLOG", vec!["GET".into(), count.into()]).await?;
+        let reply = self
+            .cmd("SLOWLOG", vec!["GET".into(), count.into()])
+            .await?;
         Ok(parse_slowlog(&reply))
     }
 
@@ -110,7 +112,9 @@ impl Conn {
         }
 
         let reply = self.cmd("PUBSUB", vec!["CHANNELS".into()]).await?;
-        let Value::Array(items) = reply else { return Ok(Vec::new()) };
+        let Value::Array(items) = reply else {
+            return Ok(Vec::new());
+        };
 
         let names: Vec<String> = items.iter().map(display_string).take(limit).collect();
         if names.is_empty() {
@@ -126,7 +130,9 @@ impl Conn {
 }
 
 fn parse_slowlog(reply: &Value) -> Vec<SlowEntry> {
-    let Value::Array(entries) = reply else { return Vec::new() };
+    let Value::Array(entries) = reply else {
+        return Vec::new();
+    };
     entries
         .iter()
         .filter_map(|e| {
@@ -135,9 +141,11 @@ fn parse_slowlog(reply: &Value) -> Vec<SlowEntry> {
                 return None;
             }
             let command = match &f[3] {
-                Value::Array(parts) => {
-                    parts.iter().map(display_string).collect::<Vec<_>>().join(" ")
-                }
+                Value::Array(parts) => parts
+                    .iter()
+                    .map(display_string)
+                    .collect::<Vec<_>>()
+                    .join(" "),
                 other => display_string(other),
             };
             Some(SlowEntry {
@@ -163,7 +171,9 @@ fn parse_client_list(raw: &str) -> Vec<ClientInfo> {
         .map(|line| {
             let mut client = ClientInfo::default();
             for pair in line.split_ascii_whitespace() {
-                let Some((k, v)) = pair.split_once('=') else { continue };
+                let Some((k, v)) = pair.split_once('=') else {
+                    continue;
+                };
                 match k {
                     "id" => client.id = v.to_string(),
                     "addr" => client.addr = v.to_string(),
@@ -184,7 +194,9 @@ fn parse_client_list(raw: &str) -> Vec<ClientInfo> {
 fn parse_cluster_info(raw: &str) -> ClusterTopology {
     let mut t = ClusterTopology::default();
     for line in raw.lines() {
-        let Some((k, v)) = line.trim().split_once(':') else { continue };
+        let Some((k, v)) = line.trim().split_once(':') else {
+            continue;
+        };
         match k {
             "cluster_enabled" => t.enabled = v.trim() == "1",
             "cluster_state" => t.state = v.trim().to_string(),
@@ -228,7 +240,9 @@ fn parse_cluster_nodes(raw: &str) -> Vec<ClusterNode> {
 }
 
 fn parse_numsub(reply: &Value) -> Vec<PubSubChannel> {
-    let Value::Array(items) = reply else { return Vec::new() };
+    let Value::Array(items) = reply else {
+        return Vec::new();
+    };
     items
         .chunks_exact(2)
         .map(|c| PubSubChannel {
@@ -251,7 +265,10 @@ mod tests {
 
         assert_eq!(clients[0].id, "7");
         assert_eq!(clients[0].addr, "127.0.0.1:54321");
-        assert_eq!(clients[0].name, "", "an empty name= must parse, not skip the row");
+        assert_eq!(
+            clients[0].name, "",
+            "an empty name= must parse, not skip the row"
+        );
         assert_eq!(clients[0].age, 120);
         assert_eq!(clients[0].cmd, "client|list");
 
@@ -338,7 +355,10 @@ e7d1eec 127.0.0.1:30001@31001,node1.local myself,master - 0 0 1 connected 0-5460
         assert!(nodes[1].master);
         assert_eq!(nodes[1].slots, vec!["0-5460"]);
 
-        assert!(!nodes[0].master, "a slave row must not be counted as a master");
+        assert!(
+            !nodes[0].master,
+            "a slave row must not be counted as a master"
+        );
 
         // Migration markers are not slot ranges.
         assert_eq!(nodes[2].slots, vec!["5461-10922"]);

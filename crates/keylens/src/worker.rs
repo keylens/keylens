@@ -5,11 +5,11 @@
 //! broken. So: the worker owns the [`Conn`] and the scan cursor, the UI owns the tree and
 //! the selection, and they exchange messages over bounded channels.
 
-use keylens_conn::{
-    ClientInfo, ClusterTopology, Conn, Feature, KeyMeta, KeyValue, Kind, PubSubChannel,
-    ServerInfo, SlowEntry, Value,
-};
 use keylens_bullmq::{BullMqLens, Job, JobRef, QueueSummary, State};
+use keylens_conn::{
+    ClientInfo, ClusterTopology, Conn, Feature, KeyMeta, KeyValue, Kind, PubSubChannel, ServerInfo,
+    SlowEntry, StreamInfo, Value,
+};
 use keylens_lens::{Detection, Lens};
 use keylens_ui::PaneState;
 use tokio::sync::mpsc::{Receiver, Sender};
@@ -32,11 +32,17 @@ const JOB_LOG_LINES: usize = 200;
 #[derive(Debug)]
 pub enum Request {
     /// Start over with a new filter.
-    Rescan { pattern: Option<String>, kind: Option<Kind> },
+    Rescan {
+        pattern: Option<String>,
+        kind: Option<Kind>,
+    },
     /// Continue the current scan.
     More,
     /// Load metadata and a value page for one key.
-    Select { key: String, offset: usize },
+    Select {
+        key: String,
+        offset: usize,
+    },
     RefreshInfo,
 
     LoadSlowlog,
@@ -47,8 +53,15 @@ pub enum Request {
     /// Run every lens detector. Cheap, and it decides whether the queues tab exists.
     Detect,
     LoadQueues,
-    LoadJobs { queue: String, state: State, offset: usize },
-    LoadJob { queue: String, id: String },
+    LoadJobs {
+        queue: String,
+        state: State,
+        offset: usize,
+    },
+    LoadJob {
+        queue: String,
+        id: String,
+    },
 }
 
 #[derive(Debug)]
@@ -64,6 +77,8 @@ pub enum Update {
     Detail {
         meta: Box<KeyMeta>,
         value: Box<KeyValue>,
+        /// Groups, consumers and pending state — only for stream keys.
+        stream: Option<Box<StreamInfo>>,
     },
     Info(Box<ServerInfo>),
     Error(String),
@@ -78,7 +93,10 @@ pub enum Update {
     EventsAttached,
     Events(Vec<crate::events::StreamEvent>),
     Queues(PaneState<Vec<QueueSummary>>),
-    Jobs { state: State, data: PaneState<Vec<JobRef>> },
+    Jobs {
+        state: State,
+        data: PaneState<Vec<JobRef>>,
+    },
     /// `None` inside `Ready` means the job was removed between listing and reading, which
     /// happens constantly on a live queue with retention configured.
     Job(PaneState<Option<Box<JobDetail>>>),
@@ -131,20 +149,30 @@ impl Worker {
                     self.scan_batch(false).await
                 }
                 Request::Select { key, offset } => self.detail(&key, offset).await,
-                Request::RefreshInfo => match self.conn.refresh_info().await {
-                    Ok(info) => Update::Info(Box::new(info)),
-                    Err(e) => Update::Error(e.to_string()),
-                },
+                Request::RefreshInfo => {
+                    // Servers that don't implement `INFO` would otherwise fail this on
+                    // every tick and paint the error over whatever pane is open.
+                    if !self.conn.has_server_info() {
+                        continue;
+                    }
+                    match self.conn.refresh_info().await {
+                        Ok(info) => Update::Info(Box::new(info)),
+                        Err(e) => Update::Error(e.to_string()),
+                    }
+                }
 
                 Request::LoadSlowlog => Update::Slowlog(
-                    self.pane(Feature::Slowlog, self.conn.slowlog(SLOWLOG_ENTRIES)).await,
+                    self.pane(Feature::Slowlog, self.conn.slowlog(SLOWLOG_ENTRIES))
+                        .await,
                 ),
-                Request::LoadClients => {
-                    Update::Clients(self.pane(Feature::ClientList, self.conn.client_list()).await)
-                }
+                Request::LoadClients => Update::Clients(
+                    self.pane(Feature::ClientList, self.conn.client_list())
+                        .await,
+                ),
                 Request::LoadCluster => Update::Cluster(self.cluster().await),
                 Request::LoadPubSub => Update::PubSub(
-                    self.pane(Feature::PubSub, self.conn.pubsub_channels(PUBSUB_CHANNELS)).await,
+                    self.pane(Feature::PubSub, self.conn.pubsub_channels(PUBSUB_CHANNELS))
+                        .await,
                 ),
 
                 Request::Detect => {
@@ -170,7 +198,11 @@ impl Worker {
                     })
                 }
 
-                Request::LoadJobs { queue, state, offset } => Update::Jobs {
+                Request::LoadJobs {
+                    queue,
+                    state,
+                    offset,
+                } => Update::Jobs {
                     state,
                     data: match self
                         .bullmq
@@ -200,7 +232,12 @@ impl Worker {
             let type_filter = self.kind.map(|k| k.label());
             let page = match self
                 .conn
-                .scan_page(&self.cursor, self.pattern.as_deref(), SCAN_COUNT, type_filter)
+                .scan_page(
+                    &self.cursor,
+                    self.pattern.as_deref(),
+                    SCAN_COUNT,
+                    type_filter,
+                )
                 .await
             {
                 Ok(p) => p,
@@ -216,7 +253,12 @@ impl Worker {
         }
 
         let typed = self.type_keys(keys).await;
-        Update::Batch { keys: typed, reset, complete: self.complete, scanned_pages: pages }
+        Update::Batch {
+            keys: typed,
+            reset,
+            complete: self.complete,
+            scanned_pages: pages,
+        }
     }
 
     /// Resolve each key's type in one round trip.
@@ -232,8 +274,10 @@ impl Worker {
         }
 
         let head = keys.len().min(MAX_TYPED);
-        let cmds: Vec<(&'static str, Vec<Value>)> =
-            keys[..head].iter().map(|k| ("TYPE", vec![Value::from(k.as_str())])).collect();
+        let cmds: Vec<(&'static str, Vec<Value>)> = keys[..head]
+            .iter()
+            .map(|k| ("TYPE", vec![Value::from(k.as_str())]))
+            .collect();
 
         let kinds = match self.conn.pipeline(&cmds).await {
             Ok(v) => v,
@@ -267,7 +311,10 @@ impl Worker {
         let availability = self.conn.capabilities().get(feature);
         if !availability.is_available() {
             return PaneState::Unavailable(
-                availability.reason().unwrap_or("blocked by this server").to_string(),
+                availability
+                    .reason()
+                    .unwrap_or("blocked by this server")
+                    .to_string(),
             );
         }
         match load.await {
@@ -285,7 +332,9 @@ impl Worker {
     async fn cluster(&self) -> PaneState<Box<ClusterTopology>> {
         let availability = self.conn.capabilities().get(Feature::Cluster);
         if let keylens_conn::Availability::Denied(why) = &availability
-            && why.to_ascii_lowercase().contains("cluster support disabled")
+            && why
+                .to_ascii_lowercase()
+                .contains("cluster support disabled")
         {
             return PaneState::Ready(Box::default());
         }
@@ -322,6 +371,20 @@ impl Worker {
             Ok(v) => v,
             Err(e) => return Update::Error(e.to_string()),
         };
-        Update::Detail { meta: Box::new(meta), value: Box::new(value) }
+
+        // Consumer-group state is the reason to open a stream at all, but it's several
+        // extra round trips, so it's fetched only for streams. A failure here degrades to
+        // "entries only" rather than failing the whole key.
+        let stream = if meta.kind == Kind::Stream {
+            self.conn.stream_info(key).await.ok().map(Box::new)
+        } else {
+            None
+        };
+
+        Update::Detail {
+            meta: Box::new(meta),
+            value: Box::new(value),
+            stream,
+        }
     }
 }

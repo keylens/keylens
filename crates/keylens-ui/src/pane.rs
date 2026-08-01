@@ -64,7 +64,12 @@ mod tests {
         // failure the user is expected to do something about.
         let state: PaneState<Vec<u8>> = PaneState::Unavailable("NOPERM".into());
         assert!(!state.is_error());
-        assert!(state.placeholder().unwrap().contains("unavailable on this server"));
+        assert!(
+            state
+                .placeholder()
+                .unwrap()
+                .contains("unavailable on this server")
+        );
     }
 
     #[test]

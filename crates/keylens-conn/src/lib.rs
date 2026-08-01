@@ -8,6 +8,7 @@ pub mod conn;
 pub mod error;
 pub mod server;
 pub mod server_info;
+pub mod stream;
 pub mod value;
 
 /// The one place fred's types surface outside this crate.
@@ -24,4 +25,5 @@ pub use conn::{Conn, ScanPage};
 pub use error::{ConnError, Result};
 pub use server::{ClientInfo, ClusterNode, ClusterTopology, PubSubChannel, SlowEntry};
 pub use server_info::{ServerInfo, Vendor};
-pub use value::{Kind, KeyMeta, KeyValue, StreamEntry};
+pub use stream::{ConsumerInfo, GroupInfo, StreamInfo};
+pub use value::{KeyMeta, KeyValue, Kind, StreamEntry};

@@ -143,7 +143,8 @@ mod tests {
     #[test]
     fn registry_lookup_by_id() {
         let mut r = Registry::new();
-        r.register(Arc::new(Fake("bullmq"))).register(Arc::new(Fake("sidekiq")));
+        r.register(Arc::new(Fake("bullmq")))
+            .register(Arc::new(Fake("sidekiq")));
 
         assert_eq!(r.lenses().len(), 2);
         assert_eq!(r.get("sidekiq").map(|l| l.id()), Some("sidekiq"));

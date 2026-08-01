@@ -1,6 +1,6 @@
 # keylens
 
-**A TUI for Redis and Valkey that understands your keys.**
+**A TUI for Redis, Valkey and Recached that understands your keys.**
 
 Every Redis client shows you keys. None of them understand what your keys *mean*.
 
@@ -11,6 +11,11 @@ namespace with a hit rate and a TTL distribution, not a flat list.
 keylens is a general Redis/Valkey browser with a pluggable **lens** system on top. A lens
 detects a known keyspace pattern and renders domain UI instead of raw keys. BullMQ is the
 first one.
+
+Every capability is **probed at connect, never assumed**, so keylens works against any
+RESP server and tells you plainly what that server can't do. Verified against Redis 8,
+Valkey 8, and [Recached](https://github.com/thinkgrid-labs/recached) — see
+[compatibility](#compatibility).
 
 > **v0.1 is read-only.** That's a feature — you can point it at production on day one.
 
@@ -28,7 +33,7 @@ first one.
         ██║  ██╗███████╗   ██║   ███████╗███████╗██║ ╚████║███████║
         ╚═╝  ╚═╝╚══════╝   ╚═╝   ╚══════╝╚══════╝╚═╝  ╚═══╝╚══════╝
 
-           a TUI for Redis and Valkey that understands your keys
+           a TUI for Redis, Valkey and Recached that understands your keys
 
                     Redis  8.10.0  redis://127.0.0.1:6379
                              scanning keyspace…
@@ -98,6 +103,27 @@ Drill in for the failed job, and you get the trace for **each attempt**:
 Queue counts are one pipelined round trip for the whole table, not eight commands per
 queue — the difference between instant and twenty seconds on a remote server.
 
+Selecting a **stream** leads with consumer-group state, because the operational question
+is almost never "what's in it" — it's *which consumer stopped acknowledging*:
+
+```
+ ▌stream
+  length 1,506  added 1,506  last id 1785518199335-0
+
+ ▌consumer groups
+  processors  consumers 2  pending 27  lag 0
+    pending range 1785517610863-0 … 1785517615743-0
+    ! worker-stuck          pending 27      idle 9m43s
+      worker-healthy        pending 0       idle 52ms
+
+ ▌entries
+  …
+```
+
+Consumers are ranked worst-first, and a nil `lag` renders as `unknown` rather than `0` —
+Redis genuinely cannot compute it after trimming, and claiming the group is caught up
+would be a lie.
+
 The stats view is an `INFO` dashboard with meters — no extra commands, and the meters only
 appear when there's a real denominator (a memory bar means nothing without `maxmemory`):
 
@@ -140,6 +166,42 @@ bullmq queues (prefix `bull`)
   emails            running          0          0            0         76                 0        300         18
   reports            paused        415          0           45         47                 2         93          5
 ```
+
+## Compatibility
+
+keylens probes each server at connect and degrades to what it finds, rather than assuming
+a feature set. A pane whose command is missing says *unavailable on this server* and names
+the reason.
+
+| | Redis 8 | Valkey 8 | Recached |
+|---|---|---|---|
+| Key browser, all 6 value types | ✅ | ✅ | ✅ |
+| Stats / slowlog / clients / cluster / pub-sub | ✅ | ✅ | — no `INFO` etc. |
+| Streams + consumer groups | ✅ | ✅ | — no stream types |
+| BullMQ lens | ✅ | ✅ | — needs streams |
+
+Recached has no `HSCAN`/`SSCAN`/`GETRANGE`, so keylens measures a key with `HLEN`/`SCARD`/
+`STRLEN` first and reads it whole only when it's small. The bound is preserved — it's
+enforced client-side instead of requested server-side — and an oversized key says so
+rather than being fetched.
+
+The same machinery is what makes keylens behave on Upstash, ElastiCache and MemoryDB,
+which block subsets of `CONFIG`, `CLIENT`, `MEMORY` and `DEBUG`.
+
+## Regenerating the demo
+
+The GIF at the top is rendered from a script, so it stays honest as the UI changes:
+
+```sh
+brew install vhs                  # pulls ttyd + ffmpeg
+docker compose up -d --build      # the workload the demo shows
+cargo build --release
+vhs docs/demo.tape                # writes docs/demo.gif
+```
+
+The tape warms up off-camera for 25 seconds before recording. The sparklines are real —
+they start empty and fill from the events stream — so capturing immediately would show a
+flat graph and undersell the one thing the demo exists to show.
 
 ## Development
 

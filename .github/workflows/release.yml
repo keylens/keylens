@@ -1,0 +1,296 @@
+name: Release
+
+on:
+  push:
+    tags:
+      - "v*"
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: "Tag to release (e.g. v0.1.0)"
+        required: true
+
+env:
+  CARGO_TERM_COLOR: always
+  BINARY_NAME: keylens
+
+jobs:
+  # ─── Gate: the tag must match the version in Cargo.toml ────────────────────
+  #
+  # Publishing v0.1.1 from a tree that says 0.1.0 produces a release nobody can
+  # reproduce, and crates.io will not let you take the version back.
+  tag-check:
+    name: Tag matches Cargo.toml
+    runs-on: ubuntu-latest
+    if: github.repository_owner == 'keylens'
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Compare tag to workspace version
+        run: |
+          TAG="${{ github.event.inputs.tag || github.ref_name }}"
+          VERSION=$(grep -m1 '^version = ' Cargo.toml | cut -d'"' -f2)
+          echo "tag=${TAG}  Cargo.toml=${VERSION}"
+          if [ "${TAG}" != "v${VERSION}" ]; then
+            echo "::error::tag ${TAG} does not match workspace version ${VERSION}"
+            exit 1
+          fi
+
+  # ─── Build cross-platform binaries ─────────────────────────────────────────
+  build:
+    name: Build ${{ matrix.target }}
+    runs-on: ${{ matrix.runner }}
+    needs: tag-check
+    if: github.repository_owner == 'keylens'
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - target: x86_64-unknown-linux-gnu
+            runner: ubuntu-latest
+            archive: tar.gz
+            cross: false
+
+          - target: aarch64-unknown-linux-gnu
+            runner: ubuntu-latest
+            archive: tar.gz
+            cross: true
+
+          - target: x86_64-apple-darwin
+            runner: macos-latest
+            archive: tar.gz
+            cross: false
+
+          - target: aarch64-apple-darwin
+            runner: macos-latest
+            archive: tar.gz
+            cross: false
+
+          - target: x86_64-pc-windows-msvc
+            runner: windows-latest
+            archive: zip
+            cross: false
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Rust (stable)
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.target }}
+
+      - name: Install cross (aarch64-linux)
+        if: matrix.cross == true
+        uses: taiki-e/install-action@v2
+        with:
+          tool: cross
+
+      - name: Cache
+        uses: Swatinem/rust-cache@v2
+        with:
+          key: release-${{ matrix.target }}
+
+      - name: Build (native)
+        if: matrix.cross == false
+        run: cargo build --release --target ${{ matrix.target }} -p keylens
+
+      - name: Build (cross)
+        if: matrix.cross == true
+        run: cross build --release --target ${{ matrix.target }} -p keylens
+
+      # ── Package ──────────────────────────────────────────────────────────
+      - name: Package (tar.gz — Unix)
+        if: matrix.archive == 'tar.gz'
+        shell: bash
+        run: |
+          ASSET="${{ env.BINARY_NAME }}-${{ matrix.target }}"
+          mkdir -p dist
+          cp target/${{ matrix.target }}/release/${{ env.BINARY_NAME }} dist/
+          cp README.md LICENSE dist/
+          tar -czf "${ASSET}.tar.gz" -C dist .
+          echo "ASSET=${ASSET}.tar.gz" >> $GITHUB_ENV
+
+      - name: Package (zip — Windows)
+        if: matrix.archive == 'zip'
+        shell: pwsh
+        run: |
+          $asset = "${{ env.BINARY_NAME }}-${{ matrix.target }}"
+          New-Item -ItemType Directory -Force dist | Out-Null
+          Copy-Item "target\${{ matrix.target }}\release\${{ env.BINARY_NAME }}.exe" dist\
+          Copy-Item README.md dist\
+          Copy-Item LICENSE dist\
+          Compress-Archive -Path dist\* -DestinationPath "${asset}.zip"
+          "ASSET=${asset}.zip" | Out-File -FilePath $env:GITHUB_ENV -Append
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: ${{ env.BINARY_NAME }}-${{ matrix.target }}
+          path: ${{ env.ASSET }}
+          retention-days: 1
+
+  # ─── Publish to crates.io ──────────────────────────────────────────────────
+  #
+  # The workspace has five crates with path+version dependencies, so they have to
+  # go up in dependency order: keylens-conn → keylens-lens → keylens-ui →
+  # keylens-bullmq → keylens. `cargo publish --workspace` works that order out
+  # itself and waits for each crate to appear in the index before the next.
+  publish:
+    name: Publish to crates.io
+    runs-on: ubuntu-latest
+    needs: build
+    if: github.repository_owner == 'keylens' && !contains(github.ref_name, '-')
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Rust (stable)
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Cache
+        uses: Swatinem/rust-cache@v2
+
+      - name: cargo publish --workspace
+        run: cargo publish --workspace --no-verify
+        env:
+          CARGO_REGISTRY_TOKEN: ${{ secrets.CARGO_REGISTRY_TOKEN }}
+
+  # ─── Update the Homebrew tap ───────────────────────────────────────────────
+  #
+  # Skipped entirely when HOMEBREW_TAP_TOKEN is not configured, so the release
+  # still succeeds before the tap repo exists.
+  homebrew:
+    name: Update Homebrew tap
+    runs-on: ubuntu-latest
+    needs: release
+    if: >-
+      github.repository_owner == 'keylens'
+      && !contains(github.ref_name, '-')
+      && secrets.HOMEBREW_TAP_TOKEN != ''
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Download release artifacts
+        uses: actions/download-artifact@v4
+        with:
+          path: artifacts
+          merge-multiple: true
+
+      - name: Render the formula
+        run: |
+          set -euo pipefail
+          TAG="${{ github.event.inputs.tag || github.ref_name }}"
+          VERSION="${TAG#v}"
+
+          sha() { sha256sum "artifacts/keylens-$1.tar.gz" | cut -d' ' -f1; }
+
+          FORMULA=packaging/homebrew/keylens.rb
+          sed -i "s/^  version \".*\"/  version \"${VERSION}\"/" "$FORMULA"
+
+          # Replace each placeholder in file order: macOS arm, macOS intel,
+          # Linux arm, Linux intel — matching the on_* blocks in the template.
+          for target in aarch64-apple-darwin x86_64-apple-darwin \
+                        aarch64-unknown-linux-gnu x86_64-unknown-linux-gnu; do
+            python3 - "$FORMULA" "$(sha "$target")" <<'PY'
+          import sys, pathlib
+          p = pathlib.Path(sys.argv[1]); s = p.read_text()
+          p.write_text(s.replace("REPLACED_AT_RELEASE", sys.argv[2], 1))
+          PY
+          done
+          cat "$FORMULA"
+
+      - name: Push to the tap
+        env:
+          GH_TOKEN: ${{ secrets.HOMEBREW_TAP_TOKEN }}
+        run: |
+          set -euo pipefail
+          TAG="${{ github.event.inputs.tag || github.ref_name }}"
+          git clone "https://x-access-token:${GH_TOKEN}@github.com/keylens/homebrew-tap.git" tap
+          mkdir -p tap/Formula
+          cp packaging/homebrew/keylens.rb tap/Formula/keylens.rb
+          cd tap
+          git config user.name "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+          git add Formula/keylens.rb
+          git commit -m "keylens ${TAG}" || { echo "nothing to update"; exit 0; }
+          git push
+
+  # ─── Create GitHub Release ─────────────────────────────────────────────────
+  release:
+    name: Publish GitHub Release
+    runs-on: ubuntu-latest
+    needs: build
+    if: github.repository_owner == 'keylens'
+    permissions:
+      contents: write
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Download all artifacts
+        uses: actions/download-artifact@v4
+        with:
+          path: artifacts
+          merge-multiple: true
+
+      - name: Copy install script to artifacts
+        run: cp install.sh artifacts/install.sh
+
+      - name: Generate checksums (SHA-256)
+        run: |
+          cd artifacts
+          sha256sum * > checksums.txt
+          cat checksums.txt
+
+      - name: Extract release notes from tag
+        id: notes
+        run: |
+          TAG="${{ github.event.inputs.tag || github.ref_name }}"
+          echo "tag=${TAG}" >> $GITHUB_OUTPUT
+
+      - name: Create GitHub Release
+        uses: softprops/action-gh-release@v2
+        with:
+          name: keylens ${{ steps.notes.outputs.tag }}
+          tag_name: ${{ steps.notes.outputs.tag }}
+          draft: false
+          prerelease: ${{ contains(steps.notes.outputs.tag, '-') }}
+          generate_release_notes: true
+          files: |
+            artifacts/*
+          body: |
+            ## Installation
+
+            **One-liner (Linux / macOS)**
+            ```bash
+            curl -fsSL https://github.com/keylens/keylens/releases/latest/download/install.sh | bash
+            ```
+
+            **Homebrew**
+            ```bash
+            brew install keylens/tap/keylens
+            ```
+
+            **Cargo**
+            ```bash
+            cargo install keylens
+            ```
+
+            **Manual**
+            Download the archive for your platform below, extract it, and put
+            `keylens` somewhere on your `PATH`.
+
+            ## Usage
+
+            ```bash
+            keylens                                  # browse localhost:6379
+            keylens --url redis://host:6379          # browse a specific server
+            keylens probe --queues                   # non-interactive report
+            ```
+
+            keylens is **read-only** — safe to point at production.
+
+            ## SHA-256 checksums
+
+            See `checksums.txt` in the release assets.
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}

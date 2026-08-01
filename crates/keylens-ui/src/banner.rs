@@ -3,7 +3,6 @@
 //! The splash covers the gap between "process started" and "first batch of keys arrived",
 //! which on a cold remote keyspace is a real second or two of otherwise-blank screen.
 
-use ratatui::style::{Modifier, Style};
 use ratatui::text::{Line, Span};
 
 use crate::theme::Theme;
@@ -31,8 +30,8 @@ const KEY_COLUMNS: usize = 24;
 pub fn wordmark(available_width: u16) -> Vec<Line<'static>> {
     if available_width < WORDMARK_WIDTH {
         return vec![Line::from(vec![
-            Span::styled("KEY", Style::new().fg(Theme::BRAND_A).add_modifier(Modifier::BOLD)),
-            Span::styled("LENS", Style::new().fg(Theme::BRAND_B).add_modifier(Modifier::BOLD)),
+            Span::styled("KEY", Theme::brand_a()),
+            Span::styled("LENS", Theme::brand_b()),
         ])];
     }
 
@@ -42,19 +41,26 @@ pub fn wordmark(available_width: u16) -> Vec<Line<'static>> {
             // Split on character count, not bytes: these are multi-byte box glyphs.
             let chars: Vec<char> = row.chars().collect();
             let split = KEY_COLUMNS.min(chars.len());
-            let (key, lens): (String, String) =
-                (chars[..split].iter().collect(), chars[split..].iter().collect());
+            let (key, lens): (String, String) = (
+                chars[..split].iter().collect(),
+                chars[split..].iter().collect(),
+            );
 
             Line::from(vec![
-                Span::styled(key, Style::new().fg(Theme::BRAND_A).add_modifier(Modifier::BOLD)),
-                Span::styled(lens, Style::new().fg(Theme::BRAND_B).add_modifier(Modifier::BOLD)),
+                Span::styled(key, Theme::brand_a()),
+                Span::styled(lens, Theme::brand_b()),
             ])
         })
         .collect()
 }
 
 /// Full splash: wordmark, tagline, and whatever we know so far about the connection.
-pub fn splash(width: u16, url: &str, server: Option<(&str, &str)>, status: &str) -> Vec<Line<'static>> {
+pub fn splash(
+    width: u16,
+    url: &str,
+    server: Option<(&str, &str)>,
+    status: &str,
+) -> Vec<Line<'static>> {
     let mut lines = vec![Line::raw(""), Line::raw("")];
     lines.extend(wordmark(width));
 
@@ -77,9 +83,15 @@ pub fn splash(width: u16, url: &str, server: Option<(&str, &str)>, status: &str)
     }
 
     lines.push(Line::raw(""));
-    lines.push(Line::from(Span::styled(status.to_string(), Theme::accent())));
+    lines.push(Line::from(Span::styled(
+        status.to_string(),
+        Theme::accent(),
+    )));
     lines.push(Line::raw(""));
-    lines.push(Line::from(Span::styled("read-only — safe to point at production", Theme::ok())));
+    lines.push(Line::from(Span::styled(
+        "read-only — safe to point at production",
+        Theme::ok(),
+    )));
 
     lines
 }
@@ -91,7 +103,12 @@ mod tests {
     fn text(lines: &[Line]) -> String {
         lines
             .iter()
-            .map(|l| l.spans.iter().map(|s| s.content.as_ref()).collect::<String>())
+            .map(|l| {
+                l.spans
+                    .iter()
+                    .map(|s| s.content.as_ref())
+                    .collect::<String>()
+            })
             .collect::<Vec<_>>()
             .join("\n")
     }

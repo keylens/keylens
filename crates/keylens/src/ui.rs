@@ -13,6 +13,10 @@ use ratatui::widgets::{Block, BorderType, Clear, List, ListItem, Paragraph, Wrap
 use crate::app::{App, Focus, Mode, View};
 use crate::{panes, queues};
 
+/// A consumer holding entries this long without acknowledging is worth flagging. Chosen
+/// to be well past a normal processing window without waiting for a human to notice.
+const STUCK_IDLE_MS: i64 = 30_000;
+
 pub fn draw(frame: &mut Frame, app: &mut App) {
     if app.splash {
         draw_splash(frame, app, frame.area());
@@ -78,7 +82,10 @@ fn draw_status(frame: &mut Frame, app: &App, area: Rect) {
     let mut spans = vec![
         Span::styled(" KEYLENS ", Theme::brand()),
         Span::raw(" "),
-        Span::styled(format!(" {} ", server.vendor.label()), Theme::chip(Theme::BRAND_B)),
+        Span::styled(
+            format!(" {} ", server.vendor.label()),
+            Theme::chip(Theme::BRAND_B),
+        ),
         Span::raw(" "),
         Span::styled(server.version.clone(), Theme::number()),
         Span::styled(format!("  {}", server.mode), Theme::label()),
@@ -89,7 +96,10 @@ fn draw_status(frame: &mut Frame, app: &App, area: Rect) {
     // you set and then report as a bug.
     if let Some(p) = &app.pattern {
         spans.push(Span::raw(" "));
-        spans.push(Span::styled(format!(" match {p} "), Theme::chip(ratatui::style::Color::Yellow)));
+        spans.push(Span::styled(
+            format!(" match {p} "),
+            Theme::chip(ratatui::style::Color::Yellow),
+        ));
     }
     if let Some(k) = app.kind_filter {
         spans.push(Span::raw(" "));
@@ -113,7 +123,11 @@ fn draw_tabs(frame: &mut Frame, app: &App, area: Rect) {
         let active = view == app.view;
         spans.push(Span::styled(
             format!(" {} {} ", i + 1, view.label()),
-            if active { Theme::tab_active() } else { Theme::tab_inactive() },
+            if active {
+                Theme::tab_active()
+            } else {
+                Theme::tab_inactive()
+            },
         ));
         spans.push(Span::raw(" "));
     }
@@ -122,24 +136,36 @@ fn draw_tabs(frame: &mut Frame, app: &App, area: Rect) {
 
 fn draw_server_pane(frame: &mut Frame, app: &App, area: Rect, view: View) {
     let (title, lines) = match view {
-        View::Stats => (view.label().to_string(), panes::stats(&app.server, area.width)),
+        View::Stats => (
+            view.label().to_string(),
+            panes::stats(&app.server, area.width),
+        ),
         View::Slowlog => (view.label().to_string(), panes::slowlog(app)),
         View::Clients => (view.label().to_string(), panes::clients(app)),
         View::Cluster => (view.label().to_string(), panes::cluster(app)),
         View::PubSub => (view.label().to_string(), panes::pubsub(app)),
         // -2 for the panel border.
-        View::Queues => (queues::title(app), queues::render(app, area.width.saturating_sub(2))),
+        View::Queues => (
+            queues::title(app),
+            queues::render(app, area.width.saturating_sub(2)),
+        ),
         View::Keys => unreachable!("the keys view has its own split layout"),
     };
 
     frame.render_widget(
-        Paragraph::new(lines).block(Theme::panel(&title, true)).scroll((app.pane_scroll, 0)),
+        Paragraph::new(lines)
+            .block(Theme::panel(&title, true))
+            .scroll((app.pane_scroll, 0)),
         area,
     );
 }
 
 fn draw_tree(frame: &mut Frame, app: &mut App, area: Rect) {
-    let title = if app.loading { "keys — scanning…".to_string() } else { app.status.clone() };
+    let title = if app.loading {
+        "keys — scanning…".to_string()
+    } else {
+        app.status.clone()
+    };
     let block = Theme::panel(&title, app.focus == Focus::Tree);
 
     let items: Vec<ListItem> = app
@@ -157,7 +183,11 @@ fn draw_tree(frame: &mut Frame, app: &mut App, area: Rect) {
                 Span::raw(indent),
                 Span::styled(
                     marker,
-                    if row.is_branch { Theme::accent() } else { Theme::dim() },
+                    if row.is_branch {
+                        Theme::accent()
+                    } else {
+                        Theme::dim()
+                    },
                 ),
                 if row.is_branch {
                     Span::styled(row.label.clone(), Theme::branch())
@@ -173,7 +203,9 @@ fn draw_tree(frame: &mut Frame, app: &mut App, area: Rect) {
                 ));
             }
             // A node can be both branch and key, so this is not an `else`.
-            if row.is_key && let Some(kind) = row.kind {
+            if row.is_key
+                && let Some(kind) = row.kind
+            {
                 spans.push(Span::raw(" "));
                 spans.push(Span::styled(kind.tag(), Theme::kind(Some(kind))));
             }
@@ -182,7 +214,9 @@ fn draw_tree(frame: &mut Frame, app: &mut App, area: Rect) {
         })
         .collect();
 
-    let list = List::new(items).block(block).highlight_style(Theme::selected());
+    let list = List::new(items)
+        .block(block)
+        .highlight_style(Theme::selected());
     app.list_state.select(Some(app.selected));
     frame.render_stateful_widget(list, area, &mut app.list_state);
 }
@@ -216,9 +250,10 @@ fn draw_value(frame: &mut Frame, app: &App, area: Rect) {
 
     lines.push(Line::from(Span::styled(meta.key.clone(), Theme::title())));
     lines.push(Line::from(vec![
-        Span::styled(format!(" {} ", meta.kind.label()), Theme::chip(
-            Theme::kind(Some(meta.kind)).fg.unwrap_or(Theme::BRAND_B),
-        )),
+        Span::styled(
+            format!(" {} ", meta.kind.label()),
+            Theme::chip(Theme::kind(Some(meta.kind)).fg.unwrap_or(Theme::BRAND_B)),
+        ),
         Span::styled("  ttl ", Theme::dim()),
         Span::styled(format::ttl(meta.ttl_ms), Theme::number()),
         Span::styled("  size ", Theme::dim()),
@@ -228,6 +263,14 @@ fn draw_value(frame: &mut Frame, app: &App, area: Rect) {
     ]));
     lines.push(Line::raw(""));
 
+    // For a stream, groups and consumers come *before* the entries: "which consumer is
+    // stuck" is the question, and the entries are the background detail.
+    if let Some(stream) = &app.stream {
+        lines.extend(stream_lines(stream));
+        lines.push(Line::raw(""));
+        lines.push(Line::from(Span::styled(" ▌entries", Theme::heading())));
+    }
+
     lines.extend(value_lines(value, area.width.saturating_sub(4) as usize));
 
     let p = Paragraph::new(lines)
@@ -235,6 +278,131 @@ fn draw_value(frame: &mut Frame, app: &App, area: Rect) {
         .wrap(Wrap { trim: false })
         .scroll((app.detail_scroll, 0));
     frame.render_widget(p, area);
+}
+
+/// Stream metadata, consumer groups and per-consumer pending/idle.
+///
+/// Every other tool shows a stream as a list of entries. The operational question is
+/// almost never "what's in it" — it's "which consumer stopped acknowledging, and how far
+/// behind has the group fallen".
+fn stream_lines(s: &keylens_conn::StreamInfo) -> Vec<Line<'static>> {
+    let mut lines = vec![Line::from(Span::styled(" ▌stream", Theme::heading()))];
+
+    lines.push(Line::from(vec![
+        Span::styled("  length ", Theme::label()),
+        Span::styled(format::count(s.length), Theme::number()),
+        Span::styled("  added ", Theme::label()),
+        Span::styled(
+            s.entries_added
+                .map(format::count)
+                .unwrap_or_else(|| "-".into()),
+            Theme::number(),
+        ),
+        Span::styled("  last id ", Theme::label()),
+        Span::styled(s.last_generated_id.clone(), Theme::value()),
+    ]));
+
+    if s.groups.is_empty() {
+        lines.push(Line::from(Span::styled(
+            "  no consumer groups — this stream is read with XREAD",
+            Theme::dim(),
+        )));
+        return lines;
+    }
+
+    lines.push(Line::raw(""));
+    lines.push(Line::from(Span::styled(
+        " ▌consumer groups",
+        Theme::heading(),
+    )));
+
+    for g in &s.groups {
+        let lag_style = match g.lag {
+            Some(0) => Theme::ok(),
+            Some(_) => Theme::warn(),
+            None => Theme::dim(),
+        };
+
+        lines.push(Line::from(vec![
+            Span::styled(format!("  {}", g.name), Theme::accent()),
+            Span::styled("  consumers ", Theme::label()),
+            Span::styled(g.consumer_count.to_string(), Theme::number()),
+            Span::styled("  pending ", Theme::label()),
+            Span::styled(
+                format::count(g.pending),
+                if g.pending > 0 {
+                    Theme::warn()
+                } else {
+                    Theme::ok()
+                },
+            ),
+            Span::styled("  lag ", Theme::label()),
+            // `unknown` is the honest rendering of a nil lag; 0 would claim the group is
+            // caught up when Redis simply cannot tell.
+            Span::styled(
+                g.lag
+                    .map(|l| l.to_string())
+                    .unwrap_or_else(|| "unknown".into()),
+                lag_style,
+            ),
+        ]));
+
+        if !g.pending_min_id.is_empty() {
+            lines.push(Line::from(vec![
+                Span::styled("    pending range ", Theme::label()),
+                Span::styled(
+                    format!("{} … {}", g.pending_min_id, g.pending_max_id),
+                    Theme::dim(),
+                ),
+            ]));
+        }
+
+        // Worst offenders first: a group with fifty consumers should not make you scroll
+        // to find the one that stopped acknowledging.
+        let mut consumers: Vec<_> = g.consumers.iter().collect();
+        consumers.sort_by_key(|c| (std::cmp::Reverse(c.pending), std::cmp::Reverse(c.idle_ms)));
+
+        for c in consumers {
+            // A consumer holding entries while idle for a long time is the failure mode
+            // this pane exists to surface.
+            let stuck = c.pending > 0 && c.idle_ms > STUCK_IDLE_MS;
+            let name_style = if stuck {
+                Theme::error()
+            } else {
+                Theme::value()
+            };
+
+            // The flag leads the row rather than trailing it: a trailing note wraps onto
+            // its own line in a narrow value pane, which is exactly where this matters.
+            lines.push(Line::from(vec![
+                Span::styled(if stuck { "    ! " } else { "      " }, Theme::error()),
+                Span::styled(format!("{:<22}", format::truncate(&c.name, 21)), name_style),
+                Span::styled("pending ", Theme::label()),
+                Span::styled(
+                    format!("{:<8}", format::count(c.pending)),
+                    if c.pending > 0 {
+                        Theme::warn()
+                    } else {
+                        Theme::dim()
+                    },
+                ),
+                Span::styled("idle ", Theme::label()),
+                Span::styled(
+                    format::ttl(Some(c.idle_ms)),
+                    if stuck { Theme::error() } else { Theme::dim() },
+                ),
+            ]));
+        }
+    }
+
+    if s.groups_truncated {
+        lines.push(Line::from(Span::styled(
+            "  … more groups not shown",
+            Theme::dim(),
+        )));
+    }
+
+    lines
 }
 
 fn value_lines(value: &KeyValue, width: usize) -> Vec<Line<'static>> {
@@ -246,7 +414,10 @@ fn value_lines(value: &KeyValue, width: usize) -> Vec<Line<'static>> {
             // Job payloads are JSON far more often than not; a minified blob is unreadable.
             match format::pretty_json(s) {
                 Some(pretty) => pretty.lines().map(|l| json_line(l.to_string())).collect(),
-                None => s.lines().map(|l| Line::from(Span::styled(l.to_string(), Theme::value()))).collect(),
+                None => s
+                    .lines()
+                    .map(|l| Line::from(Span::styled(l.to_string(), Theme::value())))
+                    .collect(),
             }
         }
 
@@ -318,7 +489,24 @@ fn value_lines(value: &KeyValue, width: usize) -> Vec<Line<'static>> {
             out
         }
 
-        KeyValue::Missing => vec![Line::from(Span::styled("key no longer exists", Theme::dim()))],
+        KeyValue::Missing => vec![Line::from(Span::styled(
+            "key no longer exists",
+            Theme::dim(),
+        ))],
+
+        // Not an error: this server has no cursor-based read for the type, so keylens
+        // measured the key first and declined rather than pulling the whole thing.
+        KeyValue::TooLarge(what, limit) => vec![
+            Line::from(Span::styled(
+                format!("this {what} holds more than {limit} entries"),
+                Theme::warn(),
+            )),
+            Line::from(Span::styled(
+                "this server has no cursor-based read for it, so keylens will not fetch it whole",
+                Theme::dim(),
+            )),
+        ],
+
         KeyValue::Unsupported(why) => vec![Line::from(Span::styled(why.clone(), Theme::warn()))],
     }
 }

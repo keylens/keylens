@@ -7,8 +7,8 @@
 //! One `XREAD` covers every queue at once — Redis takes multiple streams in a single call
 //! — so watching 40 queues costs one blocked connection, not 40.
 
-use keylens_bullmq::events::{entry_id_ms, EventKind};
 use keylens_bullmq::QueueKeys;
+use keylens_bullmq::events::{EventKind, entry_id_ms};
 use keylens_conn::{Conn, Value};
 use tokio::sync::mpsc::Sender;
 use tracing::{debug, warn};
@@ -35,8 +35,10 @@ pub async fn run(conn: Conn, prefix: String, queues: Vec<String>, tx: Sender<Upd
         return;
     }
 
-    let keys: Vec<String> =
-        queues.iter().map(|q| QueueKeys::new(&prefix, q).events()).collect();
+    let keys: Vec<String> = queues
+        .iter()
+        .map(|q| QueueKeys::new(&prefix, q).events())
+        .collect();
 
     // `$` means "only entries added from now on". Reading history would replay hours of
     // events into the first second of the graph and draw a spike that never happened.
@@ -104,15 +106,20 @@ fn parse_xread(
                 _ => None,
             })
             .collect(),
-        Value::Map(map) => {
-            map.iter().map(|(k, v)| (k.as_str().unwrap_or_default().to_string(), v)).collect()
-        }
+        Value::Map(map) => map
+            .iter()
+            .map(|(k, v)| (k.as_str().unwrap_or_default().to_string(), v))
+            .collect(),
         _ => return out,
     };
 
     for (key, entries) in streams {
-        let Some(idx) = keys.iter().position(|k| *k == key) else { continue };
-        let Value::Array(entries) = entries else { continue };
+        let Some(idx) = keys.iter().position(|k| *k == key) else {
+            continue;
+        };
+        let Value::Array(entries) = entries else {
+            continue;
+        };
 
         for entry in entries {
             let Value::Array(pair) = entry else { continue };
@@ -125,8 +132,12 @@ fn parse_xread(
             // unparseable entry would be re-read forever.
             ids[idx] = id.clone();
 
-            let Some(at_ms) = entry_id_ms(&id) else { continue };
-            let Value::Array(fields) = &pair[1] else { continue };
+            let Some(at_ms) = entry_id_ms(&id) else {
+                continue;
+            };
+            let Value::Array(fields) = &pair[1] else {
+                continue;
+            };
 
             // Fields are a flat [name, value, ...] list; BullMQ puts the event name under
             // the `event` key.
@@ -136,7 +147,11 @@ fn parse_xread(
                 .map(|c| EventKind::parse(&as_text(&c[1])));
 
             if let Some(kind) = kind {
-                out.push(StreamEvent { queue: queues[idx].clone(), kind, at_ms });
+                out.push(StreamEvent {
+                    queue: queues[idx].clone(),
+                    kind,
+                    at_ms,
+                });
             }
         }
     }
@@ -182,7 +197,10 @@ mod tests {
 
         let events = parse_xread(&reply, &keys, &queues, &mut ids);
         assert_eq!(events.len(), 1);
-        assert_eq!(events[0].queue, "reports", "stream key must map to the right queue");
+        assert_eq!(
+            events[0].queue, "reports",
+            "stream key must map to the right queue"
+        );
         assert_eq!(events[0].kind, EventKind::Failed);
         assert_eq!(events[0].at_ms, 1_785_515_393_600);
     }
@@ -192,12 +210,18 @@ mod tests {
         let (keys, queues, mut ids) = setup();
         let reply = Value::Array(vec![Value::Array(vec![
             Value::from("bull:reports:events"),
-            Value::Array(vec![entry("100-0", "completed"), entry("101-0", "completed")]),
+            Value::Array(vec![
+                entry("100-0", "completed"),
+                entry("101-0", "completed"),
+            ]),
         ])]);
 
         parse_xread(&reply, &keys, &queues, &mut ids);
         assert_eq!(ids[0], "$", "a silent stream keeps waiting for new entries");
-        assert_eq!(ids[1], "101-0", "the cursor advances to the last entry seen");
+        assert_eq!(
+            ids[1], "101-0",
+            "the cursor advances to the last entry seen"
+        );
     }
 
     #[test]

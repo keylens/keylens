@@ -5,9 +5,9 @@
 //! in-memory buffer, so these run in CI with no terminal and no Redis.
 
 use keylens::app::{App, Mode, View};
+use keylens::events::StreamEvent;
 use keylens::ui;
 use keylens::worker::{JobDetail, Request, Update};
-use keylens::events::StreamEvent;
 use keylens_bullmq::{EventKind, JobRef, QueueSummary, State};
 use keylens_conn::{KeyMeta, KeyValue, Kind, ServerInfo, StreamEntry};
 use keylens_lens::{Confidence, Detection};
@@ -26,7 +26,10 @@ fn app_with(keys: &[&str]) -> (App, Receiver<Request>) {
         tx,
     );
     app.apply(Update::Batch {
-        keys: keys.iter().map(|k| (k.to_string(), Some(Kind::Hash))).collect(),
+        keys: keys
+            .iter()
+            .map(|k| (k.to_string(), Some(Kind::Hash)))
+            .collect(),
         reset: true,
         complete: true,
         scanned_pages: 1,
@@ -35,7 +38,13 @@ fn app_with(keys: &[&str]) -> (App, Receiver<Request>) {
 }
 
 fn meta(key: &str, kind: Kind) -> Box<KeyMeta> {
-    Box::new(KeyMeta { key: key.into(), kind, ttl_ms: Some(90_000), size: 2, memory: Some(1024) })
+    Box::new(KeyMeta {
+        key: key.into(),
+        kind,
+        ttl_ms: Some(90_000),
+        size: 2,
+        memory: Some(1024),
+    })
 }
 
 fn render(app: &mut App, width: u16, height: u16) -> String {
@@ -58,16 +67,28 @@ fn renders_tree_and_status_bar() {
     let out = render(&mut app, 100, 24);
 
     assert!(out.contains("KEYLENS"), "status bar wordmark missing");
-    assert!(out.contains("Valkey"), "vendor should come from INFO, not be assumed");
+    assert!(
+        out.contains("Valkey"),
+        "vendor should come from INFO, not be assumed"
+    );
 
     // Single-child chains fold, so `bull` shows as `bull:emails` and the lone cache key
     // collapses to its whole path -- one row each instead of three levels of expanding.
-    assert!(out.contains("bull:emails"), "chain should be folded:\n{out}");
+    assert!(
+        out.contains("bull:emails"),
+        "chain should be folded:\n{out}"
+    );
     assert!(out.contains("cache:user:7"), "{out}");
 
     // Still collapsed below the fold: the two job ids must not be visible yet.
-    let tree_pane: String = out.lines().map(|l| l.split("││").next().unwrap_or(l)).collect();
-    assert!(!tree_pane.contains("emails:1"), "tree should start collapsed:\n{out}");
+    let tree_pane: String = out
+        .lines()
+        .map(|l| l.split("││").next().unwrap_or(l))
+        .collect();
+    assert!(
+        !tree_pane.contains("emails:1"),
+        "tree should start collapsed:\n{out}"
+    );
 }
 
 #[test]
@@ -89,7 +110,11 @@ fn renders_every_value_type_without_panicking() {
     for value in values {
         let (mut app, _rx) = app_with(&["k"]);
         app.set_pending_key(Some("k".into()));
-        app.apply(Update::Detail { meta: meta("k", Kind::String), value: Box::new(value) });
+        app.apply(Update::Detail {
+            meta: meta("k", Kind::String),
+            value: Box::new(value),
+            stream: None,
+        });
         assert!(app.detail.is_some(), "detail should have been accepted");
         let _ = render(&mut app, 100, 24);
     }
@@ -102,11 +127,15 @@ fn json_payloads_render_pretty_printed() {
     app.apply(Update::Detail {
         meta: meta("job", Kind::String),
         value: Box::new(KeyValue::String(r#"{"to":"a@b.c","attempts":3}"#.into())),
+        stream: None,
     });
 
     let out = render(&mut app, 100, 24);
     // Minified JSON has no space after the colon; pretty-printed does.
-    assert!(out.contains("\"to\": \"a@b.c\""), "payload should be pretty-printed:\n{out}");
+    assert!(
+        out.contains("\"to\": \"a@b.c\""),
+        "payload should be pretty-printed:\n{out}"
+    );
 }
 
 #[test]
@@ -116,6 +145,7 @@ fn ttl_and_memory_appear_in_the_detail_header() {
     app.apply(Update::Detail {
         meta: meta("k", Kind::Hash),
         value: Box::new(KeyValue::Hash(vec![("f".into(), "v".into())])),
+        stream: None,
     });
 
     let out = render(&mut app, 100, 24);
@@ -132,6 +162,7 @@ fn survives_a_terminal_too_narrow_to_be_reasonable() {
     app.apply(Update::Detail {
         meta: meta("bull:emails:1", Kind::Hash),
         value: Box::new(KeyValue::Hash(vec![("field".into(), "value".into())])),
+        stream: None,
     });
 
     for (w, h) in [(20, 5), (10, 3), (4, 2), (1, 1)] {
@@ -152,7 +183,10 @@ fn help_overlay_draws_over_the_tree() {
 fn empty_keyspace_explains_itself() {
     let (mut app, _rx) = app_with(&[]);
     let out = render(&mut app, 100, 24);
-    assert!(out.contains("no keys"), "an empty pane should say what to do next:\n{out}");
+    assert!(
+        out.contains("no keys"),
+        "an empty pane should say what to do next:\n{out}"
+    );
 }
 
 #[test]
@@ -161,7 +195,11 @@ fn every_view_renders() {
         let (mut app, _rx) = app_with(&["bull:emails:1"]);
         app.view = view;
         let out = render(&mut app, 110, 30);
-        assert!(out.contains(view.label()), "tab bar missing {}:\n{out}", view.label());
+        assert!(
+            out.contains(view.label()),
+            "tab bar missing {}:\n{out}",
+            view.label()
+        );
     }
 }
 
@@ -175,7 +213,10 @@ fn a_blocked_command_reads_as_unavailable_not_as_an_error() {
     let out = render(&mut app, 110, 30);
     assert!(out.contains("unavailable on this server"), "{out}");
     assert!(out.contains("NOPERM"), "the reason should be shown:\n{out}");
-    assert!(!out.to_lowercase().contains("failed"), "must not read as a failure:\n{out}");
+    assert!(
+        !out.to_lowercase().contains("failed"),
+        "must not read as a failure:\n{out}"
+    );
 }
 
 #[test]
@@ -192,7 +233,10 @@ fn stats_pane_reports_what_info_actually_returned() {
     assert!(out.contains("5.17M"));
     assert!(out.contains("90.0%"), "hit rate should be computed:\n{out}");
     assert!(out.contains("noeviction"));
-    assert!(out.contains("keys=501"), "per-db keyspace should be listed:\n{out}");
+    assert!(
+        out.contains("keys=501"),
+        "per-db keyspace should be listed:\n{out}"
+    );
 
     // The dashboard is taller than most terminals, so scrolling has to work: the keyspace
     // section sits below the fold at a realistic height.
@@ -200,7 +244,10 @@ fn stats_pane_reports_what_info_actually_returned() {
     assert!(!short.contains("keys=501"));
     app.pane_scroll = 24;
     let scrolled = render(&mut app, 110, 30);
-    assert!(scrolled.contains("keys=501"), "scrolling should reach the keyspace:\n{scrolled}");
+    assert!(
+        scrolled.contains("keys=501"),
+        "scrolling should reach the keyspace:\n{scrolled}"
+    );
 }
 
 #[test]
@@ -221,7 +268,10 @@ fn empty_slowlog_says_so_and_says_why() {
 
     let out = render(&mut app, 110, 30);
     assert!(out.contains("no slow commands logged"), "{out}");
-    assert!(out.contains("slowlog-log-slower-than"), "should hint at the threshold:\n{out}");
+    assert!(
+        out.contains("slowlog-log-slower-than"),
+        "should hint at the threshold:\n{out}"
+    );
 }
 
 fn with_bullmq(keys: &[&str]) -> (App, Receiver<Request>) {
@@ -258,10 +308,16 @@ fn queue_table_shows_counts_and_true_paused_state() {
     ])));
 
     let out = render(&mut app, 120, 24);
-    assert!(out.contains("bullmq 6.0.2"), "detection summary belongs in the title:\n{out}");
+    assert!(
+        out.contains("bullmq 6.0.2"),
+        "detection summary belongs in the title:\n{out}"
+    );
     assert!(out.contains("emails"));
     assert!(out.contains("running"));
-    assert!(out.contains("paused"), "paused state must be visible:\n{out}");
+    assert!(
+        out.contains("paused"),
+        "paused state must be visible:\n{out}"
+    );
     assert!(out.contains("18"));
     assert!(out.contains("1 paused"));
 }
@@ -270,21 +326,39 @@ fn queue_table_shows_counts_and_true_paused_state() {
 fn queue_columns_do_not_run_into_each_other() {
     // `prioritized` and `waiting-children` at full length overflowed their columns.
     let (mut app, _rx) = with_bullmq(&[]);
-    app.apply(Update::Queues(PaneState::Ready(vec![queue("image-processing", false, 500)])));
+    app.apply(Update::Queues(PaneState::Ready(vec![queue(
+        "image-processing",
+        false,
+        500,
+    )])));
 
     let out = render(&mut app, 120, 24);
-    let header = out.lines().find(|l| l.contains("queue") && l.contains("status")).unwrap();
+    let header = out
+        .lines()
+        .find(|l| l.contains("queue") && l.contains("status"))
+        .unwrap();
     assert!(header.contains("prio"), "short labels expected:\n{header}");
-    assert!(!header.contains("prioritized"), "full label overflows:\n{header}");
+    assert!(
+        !header.contains("prioritized"),
+        "full label overflows:\n{header}"
+    );
     // The name column needs a gap before status.
-    let row = out.lines().find(|l| l.contains("image-processing")).unwrap();
-    assert!(!row.contains("image-processingrunning"), "name butts into status:\n{row}");
+    let row = out
+        .lines()
+        .find(|l| l.contains("image-processing"))
+        .unwrap();
+    assert!(
+        !row.contains("image-processingrunning"),
+        "name butts into status:\n{row}"
+    );
 }
 
 #[test]
 fn throughput_column_distinguishes_idle_from_not_yet_watching() {
     let (mut app, _rx) = with_bullmq(&[]);
-    app.apply(Update::Queues(PaneState::Ready(vec![queue("emails", false, 0)])));
+    app.apply(Update::Queues(PaneState::Ready(vec![queue(
+        "emails", false, 0,
+    )])));
 
     // Before the reader attaches, the graph is unknown -- not idle.
     let out = render(&mut app, 130, 24);
@@ -293,13 +367,18 @@ fn throughput_column_distinguishes_idle_from_not_yet_watching() {
     app.apply(Update::EventsAttached);
     let out = render(&mut app, 130, 24);
     assert!(out.contains("live"), "{out}");
-    assert!(out.contains("idle"), "an attached-but-silent queue reads as idle:\n{out}");
+    assert!(
+        out.contains("idle"),
+        "an attached-but-silent queue reads as idle:\n{out}"
+    );
 }
 
 #[test]
 fn throughput_column_draws_a_sparkline_from_stream_events() {
     let (mut app, _rx) = with_bullmq(&[]);
-    app.apply(Update::Queues(PaneState::Ready(vec![queue("emails", false, 0)])));
+    app.apply(Update::Queues(PaneState::Ready(vec![queue(
+        "emails", false, 0,
+    )])));
     app.apply(Update::EventsAttached);
 
     // Events timestamped "now" so they land inside the rendered window.
@@ -325,7 +404,10 @@ fn throughput_column_draws_a_sparkline_from_stream_events() {
 
     // Assert on the summary line specifically -- a substring search for "0.0" over the
     // whole screen matches the `127.0.0.1` in the connection URL.
-    let summary = out.lines().find(|l| l.contains("events/sec")).expect("summary line");
+    let summary = out
+        .lines()
+        .find(|l| l.contains("events/sec"))
+        .expect("summary line");
     assert!(summary.contains("live"), "{summary}");
     assert!(
         !summary.contains("0.0 events/sec"),
@@ -338,7 +420,11 @@ fn the_queue_table_fits_its_pane() {
     // The sparkline is sized from the remaining width; getting that budget wrong clipped
     // the ev/s column off the right-hand edge.
     let (mut app, _rx) = with_bullmq(&[]);
-    app.apply(Update::Queues(PaneState::Ready(vec![queue("image-processing", false, 500)])));
+    app.apply(Update::Queues(PaneState::Ready(vec![queue(
+        "image-processing",
+        false,
+        500,
+    )])));
     app.apply(Update::EventsAttached);
 
     for width in [80u16, 100, 120, 160, 200] {
@@ -353,14 +439,23 @@ fn the_queue_table_fits_its_pane() {
         }
 
         // The columns that justify the view must survive every width.
-        let header = out.lines().find(|l| l.contains("queue") && l.contains("status")).unwrap();
+        let header = out
+            .lines()
+            .find(|l| l.contains("queue") && l.contains("status"))
+            .unwrap();
         for required in ["wait", "active", "failed"] {
-            assert!(header.contains(required), "lost `{required}` at width {width}:\n{header}");
+            assert!(
+                header.contains(required),
+                "lost `{required}` at width {width}:\n{header}"
+            );
         }
 
         // Once there's room, the graph and rate appear.
         if width >= 140 {
-            assert!(out.contains("ev/s"), "graph should fit at width {width}:\n{out}");
+            assert!(
+                out.contains("ev/s"),
+                "graph should fit at width {width}:\n{out}"
+            );
         }
     }
 }
@@ -368,14 +463,22 @@ fn the_queue_table_fits_its_pane() {
 #[test]
 fn a_narrow_pane_drops_columns_instead_of_clipping_them() {
     let (mut app, _rx) = with_bullmq(&[]);
-    app.apply(Update::Queues(PaneState::Ready(vec![queue("emails", false, 7)])));
+    app.apply(Update::Queues(PaneState::Ready(vec![queue(
+        "emails", false, 7,
+    )])));
 
     let narrow = render(&mut app, 80, 20);
     let wide = render(&mut app, 200, 20);
 
     // `children` is the least useful column, so it goes first.
-    assert!(!narrow.contains("children"), "narrow pane should drop it:\n{narrow}");
-    assert!(wide.contains("children"), "wide pane has room for it:\n{wide}");
+    assert!(
+        !narrow.contains("children"),
+        "narrow pane should drop it:\n{narrow}"
+    );
+    assert!(
+        wide.contains("children"),
+        "wide pane has room for it:\n{wide}"
+    );
     // But the failed count is never dropped -- it's why the view exists.
     assert!(narrow.contains("failed"));
 }
@@ -383,10 +486,17 @@ fn a_narrow_pane_drops_columns_instead_of_clipping_them() {
 #[test]
 fn job_detail_renders_a_stack_trace_per_attempt() {
     let (mut app, _rx) = with_bullmq(&[]);
-    app.apply(Update::Queues(PaneState::Ready(vec![queue("image-processing", false, 1)])));
+    app.apply(Update::Queues(PaneState::Ready(vec![queue(
+        "image-processing",
+        false,
+        1,
+    )])));
     app.apply(Update::Jobs {
         state: State::Failed,
-        data: PaneState::Ready(vec![JobRef { id: "7012".into(), score: Some(1.0) }]),
+        data: PaneState::Ready(vec![JobRef {
+            id: "7012".into(),
+            score: Some(1.0),
+        }]),
     });
 
     let job = keylens_bullmq::job::from_fields(
@@ -406,17 +516,32 @@ fn job_detail_renders_a_stack_trace_per_attempt() {
             ("finishedOn", "2200"),
         ]),
     );
-    app.apply(Update::Job(PaneState::Ready(Some(Box::new(JobDetail { job, logs: vec![] })))));
+    app.apply(Update::Job(PaneState::Ready(Some(Box::new(JobDetail {
+        job,
+        logs: vec![],
+    })))));
     app.level = keylens::app::QueueLevel::Job;
 
     let out = render(&mut app, 120, 40);
-    assert!(out.contains("2/2"), "attempts should show made/allowed:\n{out}");
+    assert!(
+        out.contains("2/2"),
+        "attempts should show made/allowed:\n{out}"
+    );
     assert!(out.contains("waited"), "{out}");
     assert!(out.contains("ran for"), "{out}");
     assert!(out.contains("offset is out of bounds"));
-    assert!(out.contains("attempt 1") && out.contains("attempt 2"), "one trace per attempt:\n{out}");
-    assert!(out.contains("at decodeFrame"), "frames should be real lines, not escaped:\n{out}");
-    assert!(!out.contains("\\n"), "escaped newlines mean the JSON array wasn't parsed:\n{out}");
+    assert!(
+        out.contains("attempt 1") && out.contains("attempt 2"),
+        "one trace per attempt:\n{out}"
+    );
+    assert!(
+        out.contains("at decodeFrame"),
+        "frames should be real lines, not escaped:\n{out}"
+    );
+    assert!(
+        !out.contains("\\n"),
+        "escaped newlines mean the JSON array wasn't parsed:\n{out}"
+    );
     assert!(out.contains("\"assetId\""), "payload should render:\n{out}");
 }
 
@@ -433,8 +558,147 @@ fn a_job_removed_by_retention_explains_itself() {
 fn field_values(pairs: &[(&str, &str)]) -> Vec<Option<String>> {
     keylens_bullmq::job::JOB_FIELDS
         .iter()
-        .map(|f| pairs.iter().find(|(k, _)| k == f).map(|(_, v)| v.to_string()))
+        .map(|f| {
+            pairs
+                .iter()
+                .find(|(k, _)| k == f)
+                .map(|(_, v)| v.to_string())
+        })
         .collect()
+}
+
+fn stream_with_groups() -> Box<keylens_conn::StreamInfo> {
+    use keylens_conn::{ConsumerInfo, GroupInfo, StreamInfo};
+    Box::new(StreamInfo {
+        length: 1154,
+        entries_added: Some(1154),
+        last_generated_id: "1785518057220-0".into(),
+        groups: vec![GroupInfo {
+            name: "processors".into(),
+            consumer_count: 2,
+            pending: 27,
+            last_delivered_id: "1785517628634-0".into(),
+            entries_read: Some(95),
+            lag: Some(0),
+            pending_min_id: "1785517610863-0".into(),
+            pending_max_id: "1785517615743-0".into(),
+            consumers: vec![
+                ConsumerInfo {
+                    name: "worker-healthy".into(),
+                    pending: 0,
+                    idle_ms: 232,
+                    inactive_ms: Some(240),
+                },
+                ConsumerInfo {
+                    name: "worker-stuck".into(),
+                    pending: 27,
+                    idle_ms: 441_000,
+                    inactive_ms: Some(441_000),
+                },
+            ],
+        }],
+        ..Default::default()
+    })
+}
+
+fn render_stream(app: &mut App, stream: Box<keylens_conn::StreamInfo>, width: u16) -> String {
+    app.set_pending_key(Some("keylens:audit".into()));
+    app.apply(Update::Detail {
+        meta: meta("keylens:audit", Kind::Stream),
+        value: Box::new(KeyValue::Stream(vec![StreamEntry {
+            id: "1785517610835-0".into(),
+            fields: vec![("actor".into(), "admin".into())],
+        }])),
+        stream: Some(stream),
+    });
+    render(app, width, 40)
+}
+
+#[test]
+fn stream_viewer_surfaces_the_stuck_consumer() {
+    // The reason this pane exists: not "what's in the stream" but "who stopped acking".
+    let (mut app, _rx) = app_with(&["keylens:audit"]);
+    let out = render_stream(&mut app, stream_with_groups(), 120);
+
+    assert!(out.contains("consumer groups"), "{out}");
+    assert!(out.contains("processors"));
+    assert!(out.contains("worker-stuck"));
+    assert!(
+        out.contains("pending range"),
+        "the outstanding id range matters:\n{out}"
+    );
+    // The flagged consumer's idle time is humanised, not raw milliseconds.
+    assert!(out.contains("7m21s"), "{out}");
+    // Entries still render, below the group state.
+    assert!(out.contains("entries"));
+}
+
+#[test]
+fn the_stuck_flag_does_not_wrap_onto_its_own_line() {
+    // A trailing note wrapped in a narrow value pane -- exactly where it matters most.
+    let (mut app, _rx) = app_with(&["keylens:audit"]);
+    for width in [90u16, 110, 140] {
+        let out = render_stream(&mut app, stream_with_groups(), width);
+        let row = out
+            .lines()
+            .find(|l| l.contains("worker-stuck"))
+            .unwrap_or_else(|| panic!("consumer row missing at width {width}"));
+        assert!(
+            row.contains('!'),
+            "stuck marker missing at width {width}: {row}"
+        );
+        assert!(
+            row.contains("27"),
+            "pending count wrapped away at width {width}: {row}"
+        );
+    }
+}
+
+#[test]
+fn consumers_are_ordered_worst_first() {
+    let (mut app, _rx) = app_with(&["keylens:audit"]);
+    let out = render_stream(&mut app, stream_with_groups(), 120);
+
+    let stuck = out
+        .lines()
+        .position(|l| l.contains("worker-stuck"))
+        .unwrap();
+    let healthy = out
+        .lines()
+        .position(|l| l.contains("worker-healthy"))
+        .unwrap();
+    assert!(
+        stuck < healthy,
+        "the consumer holding entries should come first:\n{out}"
+    );
+}
+
+#[test]
+fn an_unknown_lag_is_not_reported_as_zero() {
+    // Redis returns nil for lag after trimming or XSETID. Showing 0 would claim the group
+    // is caught up when the truth is that Redis cannot tell.
+    let (mut app, _rx) = app_with(&["keylens:audit"]);
+    let mut stream = stream_with_groups();
+    stream.groups[0].lag = None;
+
+    let out = render_stream(&mut app, stream, 120);
+    assert!(out.contains("lag unknown"), "{out}");
+}
+
+#[test]
+fn a_stream_without_groups_says_so() {
+    use keylens_conn::StreamInfo;
+    let (mut app, _rx) = app_with(&["bull:emails:events"]);
+    let stream = Box::new(StreamInfo {
+        length: 10_044,
+        entries_added: Some(63_914),
+        last_generated_id: "1785517561250-1".into(),
+        ..Default::default()
+    });
+
+    let out = render_stream(&mut app, stream, 120);
+    assert!(out.contains("no consumer groups"), "{out}");
+    assert!(out.contains("XREAD"), "explain why, not just that:\n{out}");
 }
 
 #[test]
@@ -462,7 +726,10 @@ fn splash_shows_the_wordmark_until_the_first_batch_lands() {
     let out = render(&mut app, 100, 30);
     assert!(out.contains("█"), "block wordmark should render:\n{out}");
     assert!(out.contains("Valkey"));
-    assert!(out.contains("read-only"), "the safety promise belongs on the splash:\n{out}");
+    assert!(
+        out.contains("read-only"),
+        "the safety promise belongs on the splash:\n{out}"
+    );
 
     // The first batch is the signal there's something worth showing.
     app.apply(Update::Batch {
@@ -480,8 +747,11 @@ fn splash_shows_the_wordmark_until_the_first_batch_lands() {
 fn splash_degrades_on_a_narrow_terminal() {
     // Block glyphs sliced mid-letter look broken, not minimal.
     let (tx, _rx) = mpsc::channel(8);
-    let mut app =
-        App::new(ServerInfo::parse("redis_version:8.0.0\r\n"), "redis://x".into(), tx);
+    let mut app = App::new(
+        ServerInfo::parse("redis_version:8.0.0\r\n"),
+        "redis://x".into(),
+        tx,
+    );
 
     let out = render(&mut app, 40, 20);
     assert!(out.contains("KEYLENS"));

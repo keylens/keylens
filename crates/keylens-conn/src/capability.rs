@@ -38,6 +38,8 @@ impl Availability {
 /// backed by different commands across vendors.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
 pub enum Feature {
+    /// `INFO` itself. Not every Redis-compatible server implements it.
+    ServerInfo,
     Config,
     ClientList,
     Slowlog,
@@ -46,12 +48,17 @@ pub enum Feature {
     Modules,
     /// `SCAN ... TYPE <t>` — Redis 6+. Without it, type filtering happens client-side.
     ScanTypeFilter,
+    /// `GETRANGE` — without it a long string can only be read whole.
+    GetRange,
+    /// `HSCAN`/`SSCAN` — without them a hash or set can only be read whole.
+    CursorCollectionScan,
     Streams,
     PubSub,
 }
 
 impl Feature {
-    pub const ALL: [Feature; 9] = [
+    pub const ALL: [Feature; 12] = [
+        Feature::ServerInfo,
         Feature::Config,
         Feature::ClientList,
         Feature::Slowlog,
@@ -59,12 +66,15 @@ impl Feature {
         Feature::Cluster,
         Feature::Modules,
         Feature::ScanTypeFilter,
+        Feature::GetRange,
+        Feature::CursorCollectionScan,
         Feature::Streams,
         Feature::PubSub,
     ];
 
     pub fn label(&self) -> &'static str {
         match self {
+            Feature::ServerInfo => "INFO",
             Feature::Config => "CONFIG",
             Feature::ClientList => "CLIENT LIST",
             Feature::Slowlog => "SLOWLOG",
@@ -72,6 +82,8 @@ impl Feature {
             Feature::Cluster => "CLUSTER",
             Feature::Modules => "MODULE LIST",
             Feature::ScanTypeFilter => "SCAN TYPE",
+            Feature::GetRange => "GETRANGE",
+            Feature::CursorCollectionScan => "HSCAN/SSCAN",
             Feature::Streams => "STREAMS",
             Feature::PubSub => "PUBSUB",
         }
@@ -80,13 +92,16 @@ impl Feature {
     /// Which pane degrades when this is missing — used for the probe report.
     pub fn affects(&self) -> &'static str {
         match self {
+            Feature::ServerInfo => "stats dashboard",
             Feature::Config => "config pane",
             Feature::ClientList => "clients pane",
             Feature::Slowlog => "slowlog pane",
             Feature::MemoryStats => "memory breakdown",
             Feature::Cluster => "cluster topology",
             Feature::Modules => "module-backed viewers",
-            Feature::ScanTypeFilter => "type filter (falls back to client-side)",
+            Feature::ScanTypeFilter => "server-side type filter",
+            Feature::GetRange => "bounded string reads",
+            Feature::CursorCollectionScan => "bounded hash/set reads",
             Feature::Streams => "stream + consumer group viewer",
             Feature::PubSub => "pub/sub pane",
         }
@@ -105,7 +120,10 @@ impl Capabilities {
     }
 
     pub fn get(&self, f: Feature) -> Availability {
-        self.map.get(&f).cloned().unwrap_or(Availability::Unsupported)
+        self.map
+            .get(&f)
+            .cloned()
+            .unwrap_or(Availability::Unsupported)
     }
 
     pub fn has(&self, f: Feature) -> bool {
@@ -178,7 +196,9 @@ mod tests {
     #[test]
     fn noperm_is_denied() {
         assert!(matches!(
-            classify(&err("NOPERM this user has no permissions to run the 'config' command")),
+            classify(&err(
+                "NOPERM this user has no permissions to run the 'config' command"
+            )),
             Availability::Denied(_)
         ));
     }
@@ -198,7 +218,9 @@ mod tests {
         // `XLEN` on a missing key errors, but proves the command is permitted. Treating
         // this as unavailable would black out the stream viewer on healthy servers.
         assert_eq!(
-            classify(&err("WRONGTYPE Operation against a key holding the wrong kind of value")),
+            classify(&err(
+                "WRONGTYPE Operation against a key holding the wrong kind of value"
+            )),
             Availability::Available
         );
         assert_eq!(classify(&err("ERR no such key")), Availability::Available);

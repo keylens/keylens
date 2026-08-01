@@ -236,8 +236,9 @@ impl KeyTree {
         }
 
         // `partition` keeps the map's lexicographic order within each group.
-        let (branches, leaves): (Vec<_>, Vec<_>) =
-            folded.into_iter().partition(|(_, _, n)| !n.children.is_empty());
+        let (branches, leaves): (Vec<_>, Vec<_>) = folded
+            .into_iter()
+            .partition(|(_, _, n)| !n.children.is_empty());
 
         for (label, path, target) in branches.into_iter().chain(leaves) {
             let is_branch = !target.children.is_empty();
@@ -305,7 +306,10 @@ mod tests {
         assert_eq!(paths(&t.rows()), vec!["bull:emails"]);
 
         t.toggle("bull:emails");
-        assert_eq!(paths(&t.rows()), vec!["bull:emails", "bull:emails:1", "bull:emails:2"]);
+        assert_eq!(
+            paths(&t.rows()),
+            vec!["bull:emails", "bull:emails:1", "bull:emails:2"]
+        );
     }
 
     #[test]
@@ -365,7 +369,10 @@ mod tests {
         let mut t = tree(&["a:b:c:d", "a:b:x", "a:b:c:e"]);
         t.reveal("a:b:c");
         assert!(t.is_expanded("a:b"));
-        assert!(!t.is_expanded("a:b:c"), "reveal makes the target visible, not opened");
+        assert!(
+            !t.is_expanded("a:b:c"),
+            "reveal makes the target visible, not opened"
+        );
         assert!(paths(&t.rows()).contains(&"a:b:c"));
     }
 
@@ -407,7 +414,11 @@ mod tests {
         let mut t = tree(&["bull:emails:meta"]);
         t.set_kind("bull:emails:meta", Kind::Hash);
         t.expand_all();
-        let row = t.rows().into_iter().find(|r| r.path == "bull:emails:meta").unwrap();
+        let row = t
+            .rows()
+            .into_iter()
+            .find(|r| r.path == "bull:emails:meta")
+            .unwrap();
         assert_eq!(row.kind, Some(Kind::Hash));
     }
 

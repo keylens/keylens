@@ -23,8 +23,12 @@ const RATE_W: usize = 7;
 /// dashboard at all; `wait` and `active` are how you tell a backlog from a stall.
 const REQUIRED: [State; 3] = [State::Waiting, State::Active, State::Failed];
 /// The rest, in the order they get dropped as the pane narrows (last dropped first).
-const OPTIONAL: [State; 4] =
-    [State::Completed, State::Delayed, State::Prioritized, State::WaitingChildren];
+const OPTIONAL: [State; 4] = [
+    State::Completed,
+    State::Delayed,
+    State::Prioritized,
+    State::WaitingChildren,
+];
 
 /// Decide which columns fit in `width`.
 ///
@@ -57,8 +61,15 @@ fn layout(width: usize, name_w: usize) -> (Vec<State>, usize) {
 
 fn placeholder<T>(state: &PaneState<T>) -> Option<Vec<Line<'static>>> {
     state.placeholder().map(|msg| {
-        let style = if state.is_error() { Theme::error() } else { Theme::dim() };
-        vec![Line::raw(""), Line::from(Span::styled(format!("  {msg}"), style))]
+        let style = if state.is_error() {
+            Theme::error()
+        } else {
+            Theme::dim()
+        };
+        vec![
+            Line::raw(""),
+            Line::from(Span::styled(format!("  {msg}"), style)),
+        ]
     })
 }
 
@@ -107,7 +118,11 @@ pub fn render(app: &App, width: u16) -> Vec<Line<'static>> {
 /// completes or fails rather than at the next poll.
 fn throughput_cells(app: &App, queue: &str, now: i64, spark_w: usize) -> Vec<Span<'static>> {
     let Some(series) = app.throughput.series(queue) else {
-        let msg = if app.throughput.attached { "idle" } else { "…" };
+        let msg = if app.throughput.attached {
+            "idle"
+        } else {
+            "…"
+        };
         return vec![
             Span::styled(format!("  {msg:<spark_w$}"), Theme::dim()),
             Span::styled(format!("{:>RATE_W$}", "-"), Theme::dim()),
@@ -120,8 +135,16 @@ fn throughput_cells(app: &App, queue: &str, now: i64, spark_w: usize) -> Vec<Spa
     let failed: u64 = series.window(now, spark_w, |b| b.failed).iter().sum();
     let rate = series.rate(now, 10);
 
-    let spark_style = if failed > 0 { Theme::error() } else { Theme::ok() };
-    let rate_style = if rate > 0.0 { Theme::number() } else { Theme::dim() };
+    let spark_style = if failed > 0 {
+        Theme::error()
+    } else {
+        Theme::ok()
+    };
+    let rate_style = if rate > 0.0 {
+        Theme::number()
+    } else {
+        Theme::dim()
+    };
 
     vec![
         Span::styled(format!("  {}", format::sparkline(&totals)), spark_style),
@@ -144,7 +167,13 @@ fn queue_table(app: &App, width: u16) -> Vec<Line<'static>> {
     }
 
     // +2 so the longest name still has a gap before the status column.
-    let name_w = queues.iter().map(|q| q.name.chars().count()).max().unwrap_or(10).clamp(10, 30) + 2;
+    let name_w = queues
+        .iter()
+        .map(|q| q.name.chars().count())
+        .max()
+        .unwrap_or(10)
+        .clamp(10, 30)
+        + 2;
 
     let (columns, spark_w) = layout(width as usize, name_w);
 
@@ -153,7 +182,10 @@ fn queue_table(app: &App, width: u16) -> Vec<Line<'static>> {
         Span::styled(format!("{:<9}", "status"), Theme::label()),
     ];
     for s in &columns {
-        header.push(Span::styled(format!("{:>COL$}", s.short_label()), Theme::label()));
+        header.push(Span::styled(
+            format!("{:>COL$}", s.short_label()),
+            Theme::label(),
+        ));
     }
     if spark_w > 0 {
         let spark_header = format!("last {spark_w}s");
@@ -173,7 +205,11 @@ fn queue_table(app: &App, width: u16) -> Vec<Line<'static>> {
             Span::styled(marker, Theme::accent()),
             Span::styled(
                 format!("{:<name_w$}", format::truncate(&q.name, name_w - 2)),
-                if selected { Theme::title() } else { Theme::key_name() },
+                if selected {
+                    Theme::title()
+                } else {
+                    Theme::key_name()
+                },
             ),
         ];
 
@@ -186,7 +222,10 @@ fn queue_table(app: &App, width: u16) -> Vec<Line<'static>> {
 
         for s in &columns {
             let n = q.count(*s);
-            spans.push(Span::styled(format!("{:>COL$}", format::count(n)), count_style(*s, n)));
+            spans.push(Span::styled(
+                format!("{:>COL$}", format::count(n)),
+                count_style(*s, n),
+            ));
         }
 
         if spark_w > 0 {
@@ -212,7 +251,11 @@ fn queue_table(app: &App, width: u16) -> Vec<Line<'static>> {
             } else {
                 "   ○ attaching to event streams…".to_string()
             },
-            if app.throughput.attached { Theme::ok() } else { Theme::dim() },
+            if app.throughput.attached {
+                Theme::ok()
+            } else {
+                Theme::dim()
+            },
         ),
     ]));
 
@@ -248,9 +291,16 @@ fn job_list(app: &App) -> Vec<Line<'static>> {
             Span::styled(if selected { "▶ " } else { "  " }, Theme::accent()),
             Span::styled(
                 format!("{:<20}", format::truncate(&job.id, 19)),
-                if selected { Theme::title() } else { Theme::value() },
+                if selected {
+                    Theme::title()
+                } else {
+                    Theme::value()
+                },
             ),
-            Span::styled(job.score.map(|s| format_score(s, now)).unwrap_or_default(), Theme::dim()),
+            Span::styled(
+                job.score.map(|s| format_score(s, now)).unwrap_or_default(),
+                Theme::dim(),
+            ),
         ]));
     }
 
@@ -273,7 +323,11 @@ fn state_bar(app: &App) -> Line<'static> {
         // Short labels here too: seven chips at full length overflow an 80-column pane.
         spans.push(Span::styled(
             format!(" {} {} ", s.short_label(), format::count(count)),
-            if active { Theme::tab_active() } else { Theme::tab_inactive() },
+            if active {
+                Theme::tab_active()
+            } else {
+                Theme::tab_inactive()
+            },
         ));
         spans.push(Span::raw(" "));
     }
@@ -359,7 +413,11 @@ fn job_detail(app: &App) -> Vec<Line<'static>> {
             // The trace is one string with real newlines inside it.
             for frame in trace.lines() {
                 let trimmed = frame.trim_start();
-                let style = if trimmed.starts_with("at ") { Theme::dim() } else { Theme::warn() };
+                let style = if trimmed.starts_with("at ") {
+                    Theme::dim()
+                } else {
+                    Theme::warn()
+                };
                 lines.push(Line::from(Span::styled(format!("  {frame}"), style)));
             }
         }

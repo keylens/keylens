@@ -14,6 +14,7 @@ pub enum Vendor {
     Dragonfly,
     KeyDb,
     Garnet,
+    Recached,
     Unknown(String),
 }
 
@@ -25,6 +26,7 @@ impl Vendor {
             Vendor::Dragonfly => "Dragonfly",
             Vendor::KeyDb => "KeyDB",
             Vendor::Garnet => "Garnet",
+            Vendor::Recached => "Recached",
             Vendor::Unknown(s) => s,
         }
     }
@@ -41,6 +43,19 @@ pub struct ServerInfo {
 }
 
 impl ServerInfo {
+    /// What we know about a server that did not answer `INFO`: nothing.
+    ///
+    /// Deliberately not `Vendor::Redis` -- guessing here is how a tool ends up claiming a
+    /// Dragonfly instance is Redis 7.
+    pub fn unknown() -> Self {
+        Self {
+            vendor: Vendor::Unknown("unknown".into()),
+            version: "unknown".into(),
+            mode: "standalone".into(),
+            fields: BTreeMap::new(),
+        }
+    }
+
     pub fn parse(raw: &str) -> Self {
         let mut fields = BTreeMap::new();
         for line in raw.lines() {
@@ -65,7 +80,12 @@ impl ServerInfo {
             .cloned()
             .unwrap_or_else(|| "standalone".into());
 
-        Self { vendor, version, mode, fields }
+        Self {
+            vendor,
+            version,
+            mode,
+            fields,
+        }
     }
 
     pub fn get(&self, key: &str) -> Option<&str> {
@@ -99,6 +119,7 @@ fn detect_vendor(fields: &BTreeMap<String, String>) -> Vendor {
             "dragonfly" => Vendor::Dragonfly,
             "keydb" => Vendor::KeyDb,
             "garnet" => Vendor::Garnet,
+            "recached" => Vendor::Recached,
             other => Vendor::Unknown(other.to_string()),
         };
     }
@@ -113,6 +134,9 @@ fn detect_vendor(fields: &BTreeMap<String, String>) -> Vendor {
     }
     if fields.contains_key("garnet_version") {
         return Vendor::Garnet;
+    }
+    if fields.contains_key("recached_version") {
+        return Vendor::Recached;
     }
     if fields.contains_key("redis_version") {
         return Vendor::Redis;
@@ -142,6 +166,30 @@ mod tests {
         let info = ServerInfo::parse(raw);
         assert_eq!(info.vendor, Vendor::Valkey);
         assert_eq!(info.version, "8.1.0");
+    }
+
+    #[test]
+    fn recognises_recached() {
+        // Recached does not implement INFO today; this is ready for when it does, and
+        // covers both the explicit `server_name` and a version-key fallback.
+        assert_eq!(
+            ServerInfo::parse("server_name:recached\r\nredis_version:7.2.0\r\n").vendor,
+            Vendor::Recached
+        );
+        assert_eq!(
+            ServerInfo::parse("recached_version:0.2.2\r\n").vendor,
+            Vendor::Recached
+        );
+    }
+
+    #[test]
+    fn a_server_that_never_answered_info_is_not_guessed_as_redis() {
+        let info = ServerInfo::unknown();
+        assert!(matches!(info.vendor, Vendor::Unknown(_)));
+        assert!(
+            info.fields.is_empty(),
+            "empty fields is how panes detect this"
+        );
     }
 
     #[test]

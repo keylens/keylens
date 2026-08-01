@@ -34,9 +34,19 @@ pub async fn run(url: &str) -> Result<()> {
     // Detection first: it's cheap, and its result decides whether a queues tab exists and
     // which streams the event reader follows.
     req_tx.send(Request::Detect).await.ok();
-    req_tx.send(Request::Rescan { pattern: None, kind: None }).await.ok();
+    req_tx
+        .send(Request::Rescan {
+            pattern: None,
+            kind: None,
+        })
+        .await
+        .ok();
 
-    let streamer = StreamerHandle { url: url.to_string(), updates: up_tx2, task: None };
+    let streamer = StreamerHandle {
+        url: url.to_string(),
+        updates: up_tx2,
+        task: None,
+    };
 
     // `init` puts the terminal in raw mode and installs a panic hook that restores it --
     // without that, a panic leaves the user's shell unusable.

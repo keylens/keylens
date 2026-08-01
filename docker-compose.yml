@@ -35,6 +35,27 @@ services:
       timeout: 2s
       retries: 15
 
+  # Optional third vendor, for checking that keylens degrades correctly on a
+  # Redis-compatible server with a smaller command set — no INFO, no HSCAN/SSCAN,
+  # no GETRANGE, no streams.
+  #
+  #   docker compose --profile recached up -d
+  #   KEYLENS_TEST_RECACHED_URL=redis://127.0.0.1:6381 \
+  #     cargo test --test live -- --ignored
+  #
+  # The image is currently a **private** GHCR package, so pulling it needs either
+  #   docker login ghcr.io -u <user> -p <token-with-read:packages>
+  # or the package made public. That's also why this sits behind a profile and why
+  # the Recached live tests skip unless the URL is set — CI has no credentials for it.
+  recached:
+    image: ghcr.io/thinkgrid-labs/recached:v0.2.2
+    container_name: keylens-recached
+    profiles: ["recached"]
+    ports:
+      - "6381:6379"
+    environment:
+      RECACHED_BIND: 0.0.0.0
+
   producer:
     build: ./fixtures
     container_name: keylens-producer

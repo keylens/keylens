@@ -11,7 +11,12 @@ pub fn ttl(ms: Option<i64>) -> String {
     }
 
     let secs = ms / 1000;
-    let (d, h, m, s) = (secs / 86_400, (secs % 86_400) / 3600, (secs % 3600) / 60, secs % 60);
+    let (d, h, m, s) = (
+        secs / 86_400,
+        (secs % 86_400) / 3600,
+        (secs % 3600) / 60,
+        secs % 60,
+    );
 
     let mut out = String::new();
     if d > 0 {
@@ -27,7 +32,11 @@ pub fn ttl(ms: Option<i64>) -> String {
     if s > 0 && d == 0 && h == 0 {
         let _ = write!(out, "{s}s");
     }
-    if out.is_empty() { format!("{secs}s") } else { out }
+    if out.is_empty() {
+        format!("{secs}s")
+    } else {
+        out
+    }
 }
 
 /// Relative time between two millisecond timestamps.
@@ -38,7 +47,11 @@ pub fn ttl(ms: Option<i64>) -> String {
 pub fn ago(timestamp_ms: i64, now_ms: i64) -> String {
     let delta = now_ms - timestamp_ms;
     let magnitude = ttl(Some(delta.abs()));
-    if delta >= 0 { format!("{magnitude} ago") } else { format!("in {magnitude}") }
+    if delta >= 0 {
+        format!("{magnitude} ago")
+    } else {
+        format!("in {magnitude}")
+    }
 }
 
 pub fn bytes(n: Option<u64>) -> String {
@@ -220,7 +233,11 @@ mod tests {
     #[test]
     fn bar_is_always_exactly_width_cells() {
         for f in [-1.0, 0.0, 0.33, 0.5, 1.0, 2.5] {
-            assert_eq!(bar(f, 10).chars().count(), 10, "fraction {f} broke the width");
+            assert_eq!(
+                bar(f, 10).chars().count(),
+                10,
+                "fraction {f} broke the width"
+            );
         }
     }
 

@@ -1086,7 +1086,7 @@ dependencies = [
 
 [[package]]
 name = "keylens"
-version = "0.1.0-dev"
+version = "0.1.0"
 dependencies = [
  "bytesize",
  "clap",
@@ -1108,7 +1108,7 @@ dependencies = [
 
 [[package]]
 name = "keylens-bullmq"
-version = "0.1.0-dev"
+version = "0.1.0"
 dependencies = [
  "async-trait",
  "fred",
@@ -1120,7 +1120,7 @@ dependencies = [
 
 [[package]]
 name = "keylens-conn"
-version = "0.1.0-dev"
+version = "0.1.0"
 dependencies = [
  "fred",
  "futures",
@@ -1132,7 +1132,7 @@ dependencies = [
 
 [[package]]
 name = "keylens-lens"
-version = "0.1.0-dev"
+version = "0.1.0"
 dependencies = [
  "async-trait",
  "futures",
@@ -1143,7 +1143,7 @@ dependencies = [
 
 [[package]]
 name = "keylens-ui"
-version = "0.1.0-dev"
+version = "0.1.0"
 dependencies = [
  "bytesize",
  "keylens-conn",

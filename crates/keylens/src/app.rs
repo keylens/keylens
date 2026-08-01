@@ -1,14 +1,15 @@
 //! Application state and input handling.
 
 use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
+use keylens_bullmq::{JobRef, QueueSummary, State, Throughput};
 use keylens_conn::{
     ClientInfo, ClusterTopology, KeyMeta, KeyValue, Kind, PubSubChannel, ServerInfo, SlowEntry,
+    StreamInfo,
 };
-use keylens_bullmq::{JobRef, QueueSummary, State, Throughput};
 use keylens_lens::Detection;
 use keylens_ui::KeyTree;
-use keylens_ui::tree::Row;
 use keylens_ui::PaneState;
+use keylens_ui::tree::Row;
 use ratatui::widgets::ListState;
 use tokio::sync::mpsc::Sender;
 
@@ -96,6 +97,8 @@ pub struct App {
     pub list_state: ListState,
 
     pub detail: Option<(KeyMeta, KeyValue)>,
+    /// Consumer-group state for the selected key, when it's a stream.
+    pub stream: Option<Box<StreamInfo>>,
     pub detail_scroll: u16,
     /// Key whose detail we asked for most recently. Replies for anything else are stale
     /// -- they arrive when the user scrolls faster than the server answers.
@@ -149,6 +152,7 @@ impl App {
             selected: 0,
             list_state: ListState::default(),
             detail: None,
+            stream: None,
             detail_scroll: 0,
             pending_key: None,
             focus: Focus::Tree,
@@ -213,7 +217,12 @@ impl App {
 
     pub fn apply(&mut self, update: Update) {
         match update {
-            Update::Batch { keys, reset, complete, scanned_pages } => {
+            Update::Batch {
+                keys,
+                reset,
+                complete,
+                scanned_pages,
+            } => {
                 if reset {
                     self.tree.clear_keys();
                     self.selected = 0;
@@ -239,10 +248,15 @@ impl App {
                 self.rebuild();
             }
 
-            Update::Detail { meta, value } => {
+            Update::Detail {
+                meta,
+                value,
+                stream,
+            } => {
                 // Drop replies for a key the user has already scrolled past.
                 if self.pending_key.as_deref() == Some(meta.key.as_str()) {
                     self.detail_scroll = 0;
+                    self.stream = stream;
                     self.detail = Some((*meta, *value));
                 }
             }
@@ -380,15 +394,26 @@ impl App {
     }
 
     async fn load_jobs(&mut self) {
-        let Some(queue) = self.selected_queue().map(|q| q.name.clone()) else { return };
+        let Some(queue) = self.selected_queue().map(|q| q.name.clone()) else {
+            return;
+        };
         self.jobs = PaneState::Loading;
         let state = self.job_state;
-        self.send(Request::LoadJobs { queue, state, offset: 0 }).await;
+        self.send(Request::LoadJobs {
+            queue,
+            state,
+            offset: 0,
+        })
+        .await;
     }
 
     async fn load_job(&mut self) {
-        let Some(queue) = self.selected_queue().map(|q| q.name.clone()) else { return };
-        let Some(id) = self.selected_job().map(|j| j.id.clone()) else { return };
+        let Some(queue) = self.selected_queue().map(|q| q.name.clone()) else {
+            return;
+        };
+        let Some(id) = self.selected_job().map(|j| j.id.clone()) else {
+            return;
+        };
         self.job = PaneState::Loading;
         self.send(Request::LoadJob { queue, id }).await;
     }
@@ -406,8 +431,15 @@ impl App {
             // in/out navigation and arrows would be ambiguous here.
             KeyCode::Char('[') | KeyCode::Char(']') => {
                 if self.level != QueueLevel::Queues {
-                    let delta: isize = if key.code == KeyCode::Char(']') { 1 } else { -1 };
-                    let i = State::ALL.iter().position(|s| *s == self.job_state).unwrap_or(0);
+                    let delta: isize = if key.code == KeyCode::Char(']') {
+                        1
+                    } else {
+                        -1
+                    };
+                    let i = State::ALL
+                        .iter()
+                        .position(|s| *s == self.job_state)
+                        .unwrap_or(0);
                     let next = (i as isize + delta).rem_euclid(State::ALL.len() as isize) as usize;
                     self.job_state = State::ALL[next];
                     self.job_selected = 0;
@@ -454,12 +486,14 @@ impl App {
 
     fn move_queue_cursor(&mut self, delta: isize) {
         let (len, cursor) = match self.level {
-            QueueLevel::Queues => {
-                (self.queues.ready().map(|q| q.len()).unwrap_or(0), &mut self.queue_selected)
-            }
-            QueueLevel::Jobs => {
-                (self.jobs.ready().map(|j| j.len()).unwrap_or(0), &mut self.job_selected)
-            }
+            QueueLevel::Queues => (
+                self.queues.ready().map(|q| q.len()).unwrap_or(0),
+                &mut self.queue_selected,
+            ),
+            QueueLevel::Jobs => (
+                self.jobs.ready().map(|j| j.len()).unwrap_or(0),
+                &mut self.job_selected,
+            ),
             // The job detail is scrolled, not stepped through.
             QueueLevel::Job => {
                 self.pane_scroll = if delta > 0 {
@@ -485,9 +519,12 @@ impl App {
     }
 
     async fn load_selected(&mut self) {
-        let Some(row) = self.selected_row() else { return };
+        let Some(row) = self.selected_row() else {
+            return;
+        };
         if !row.is_key {
             self.detail = None;
+            self.stream = None;
             self.pending_key = None;
             return;
         }
@@ -622,7 +659,10 @@ impl App {
             }
 
             KeyCode::Char('t') => {
-                let i = KIND_CYCLE.iter().position(|k| *k == self.kind_filter).unwrap_or(0);
+                let i = KIND_CYCLE
+                    .iter()
+                    .position(|k| *k == self.kind_filter)
+                    .unwrap_or(0);
                 self.kind_filter = KIND_CYCLE[(i + 1) % KIND_CYCLE.len()];
                 self.rescan().await;
             }
@@ -684,8 +724,12 @@ impl App {
 
     fn handle_value_key(&mut self, key: KeyEvent) {
         match key.code {
-            KeyCode::Down | KeyCode::Char('j') => self.detail_scroll = self.detail_scroll.saturating_add(1),
-            KeyCode::Up | KeyCode::Char('k') => self.detail_scroll = self.detail_scroll.saturating_sub(1),
+            KeyCode::Down | KeyCode::Char('j') => {
+                self.detail_scroll = self.detail_scroll.saturating_add(1)
+            }
+            KeyCode::Up | KeyCode::Char('k') => {
+                self.detail_scroll = self.detail_scroll.saturating_sub(1)
+            }
             KeyCode::PageDown => self.detail_scroll = self.detail_scroll.saturating_add(20),
             KeyCode::PageUp => self.detail_scroll = self.detail_scroll.saturating_sub(20),
             KeyCode::Home => self.detail_scroll = 0,
@@ -696,7 +740,9 @@ impl App {
     /// Collapse an open branch, otherwise jump to the parent -- the behaviour every file
     /// browser has, so it needs no explanation.
     fn collapse_or_parent(&mut self) {
-        let Some(row) = self.selected_row() else { return };
+        let Some(row) = self.selected_row() else {
+            return;
+        };
         let (path, is_branch, expanded) = (row.path.clone(), row.is_branch, row.expanded);
 
         if is_branch && expanded {
@@ -733,7 +779,11 @@ mod tests {
 
     fn app() -> App {
         let (tx, _rx) = mpsc::channel(8);
-        App::new(ServerInfo::parse("redis_version:8.0.0\r\n"), "redis://x".into(), tx)
+        App::new(
+            ServerInfo::parse("redis_version:8.0.0\r\n"),
+            "redis://x".into(),
+            tx,
+        )
     }
 
     fn batch(keys: &[&str]) -> Update {
@@ -781,8 +831,12 @@ mod tests {
                 memory: None,
             }),
             value: Box::new(KeyValue::String("stale".into())),
+            stream: None,
         });
-        assert!(a.detail.is_none(), "reply for k1 must not render while k2 is selected");
+        assert!(
+            a.detail.is_none(),
+            "reply for k1 must not render while k2 is selected"
+        );
 
         a.apply(Update::Detail {
             meta: Box::new(KeyMeta {
@@ -793,6 +847,7 @@ mod tests {
                 memory: None,
             }),
             value: Box::new(KeyValue::String("fresh".into())),
+            stream: None,
         });
         assert!(a.detail.is_some());
     }
@@ -849,11 +904,13 @@ mod tests {
     async fn type_filter_cycles_and_wraps() {
         let mut a = app();
         for expected in [Some(Kind::String), Some(Kind::Hash), Some(Kind::List)] {
-            a.handle_normal_key(KeyEvent::from(KeyCode::Char('t'))).await;
+            a.handle_normal_key(KeyEvent::from(KeyCode::Char('t')))
+                .await;
             assert_eq!(a.kind_filter, expected);
         }
         for _ in 0..4 {
-            a.handle_normal_key(KeyEvent::from(KeyCode::Char('t'))).await;
+            a.handle_normal_key(KeyEvent::from(KeyCode::Char('t')))
+                .await;
         }
         assert_eq!(a.kind_filter, None, "cycle wraps back to unfiltered");
     }
@@ -863,13 +920,16 @@ mod tests {
         let mut a = app();
         assert_eq!(a.view, View::Keys);
 
-        a.handle_normal_key(KeyEvent::from(KeyCode::Char('3'))).await;
+        a.handle_normal_key(KeyEvent::from(KeyCode::Char('3')))
+            .await;
         assert_eq!(a.view, View::Slowlog);
-        a.handle_normal_key(KeyEvent::from(KeyCode::Char('1'))).await;
+        a.handle_normal_key(KeyEvent::from(KeyCode::Char('1')))
+            .await;
         assert_eq!(a.view, View::Keys);
 
         // Out of range digits are ignored rather than panicking on an index.
-        a.handle_normal_key(KeyEvent::from(KeyCode::Char('9'))).await;
+        a.handle_normal_key(KeyEvent::from(KeyCode::Char('9')))
+            .await;
         assert_eq!(a.view, View::Keys);
     }
 
@@ -878,13 +938,16 @@ mod tests {
         let mut a = app();
         assert!(a.slowlog.is_idle(), "panes must not load until opened");
 
-        a.handle_normal_key(KeyEvent::from(KeyCode::Char('3'))).await;
+        a.handle_normal_key(KeyEvent::from(KeyCode::Char('3')))
+            .await;
         assert!(matches!(a.slowlog, PaneState::Loading));
 
         // Coming back to an already-loaded pane must not refire the request.
         a.slowlog = PaneState::Ready(vec![]);
-        a.handle_normal_key(KeyEvent::from(KeyCode::Char('1'))).await;
-        a.handle_normal_key(KeyEvent::from(KeyCode::Char('3'))).await;
+        a.handle_normal_key(KeyEvent::from(KeyCode::Char('1')))
+            .await;
+        a.handle_normal_key(KeyEvent::from(KeyCode::Char('3')))
+            .await;
         assert!(matches!(a.slowlog, PaneState::Ready(_)));
     }
 
@@ -894,8 +957,12 @@ mod tests {
         a.view = View::Clients;
         a.clients = PaneState::Ready(vec![]);
 
-        a.handle_normal_key(KeyEvent::from(KeyCode::Char('r'))).await;
-        assert!(matches!(a.clients, PaneState::Loading), "r should force a reload");
+        a.handle_normal_key(KeyEvent::from(KeyCode::Char('r')))
+            .await;
+        assert!(
+            matches!(a.clients, PaneState::Loading),
+            "r should force a reload"
+        );
     }
 
     #[tokio::test]
@@ -904,7 +971,8 @@ mod tests {
         // nothing rather than silently re-scanning the keyspace.
         let mut a = app();
         a.view = View::Slowlog;
-        a.handle_normal_key(KeyEvent::from(KeyCode::Char('t'))).await;
+        a.handle_normal_key(KeyEvent::from(KeyCode::Char('t')))
+            .await;
         assert_eq!(a.kind_filter, None);
     }
 
@@ -953,11 +1021,13 @@ mod tests {
     async fn digits_follow_the_visible_tabs_not_the_enum() {
         let mut a = app();
         // Without a lens, `2` is stats.
-        a.handle_normal_key(KeyEvent::from(KeyCode::Char('2'))).await;
+        a.handle_normal_key(KeyEvent::from(KeyCode::Char('2')))
+            .await;
         assert_eq!(a.view, View::Stats);
 
         a.apply(Update::Detected(vec![detection()]));
-        a.handle_normal_key(KeyEvent::from(KeyCode::Char('2'))).await;
+        a.handle_normal_key(KeyEvent::from(KeyCode::Char('2')))
+            .await;
         assert_eq!(a.view, View::Queues, "the same digit now means queues");
     }
 
@@ -966,7 +1036,9 @@ mod tests {
         let mut a = app();
         a.apply(Update::Detected(vec![detection()]));
         a.view = View::Queues;
-        a.apply(Update::Queues(PaneState::Ready(vec![summary("emails", false)])));
+        a.apply(Update::Queues(PaneState::Ready(vec![summary(
+            "emails", false,
+        )])));
         assert_eq!(a.level, QueueLevel::Queues);
 
         a.handle_queues_key(KeyEvent::from(KeyCode::Enter)).await;
@@ -974,7 +1046,10 @@ mod tests {
 
         a.apply(Update::Jobs {
             state: a.job_state,
-            data: PaneState::Ready(vec![JobRef { id: "42".into(), score: Some(1.0) }]),
+            data: PaneState::Ready(vec![JobRef {
+                id: "42".into(),
+                score: Some(1.0),
+            }]),
         });
         a.handle_queues_key(KeyEvent::from(KeyCode::Enter)).await;
         assert_eq!(a.level, QueueLevel::Job);
@@ -994,21 +1069,29 @@ mod tests {
         a.view = View::Queues;
         a.apply(Update::Queues(PaneState::Ready(vec![])));
         a.handle_queues_key(KeyEvent::from(KeyCode::Enter)).await;
-        assert_eq!(a.level, QueueLevel::Queues, "nothing selected, nothing to open");
+        assert_eq!(
+            a.level,
+            QueueLevel::Queues,
+            "nothing selected, nothing to open"
+        );
     }
 
     #[tokio::test]
     async fn bracket_keys_cycle_job_state_and_wrap() {
         let mut a = app();
         a.view = View::Queues;
-        a.apply(Update::Queues(PaneState::Ready(vec![summary("emails", false)])));
+        a.apply(Update::Queues(PaneState::Ready(vec![summary(
+            "emails", false,
+        )])));
         a.level = QueueLevel::Jobs;
         assert_eq!(a.job_state, State::Failed);
 
         // Failed is last in the ordering, so forward wraps to the first.
-        a.handle_queues_key(KeyEvent::from(KeyCode::Char(']'))).await;
+        a.handle_queues_key(KeyEvent::from(KeyCode::Char(']')))
+            .await;
         assert_eq!(a.job_state, State::Waiting);
-        a.handle_queues_key(KeyEvent::from(KeyCode::Char('['))).await;
+        a.handle_queues_key(KeyEvent::from(KeyCode::Char('[')))
+            .await;
         assert_eq!(a.job_state, State::Failed);
     }
 
@@ -1016,8 +1099,11 @@ mod tests {
     async fn state_cycling_does_nothing_at_the_queue_list_level() {
         let mut a = app();
         a.view = View::Queues;
-        a.apply(Update::Queues(PaneState::Ready(vec![summary("emails", false)])));
-        a.handle_queues_key(KeyEvent::from(KeyCode::Char(']'))).await;
+        a.apply(Update::Queues(PaneState::Ready(vec![summary(
+            "emails", false,
+        )])));
+        a.handle_queues_key(KeyEvent::from(KeyCode::Char(']')))
+            .await;
         assert_eq!(a.job_state, State::Failed, "no job list open to re-filter");
         assert_eq!(a.level, QueueLevel::Queues);
     }
@@ -1030,9 +1116,15 @@ mod tests {
         a.job_state = State::Waiting;
         a.apply(Update::Jobs {
             state: State::Failed,
-            data: PaneState::Ready(vec![JobRef { id: "stale".into(), score: None }]),
+            data: PaneState::Ready(vec![JobRef {
+                id: "stale".into(),
+                score: None,
+            }]),
         });
-        assert!(a.jobs.ready().is_none(), "reply for `failed` must not render under `waiting`");
+        assert!(
+            a.jobs.ready().is_none(),
+            "reply for `failed` must not render under `waiting`"
+        );
     }
 
     #[test]
@@ -1052,7 +1144,8 @@ mod tests {
     async fn ctrl_c_quits_from_help_mode() {
         let mut a = app();
         a.mode = Mode::Help;
-        a.handle_key(KeyEvent::new(KeyCode::Char('c'), KeyModifiers::CONTROL)).await;
+        a.handle_key(KeyEvent::new(KeyCode::Char('c'), KeyModifiers::CONTROL))
+            .await;
         assert!(a.quit);
     }
 
