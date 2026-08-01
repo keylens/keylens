@@ -19,8 +19,34 @@ const CHANNEL_SIZE: usize = 32;
 /// Server stats refresh interval.
 const INFO_TICK: Duration = Duration::from_secs(5);
 
+/// Deadline for the browser's connect.
+///
+/// Long on purpose. The browser draws what it is doing and quits on `q`, so this is only
+/// a backstop against a connection that is black-holed and will never answer — not a
+/// guess about how far away the server is. Guessing that is what made a perfectly healthy
+/// managed database look broken.
+const BROWSE_CONNECT_TIMEOUT: Duration = Duration::from_secs(60);
+
 pub async fn run(url: &str) -> Result<()> {
-    let conn = Conn::connect(url, "browse").await?;
+    // The terminal comes up *before* the connection, so there is something on screen from
+    // the first moment. Connecting behind a blank terminal is what forced a tight deadline
+    // in the first place: with nothing drawn, a slow link and a hang look identical.
+    let mut terminal = ratatui::init();
+    let outcome = connect_with_splash(&mut terminal, url).await;
+
+    let conn = match outcome {
+        Ok(Some(conn)) => conn,
+        // The user pressed q while it was still connecting.
+        Ok(None) => {
+            ratatui::restore();
+            return Ok(());
+        }
+        Err(e) => {
+            ratatui::restore();
+            return Err(e);
+        }
+    };
+
     let server = conn.server().clone();
 
     let (req_tx, req_rx) = mpsc::channel::<Request>(CHANNEL_SIZE);
@@ -48,9 +74,6 @@ pub async fn run(url: &str) -> Result<()> {
         task: None,
     };
 
-    // `init` puts the terminal in raw mode and installs a panic hook that restores it --
-    // without that, a panic leaves the user's shell unusable.
-    let mut terminal = ratatui::init();
     let result = event_loop(&mut terminal, &mut app, &mut up_rx, &req_tx, streamer).await;
     ratatui::restore();
 
@@ -59,6 +82,91 @@ pub async fn run(url: &str) -> Result<()> {
     worker_handle.abort();
 
     result
+}
+
+/// Connect while showing the splash, so the wait is visible and interruptible.
+///
+/// Returns `Ok(None)` if the user gave up and pressed `q`. A failure is drawn in the
+/// terminal and acknowledged with a keypress rather than dumped to a shell that has
+/// already been restored.
+async fn connect_with_splash(
+    terminal: &mut ratatui::DefaultTerminal,
+    url: &str,
+) -> Result<Option<Conn>> {
+    let started = std::time::Instant::now();
+    let mut connecting = Box::pin(Conn::connect_with_timeout(
+        url,
+        "browse",
+        BROWSE_CONNECT_TIMEOUT,
+    ));
+
+    let mut events = EventStream::new();
+    // Fast enough that the elapsed counter looks live, slow enough to cost nothing.
+    let mut tick = tokio::time::interval(Duration::from_millis(200));
+
+    loop {
+        terminal.draw(|f| {
+            ui::draw_connecting(f, url, &status_line(started.elapsed()), None);
+        })?;
+
+        tokio::select! {
+            result = &mut connecting => {
+                return match result {
+                    Ok(conn) => Ok(Some(conn)),
+                    Err(e) => {
+                        // Show it here: by the time `main` prints an error the terminal is
+                        // already restored and the message can scroll past unread.
+                        let message = e.to_string();
+                        await_dismiss(terminal, url, &message, &mut events).await?;
+                        Err(e.into())
+                    }
+                };
+            }
+            maybe_event = events.next() => {
+                if let Some(Ok(Event::Key(key))) = maybe_event
+                    && key.kind == KeyEventKind::Press
+                    && is_quit(&key)
+                {
+                    return Ok(None);
+                }
+            }
+            _ = tick.tick() => {}
+        }
+    }
+}
+
+/// What the splash says while it waits. Naming the slow part beats a bare spinner.
+fn status_line(elapsed: Duration) -> String {
+    let secs = elapsed.as_secs();
+    if secs < 3 {
+        "connecting…".to_string()
+    } else {
+        format!("connecting… {secs}s   (q to cancel)")
+    }
+}
+
+/// Draw the failure and wait for a keypress.
+async fn await_dismiss(
+    terminal: &mut ratatui::DefaultTerminal,
+    url: &str,
+    message: &str,
+    events: &mut EventStream,
+) -> Result<()> {
+    terminal.draw(|f| ui::draw_connecting(f, url, "could not connect", Some(message)))?;
+    while let Some(Ok(event)) = events.next().await {
+        if let Event::Key(key) = event
+            && key.kind == KeyEventKind::Press
+        {
+            break;
+        }
+    }
+    Ok(())
+}
+
+fn is_quit(key: &crossterm::event::KeyEvent) -> bool {
+    use crossterm::event::{KeyCode, KeyModifiers};
+    matches!(key.code, KeyCode::Char('q') | KeyCode::Esc)
+        || (key.modifiers.contains(KeyModifiers::CONTROL) && key.code == KeyCode::Char('c'))
 }
 
 /// Owns the event-stream reader task, which can only start once detection tells us which

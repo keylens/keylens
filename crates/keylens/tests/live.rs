@@ -599,9 +599,13 @@ fn recached_url() -> Option<String> {
 
 #[tokio::test]
 #[ignore = "requires docker compose fixtures"]
-async fn connects_to_a_server_without_info() {
+async fn connects_and_browses_whatever_info_the_server_offers() {
     // The regression this guards: keylens used to call INFO during connect and return Err
     // if it failed, so a server that doesn't implement INFO was unreachable entirely.
+    //
+    // Deliberately asserts consistency rather than "Recached has no INFO" -- Recached
+    // gained INFO in 0.2.3, and a test that pins a dependency's missing feature starts
+    // failing the moment that dependency improves.
     let Some(url) = recached_url() else {
         eprintln!("skipping: set KEYLENS_TEST_RECACHED_URL");
         return;
@@ -609,14 +613,21 @@ async fn connects_to_a_server_without_info() {
 
     let conn = Conn::connect(&url, "test")
         .await
-        .expect("must connect without INFO");
-    assert!(!conn.has_server_info(), "recached does not implement INFO");
-    assert!(
-        conn.server().fields.is_empty(),
-        "empty fields is how the stats pane knows to explain itself"
-    );
+        .expect("must connect either way");
 
-    // The browser must still work, which is the whole point.
+    if conn.has_server_info() {
+        assert!(
+            !conn.server().fields.is_empty(),
+            "INFO reported available but produced no fields"
+        );
+    } else {
+        assert!(
+            conn.server().fields.is_empty(),
+            "no INFO, so there should be nothing parsed from it"
+        );
+    }
+
+    // Either way the browser must work, which is the point.
     let keys = scan_all(&conn, None, None).await;
     assert!(!keys.is_empty(), "SCAN should still walk the keyspace");
 }

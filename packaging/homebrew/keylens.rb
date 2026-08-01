@@ -17,7 +17,7 @@
 class Keylens < Formula
   desc "TUI for Redis, Valkey and Recached that understands your keys"
   homepage "https://github.com/keylens/keylens"
-  version "0.1.2"
+  version "0.1.3"
   license "Apache-2.0"
 
   on_macos do

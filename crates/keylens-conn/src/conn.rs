@@ -30,8 +30,15 @@ impl ScanPage {
     }
 }
 
-/// Ceiling on the whole connect handshake, retries included.
-const CONNECT_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(10);
+/// Key used by the read-only capability probes. It is never written.
+const PROBE_KEY: &str = "keylens:__probe__";
+
+/// Backstop for a connect with nothing on screen -- the non-interactive commands.
+///
+/// A deadline is a poor substitute for showing progress: too short breaks a slow link,
+/// too long looks frozen. The browser passes its own, much longer, because it draws a
+/// status and lets the user cancel; this value only has to stop `probe` hanging silently.
+pub const DEFAULT_CONNECT_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(20);
 
 pub struct Conn {
     client: Client,
@@ -44,11 +51,30 @@ impl Conn {
     /// Connect, read `INFO`, and probe capabilities. Everything downstream can then
     /// assume vendor and capabilities are known.
     pub async fn connect(url: &str, label: impl Into<String>) -> Result<Self> {
+        Self::connect_with_timeout(url, label, DEFAULT_CONNECT_TIMEOUT).await
+    }
+
+    /// Connect with an explicit deadline.
+    ///
+    /// The browser uses a long one because it shows what it is doing and can be
+    /// cancelled; a deadline there is a backstop against a black-holed connection, not a
+    /// guess at how far away the server is.
+    pub async fn connect_with_timeout(
+        url: &str,
+        label: impl Into<String>,
+        timeout: std::time::Duration,
+    ) -> Result<Self> {
         let config = Config::from_url(url).map_err(|e| ConnError::Url(e.to_string()))?;
         let client = Builder::from_config(config)
             .with_connection_config(|c| {
-                c.connection_timeout = std::time::Duration::from_secs(5);
-                c.internal_command_timeout = std::time::Duration::from_secs(5);
+                // Generous, because these are *per-step* limits and the client's own
+                // handshake is already four round trips (PING, CLIENT ID, INFO, ROLE).
+                // At 1.4s round trip — an ordinary managed database on another continent
+                // — a 5s limit here kills a perfectly healthy connection before the
+                // caller's deadline is ever consulted. The overall bound is the caller's
+                // job; these only need to stop a wedged socket waiting forever.
+                c.connection_timeout = std::time::Duration::from_secs(30);
+                c.internal_command_timeout = std::time::Duration::from_secs(30);
             })
             .build()
             .map_err(ConnError::Connect)?;
@@ -87,7 +113,7 @@ impl Conn {
             Ok::<_, ConnError>((server, caps))
         };
 
-        let (server, caps) = match tokio::time::timeout(CONNECT_TIMEOUT, handshake).await {
+        let (server, caps) = match tokio::time::timeout(timeout, handshake).await {
             Ok(Ok(v)) => v,
             Ok(Err(e)) => {
                 // Stop the background reconnect loop, or it keeps the process alive after
@@ -97,7 +123,7 @@ impl Conn {
             }
             Err(_) => {
                 let _ = client.quit().await;
-                return Err(connect_timeout(url, CONNECT_TIMEOUT));
+                return Err(connect_timeout(url, timeout));
             }
         };
 
@@ -272,92 +298,161 @@ fn parse_scan_reply(reply: Value) -> Result<ScanPage> {
 /// Probe each restricted command once, with harmless arguments.
 async fn probe(client: &Client) -> Capabilities {
     let mut caps = Capabilities::default();
+    let probes = probe_commands();
 
-    // (feature, command, args) -- every probe is a no-op read.
-    let probes: &[(Feature, &'static str, &[&str])] = &[
-        (Feature::Config, "CONFIG", &["GET", "maxmemory"]),
-        (Feature::ClientList, "CLIENT", &["INFO"]),
-        (Feature::Slowlog, "SLOWLOG", &["LEN"]),
+    // Every probe is a harmless read, and they are all independent -- so they go in one
+    // pipeline rather than one round trip each.
+    //
+    // This is not micro-optimisation. Against a managed host ~1.4s away, eleven serial
+    // probes is fifteen seconds of staring at nothing before the UI opens, which is long
+    // enough to look like a hang. One round trip makes it one.
+    let replies = run_probe_pipeline(client, &probes).await;
+    apply_probe_results(&mut caps, &probes, &replies);
+    caps
+}
+
+/// Every capability probe. One harmless read each.
+fn probe_commands() -> Vec<(Feature, &'static str, Vec<Value>)> {
+    vec![
+        (
+            Feature::Config,
+            "CONFIG",
+            vec!["GET".into(), "maxmemory".into()],
+        ),
+        (Feature::ClientList, "CLIENT", vec!["INFO".into()]),
+        (Feature::Slowlog, "SLOWLOG", vec!["LEN".into()]),
         (
             Feature::MemoryStats,
             "MEMORY",
-            &["USAGE", "keylens:__probe__"],
+            vec!["USAGE".into(), PROBE_KEY.into()],
         ),
-        (Feature::Cluster, "CLUSTER", &["INFO"]),
-        (Feature::Modules, "MODULE", &["LIST"]),
-        (Feature::Streams, "XLEN", &["keylens:__probe__"]),
+        (Feature::Cluster, "CLUSTER", vec!["INFO".into()]),
+        (Feature::Modules, "MODULE", vec!["LIST".into()]),
+        (Feature::Streams, "XLEN", vec![PROBE_KEY.into()]),
         (
             Feature::PubSub,
             "PUBSUB",
-            &["CHANNELS", "keylens:__probe__"],
+            vec!["CHANNELS".into(), PROBE_KEY.into()],
         ),
-    ];
+        // Not every Redis-compatible server has the bounded read variants.
+        (
+            Feature::GetRange,
+            "GETRANGE",
+            vec![PROBE_KEY.into(), 0.into(), 0.into()],
+        ),
+        (
+            Feature::CursorCollectionScan,
+            "HSCAN",
+            vec![PROBE_KEY.into(), "0".into(), "COUNT".into(), 1.into()],
+        ),
+        // `SCAN ... TYPE` is Redis 6+ and needs its own shape.
+        (
+            Feature::ScanTypeFilter,
+            "SCAN",
+            vec![
+                "0".into(),
+                "COUNT".into(),
+                1.into(),
+                "TYPE".into(),
+                "string".into(),
+            ],
+        ),
+    ]
+}
 
-    for (feature, cmd, args) in probes {
-        let argv: Vec<Value> = args.iter().map(|a| Value::from(*a)).collect();
-        let result: std::result::Result<Value, Error> = client
-            .custom(
-                CustomCommand::new(cmd.to_string(), ClusterHash::FirstKey, false),
-                argv,
-            )
-            .await;
-
-        let availability = match result {
+fn apply_probe_results(
+    caps: &mut Capabilities,
+    probes: &[(Feature, &'static str, Vec<Value>)],
+    replies: &[std::result::Result<Value, Error>],
+) {
+    for ((feature, _, _), reply) in probes.iter().zip(replies.iter()) {
+        let availability = match reply {
             Ok(_) => Availability::Available,
             Err(e) => {
                 debug!(feature = feature.label(), error = %e, "probe failed");
-                classify(&e)
+                // A syntax error on SCAN means an older server without the TYPE option,
+                // not a permissions problem.
+                if *feature == Feature::ScanTypeFilter
+                    && e.details().to_ascii_lowercase().contains("syntax")
+                {
+                    Availability::Unsupported
+                } else {
+                    classify(e)
+                }
             }
         };
         caps.set(*feature, availability);
     }
 
-    // `SCAN ... TYPE` is Redis 6+; probing it needs its own shape.
-    let scan_type_args: Vec<Value> = vec![
-        "0".into(),
-        "COUNT".into(),
-        1.into(),
-        "TYPE".into(),
-        "string".into(),
-    ];
-    let scan_type: std::result::Result<Value, Error> = client
-        .custom(
-            CustomCommand::new_static("SCAN", ClusterHash::FirstKey, false),
-            scan_type_args,
-        )
-        .await;
-    caps.set(
-        Feature::ScanTypeFilter,
-        match scan_type {
-            Ok(_) => Availability::Available,
-            Err(e) => {
-                // A syntax error here means an older server that lacks the TYPE option,
-                // not a permissions problem.
-                if e.details().to_ascii_lowercase().contains("syntax") {
-                    Availability::Unsupported
-                } else {
-                    classify(&e)
-                }
-            }
-        },
-    );
-
-    if caps.has(Feature::Modules) {
-        caps.modules = module_names(client).await;
+    // The module list came back in the same pipeline; no second round trip needed.
+    if caps.has(Feature::Modules)
+        && let Some(Ok(reply)) = probes
+            .iter()
+            .position(|(f, _, _)| *f == Feature::Modules)
+            .and_then(|i| replies.get(i))
+    {
+        caps.modules = parse_module_names(reply);
     }
-
-    caps
 }
 
-async fn module_names(client: &Client) -> Vec<String> {
-    let reply: std::result::Result<Value, Error> = client
-        .custom(
-            CustomCommand::new_static("MODULE", ClusterHash::FirstKey, false),
-            vec![Value::from("LIST")],
-        )
-        .await;
+/// Run every probe in one round trip, falling back to serial calls if the pipeline
+/// cannot be used -- a cluster can reject one that spans hash slots.
+async fn run_probe_pipeline(
+    client: &Client,
+    probes: &[(Feature, &'static str, Vec<Value>)],
+) -> Vec<std::result::Result<Value, Error>> {
+    let pipe = client.pipeline();
+    for (_, cmd, args) in probes {
+        // In a pipeline this only buffers; it does not reach the server.
+        let buffered: std::result::Result<(), Error> = pipe
+            .custom(
+                CustomCommand::new(cmd.to_string(), ClusterHash::FirstKey, false),
+                args.clone(),
+            )
+            .await;
+        if let Err(e) = buffered {
+            debug!(error = %e, "could not buffer probe; falling back to serial");
+            return probe_serially(client, probes).await;
+        }
+    }
 
-    let Ok(Value::Array(mods)) = reply else {
+    let replies = pipe.try_all::<Value>().await;
+    if replies.len() == probes.len() {
+        return replies;
+    }
+
+    debug!(
+        expected = probes.len(),
+        got = replies.len(),
+        "probe pipeline returned the wrong number of replies; falling back to serial"
+    );
+    probe_serially(client, probes).await
+}
+
+async fn probe_serially(
+    client: &Client,
+    probes: &[(Feature, &'static str, Vec<Value>)],
+) -> Vec<std::result::Result<Value, Error>> {
+    let mut out = Vec::with_capacity(probes.len());
+    for (_, cmd, args) in probes {
+        out.push(
+            client
+                .custom(
+                    CustomCommand::new(cmd.to_string(), ClusterHash::FirstKey, false),
+                    args.clone(),
+                )
+                .await,
+        );
+    }
+    out
+}
+
+/// Extract module names from a `MODULE LIST` reply.
+///
+/// The reply arrives with the rest of the capability probes, so this is pure parsing --
+/// no extra round trip just to name the modules.
+fn parse_module_names(reply: &Value) -> Vec<String> {
+    let Value::Array(mods) = reply else {
         return Vec::new();
     };
 
@@ -380,6 +475,51 @@ async fn module_names(client: &Client) -> Vec<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn every_capability_is_actually_probed() {
+        // `GetRange` and `CursorCollectionScan` were added to the enum but never given a
+        // probe, so they silently defaulted to unsupported and keylens took the
+        // whole-collection fallback path on servers that support HSCAN perfectly well.
+        // A capability nobody asks about is worse than no capability at all.
+        let probed: Vec<Feature> = probe_commands().into_iter().map(|(f, _, _)| f).collect();
+
+        for feature in Feature::ALL {
+            // ServerInfo is answered by the INFO call itself, not by a probe.
+            if feature == Feature::ServerInfo {
+                continue;
+            }
+            assert!(
+                probed.contains(&feature),
+                "{:?} is in Feature::ALL but has no probe, so it will always read as \
+                 unsupported",
+                feature
+            );
+        }
+    }
+
+    #[test]
+    fn probes_are_read_only_and_use_the_reserved_key() {
+        // A probe that wrote anything would make `keylens` unsafe to point at production,
+        // which is the whole promise.
+        const MUTATING: [&str; 8] = [
+            "SET", "DEL", "HSET", "LPUSH", "SADD", "ZADD", "EXPIRE", "RENAME",
+        ];
+        for (feature, cmd, args) in probe_commands() {
+            assert!(
+                !MUTATING.contains(&cmd),
+                "{feature:?} probes with the mutating command {cmd}"
+            );
+            for arg in &args {
+                if let Some(s) = arg.as_string() {
+                    assert!(
+                        !s.starts_with("keylens:") || s == PROBE_KEY,
+                        "{feature:?} touches {s}, not the reserved probe key"
+                    );
+                }
+            }
+        }
+    }
 
     #[test]
     fn scan_page_completion_is_cursor_driven_not_emptiness() {

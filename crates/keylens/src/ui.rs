@@ -52,6 +52,43 @@ pub fn draw(frame: &mut Frame, app: &mut App) {
     }
 }
 
+/// The splash shown while connecting, and when connecting fails.
+///
+/// Deliberately available before an `App` exists: the terminal comes up before the
+/// connection does, so there is never a blank screen to interpret.
+pub fn draw_connecting(frame: &mut Frame, url: &str, status: &str, error: Option<&str>) {
+    let area = frame.area();
+    let mut lines = banner::splash(area.width, url, None, status);
+
+    if let Some(message) = error {
+        lines.push(Line::raw(""));
+        for line in message.lines() {
+            lines.push(Line::from(Span::styled(line.to_string(), Theme::error())));
+        }
+        lines.push(Line::raw(""));
+        lines.push(Line::from(Span::styled(
+            "press any key to exit",
+            Theme::dim(),
+        )));
+    }
+
+    let top = area.height.saturating_sub(lines.len() as u16) / 2;
+    let inner = Rect {
+        x: area.x,
+        y: area.y + top,
+        width: area.width,
+        height: area.height.saturating_sub(top),
+    };
+
+    frame.render_widget(Clear, area);
+    frame.render_widget(
+        Paragraph::new(lines)
+            .alignment(Alignment::Center)
+            .wrap(Wrap { trim: false }),
+        inner,
+    );
+}
+
 fn draw_splash(frame: &mut Frame, app: &App, area: Rect) {
     let server = (!app.server.version.is_empty() && app.server.version != "unknown")
         .then(|| (app.server.vendor.label(), app.server.version.as_str()));

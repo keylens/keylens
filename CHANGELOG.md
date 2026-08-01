@@ -6,6 +6,54 @@ The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 
+## [0.1.3] — 2026-08-01
+
+Connecting to a distant server works, and you can watch it happen.
+
+### Changed
+
+- **The browser draws before it connects.** The terminal comes up immediately and shows
+  `connecting… 4s (q to cancel)`, and a failure is rendered in place rather than dumped to
+  a shell that has already been restored. Connecting behind a blank terminal is what
+  forced a tight deadline in the first place: with nothing on screen, a slow link and a
+  hang look identical. The deadline is now only a backstop against a black-holed
+  connection — 60s for the browser, cancellable at any point.
+
+### Fixed
+
+- **The client's own per-step timeouts were too tight for a remote server.** They were set
+  to 5s, but the client's handshake alone is four round trips — at 1.4s round trip, an
+  ordinary managed database on another continent, that exceeds 5s and a healthy connection
+  was killed before keylens's own deadline was ever consulted. Raised to 30s; the overall
+  bound belongs to the caller, not to each step.
+- **Connecting to a remote server timed out before the UI could open.** The capability
+  probe ran eleven commands one after another. Against a managed host ~1.4s away that is
+  fifteen seconds of blank screen — long enough to look like a hang, and long enough to
+  blow the connect deadline outright, which is exactly what happened against a
+  DigitalOcean managed Valkey. The probes are independent reads, so they now go in a
+  single pipeline: one round trip instead of eleven, and it falls back to serial calls if
+  a cluster rejects the pipeline.
+- **`GETRANGE` and `HSCAN`/`SSCAN` were never actually probed.** Both capabilities existed
+  but nothing tested for them, so they always read as unsupported and keylens took the
+  measure-then-read-whole fallback on servers that support the cursor variants perfectly
+  well — a hash over 200 fields reported "too large" on plain Redis. A test now asserts
+  that every capability in `Feature::ALL` has a probe, and that no probe is a mutating
+  command.
+- BullMQ lens detection scanned the keyspace 500 keys at a time, which is eight round
+  trips on a modest keyspace and forty on a large one. `COUNT` is nearly free for the
+  server, so it now scans 4,000 at a time — one round trip instead of eight, measured.
+- A handshake timeout over `rediss://` no longer claims to know what went wrong. It lists
+  what to check in order — IP allowlisting (DigitalOcean's "Trusted Sources"), password
+  url-encoding, and a `redis-cli` command to isolate the problem — plus how to capture a
+  trace.
+
+### Changed
+
+- Recached is detected as its own vendor, and the fixture-backed tests assert what keylens
+  does with whatever the server offers rather than pinning a dependency's missing feature.
+  Recached 0.2.3 added `INFO`, and a test written as "Recached has no INFO" would have
+  started failing the moment it improved.
+
 ## [0.1.2] — 2026-08-01
 
 ### Fixed
@@ -114,7 +162,8 @@ First release. **Read-only by construction** — safe to point at production.
 - In the browser, logs go to `KEYLENS_LOG_FILE` or nowhere — never to stderr, which would
   paint over the rendered frame.
 
-[Unreleased]: https://github.com/keylens/keylens/compare/v0.1.2...HEAD
+[Unreleased]: https://github.com/keylens/keylens/compare/v0.1.3...HEAD
+[0.1.3]: https://github.com/keylens/keylens/releases/tag/v0.1.3
 [0.1.2]: https://github.com/keylens/keylens/releases/tag/v0.1.2
 [0.1.1]: https://github.com/keylens/keylens/releases/tag/v0.1.1
 [0.1.0]: https://github.com/keylens/keylens/releases/tag/v0.1.0

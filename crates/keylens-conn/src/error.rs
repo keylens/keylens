@@ -65,12 +65,12 @@ pub fn classify_connect(url: &str, source: fred::error::Error) -> ConnError {
 /// likely reason to end up here, so the TLS hint is offered for plaintext urls.
 pub fn connect_timeout(url: &str, after: std::time::Duration) -> ConnError {
     let mut msg = format!(
-        "connection failed: no response after {}s.\n\n\
-         The server accepted the connection but never completed a RESP handshake.",
+        "connection failed: the handshake did not finish within {}s.",
         after.as_secs()
     );
 
     if is_plaintext_scheme(url) {
+        // The most likely cause by a wide margin, and the one with a one-character fix.
         msg.push_str(&format!(
             "\n\nThe usual cause is a TLS-only port reached over plaintext — it accepts \
              the connection, then closes it.\nTry `rediss://`:\n\n    {}\n\n\
@@ -79,7 +79,19 @@ pub fn connect_timeout(url: &str, after: std::time::Duration) -> ConnError {
             to_tls_url(url)
         ));
     } else {
-        msg.push_str("\n\nCheck the host, port, and that the server is reachable.");
+        // Over TLS the cause is genuinely ambiguous, so list what to check rather than
+        // asserting something we cannot know from a timeout alone.
+        msg.push_str(
+            "\n\nThe scheme is already TLS, so check, in order:\n\n  \
+             1. Your IP is allowed. Managed hosts block by default — DigitalOcean calls \
+             this\n     \"Trusted Sources\", AWS uses security groups.\n  \
+             2. The password is url-encoded. A `@`, `/`, `:` or `#` in the password will \
+             corrupt\n     the url unless percent-encoded.\n  \
+             3. The host and port are right, and the server is reachable:\n     \
+             `redis-cli --tls -u '<your-url>' PING`\n\n\
+             For the full handshake trace:\n  \
+             KEYLENS_LOG=debug KEYLENS_LOG_FILE=/tmp/keylens.log keylens --url ... probe",
+        );
     }
 
     ConnError::ConnectTimeout(msg)
@@ -167,7 +179,7 @@ mod tests {
         // reconnects forever. Silence is the symptom; TLS is the usual cause.
         let err = connect_timeout("redis://host:6390", std::time::Duration::from_secs(10));
         let msg = err.to_string();
-        assert!(msg.contains("no response after 10s"));
+        assert!(msg.contains("did not finish within 10s"));
         assert!(msg.contains("rediss://host:6390"));
     }
 
@@ -176,7 +188,17 @@ mod tests {
         let err = connect_timeout("rediss://host:6390", std::time::Duration::from_secs(10));
         let msg = err.to_string();
         assert!(!msg.contains("Try `rediss://`"));
-        assert!(msg.contains("reachable"));
+        // Over TLS a timeout is ambiguous, so it must point at the real suspects rather
+        // than claim to know what happened.
+        assert!(
+            msg.contains("Trusted Sources"),
+            "should mention IP allowlisting"
+        );
+        assert!(
+            msg.contains("url-encoded"),
+            "should mention password encoding"
+        );
+        assert!(msg.contains("KEYLENS_LOG"), "should say how to get a trace");
     }
 
     #[test]

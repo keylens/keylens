@@ -10,7 +10,14 @@ use crate::keys::{QueueKeys, State, is_paused, parse_meta_version, queue_name_fr
 /// Detection walks at most this many SCAN pages. Detection runs on every connect, so it
 /// must stay cheap even on a keyspace with millions of unrelated keys.
 const MAX_DETECT_PAGES: usize = 40;
-const SCAN_COUNT: u32 = 500;
+/// Keys examined per `SCAN` page during detection.
+///
+/// Deliberately large. Detection walks the keyspace looking for `<prefix>:*:meta`, and
+/// every page is a round trip — against a managed host ~1.4s away, a small `COUNT` turns
+/// detection into half a minute of waiting before the queues tab appears. `COUNT` costs
+/// the server a bounded amount of work per call, so trading pages for page size is close
+/// to free for it and a large win for us.
+const SCAN_COUNT: u32 = 4_000;
 /// Cap on queues surfaced by a single detection pass.
 const MAX_QUEUES: usize = 500;
 
