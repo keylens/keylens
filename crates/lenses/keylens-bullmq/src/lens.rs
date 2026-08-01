@@ -119,19 +119,6 @@ impl BullMqLens {
         Ok((version, paused))
     }
 
-    /// Per-state counts for one queue.
-    pub async fn queue_summary(&self, conn: &Conn, name: &str) -> Result<QueueSummary> {
-        Ok(self
-            .summaries(conn, std::slice::from_ref(&name.to_string()))
-            .await?
-            .pop()
-            .unwrap_or_else(|| QueueSummary {
-                name: name.to_string(),
-                paused: false,
-                counts: Vec::new(),
-            }))
-    }
-
     /// Counts and paused state for many queues in a single round trip.
     ///
     /// Sequentially this is 8 commands per queue; on a queue system with 40 queues and a
@@ -162,7 +149,10 @@ impl BullMqLens {
             }
         }
 
+        // Per-command results: one queue's key being the wrong type, or its meta hash
+        // having been deleted mid-refresh, must cost that one cell -- not the whole table.
         let replies = conn.pipeline(&cmds).await?;
+        let reply = |i: usize| replies.get(i).and_then(|r| r.as_ref().ok());
 
         Ok(names
             .iter()
@@ -170,7 +160,7 @@ impl BullMqLens {
             .map(|(i, name)| {
                 let base = i * PER_QUEUE;
 
-                let paused = match replies.get(base) {
+                let paused = match reply(base) {
                     Some(Value::Array(fields)) => {
                         is_paused(fields.get(1).and_then(|v| v.as_string()).as_deref())
                     }
@@ -181,10 +171,7 @@ impl BullMqLens {
                     .iter()
                     .enumerate()
                     .map(|(j, state)| {
-                        let n = replies
-                            .get(base + 1 + j)
-                            .and_then(|v| v.as_u64())
-                            .unwrap_or(0);
+                        let n = reply(base + 1 + j).and_then(|v| v.as_u64()).unwrap_or(0);
                         (*state, n)
                     })
                     .collect();
@@ -215,38 +202,38 @@ impl BullMqLens {
         offset: usize,
         limit: usize,
     ) -> Result<Vec<JobRef>> {
+        let Some((start, stop)) = page_range(offset, limit) else {
+            return Ok(Vec::new());
+        };
+
         let keys = QueueKeys::new(&self.prefix, queue);
         let key = keys.state(state);
-        let start = offset as i64;
-        let stop = start + limit as i64 - 1;
 
-        let reply = match state.count_cmd() {
-            "LLEN" => {
-                conn.cmd("LRANGE", vec![key.into(), start.into(), stop.into()])
-                    .await?
-            }
-            _ => {
-                conn.cmd(
-                    // Newest first: for completed and failed, the recent end is the one
-                    // anyone actually wants to look at.
-                    "ZREVRANGE",
-                    vec![key.into(), start.into(), stop.into(), "WITHSCORES".into()],
-                )
+        let reply = if state.is_list_backed() {
+            conn.cmd("LRANGE", vec![key.into(), start.into(), stop.into()])
                 .await?
-            }
+        } else {
+            conn.cmd(
+                // Newest first: for completed and failed, the recent end is the one
+                // anyone actually wants to look at.
+                "ZREVRANGE",
+                vec![key.into(), start.into(), stop.into(), "WITHSCORES".into()],
+            )
+            .await?
         };
 
         let Value::Array(items) = reply else {
             return Ok(Vec::new());
         };
 
-        Ok(match state.count_cmd() {
-            "LLEN" => items
+        Ok(if state.is_list_backed() {
+            items
                 .iter()
                 .filter_map(|v| v.as_string())
                 .map(|id| JobRef { id, score: None })
-                .collect(),
-            _ => items
+                .collect()
+        } else {
+            items
                 .chunks_exact(2)
                 .filter_map(|c| {
                     c[0].as_string().map(|id| JobRef {
@@ -254,7 +241,7 @@ impl BullMqLens {
                         score: c[1].as_f64(),
                     })
                 })
-                .collect(),
+                .collect()
         })
     }
 
@@ -286,15 +273,15 @@ impl BullMqLens {
         id: &str,
         limit: usize,
     ) -> Result<Vec<String>> {
+        let Some((start, stop)) = page_range(0, limit) else {
+            return Ok(Vec::new());
+        };
+
         let keys = QueueKeys::new(&self.prefix, queue);
         let reply = conn
             .cmd(
                 "LRANGE",
-                vec![
-                    Value::from(keys.job_logs(id)),
-                    0.into(),
-                    (limit as i64 - 1).into(),
-                ],
+                vec![Value::from(keys.job_logs(id)), start.into(), stop.into()],
             )
             .await?;
         let Value::Array(items) = reply else {
@@ -364,6 +351,20 @@ impl Lens for BullMqLens {
     }
 }
 
+/// Inclusive `[start, stop]` for a page, or `None` when nothing was asked for.
+///
+/// The `None` is the whole reason this is a function. Redis range commands treat a
+/// negative `stop` as an offset from the end, so the naive `offset + limit - 1` turns a
+/// zero limit into `LRANGE key 0 -1` — the entire list, which is precisely the unbounded
+/// read this crate exists to never issue. Asking for nothing gets nothing back.
+fn page_range(offset: usize, limit: usize) -> Option<(i64, i64)> {
+    if limit == 0 {
+        return None;
+    }
+    let start = offset as i64;
+    Some((start, start + limit as i64 - 1))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -388,5 +389,34 @@ mod tests {
     fn default_prefix_is_bull() {
         assert_eq!(BullMqLens::default().prefix(), "bull");
         assert_eq!(BullMqLens::new("myapp").prefix(), "myapp");
+    }
+
+    #[test]
+    fn a_zero_limit_never_becomes_a_whole_list_read() {
+        // `0 + 0 - 1` is `LRANGE key 0 -1`, which Redis reads as "everything". A page of
+        // nothing must stay a page of nothing.
+        assert_eq!(page_range(0, 0), None);
+        assert_eq!(page_range(500, 0), None);
+    }
+
+    #[test]
+    fn page_range_is_inclusive_and_offset_relative() {
+        assert_eq!(page_range(0, 200), Some((0, 199)));
+        assert_eq!(page_range(200, 200), Some((200, 399)));
+        assert_eq!(page_range(0, 1), Some((0, 0)), "one element, not zero");
+    }
+
+    #[test]
+    fn every_page_range_stays_non_negative() {
+        // A negative bound is what silently reinterprets the request as "to the end".
+        for offset in [0usize, 1, 200, 10_000] {
+            for limit in [1usize, 2, 200, 5_000] {
+                let (start, stop) = page_range(offset, limit).expect("non-zero limit");
+                assert!(
+                    start >= 0 && stop >= start,
+                    "{offset}/{limit} → {start}..{stop}"
+                );
+            }
+        }
     }
 }

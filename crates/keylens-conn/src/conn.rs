@@ -214,15 +214,27 @@ impl Conn {
             .map_err(|source| ConnError::Command { cmd: name, source })
     }
 
-    /// Run many commands in one round trip.
+    /// Run many commands in one round trip, reporting each command's outcome separately.
     ///
     /// This is not an optimisation, it's a usability floor: typing 500 listed keys with
     /// individual `TYPE` calls is 500 round trips, which is imperceptible on localhost and
     /// half a minute against a server 60ms away.
     ///
+    /// **Per-command results, not a single all-or-nothing reply.** One command failing is
+    /// not the pipeline failing: a `WRONGTYPE` on a single queue's `wait` key used to blank
+    /// the entire queue table, and one bad key used to drop the types of all 500 keys in a
+    /// batch. Callers read the slot they care about and degrade only that slot.
+    ///
+    /// The outer `Err` is reserved for a failure that invalidates the mapping itself --
+    /// the pipeline could not be buffered, or came back with a reply count that no longer
+    /// lines up with `cmds`, at which point slot `i` is not necessarily command `i`.
+    ///
     /// Cluster caveat: a pipeline spanning multiple hash slots can be rejected. Callers
     /// that may span slots should be prepared to fall back to sequential calls.
-    pub async fn pipeline(&self, cmds: &[(&'static str, Vec<Value>)]) -> Result<Vec<Value>> {
+    pub async fn pipeline(
+        &self,
+        cmds: &[(&'static str, Vec<Value>)],
+    ) -> Result<Vec<Result<Value>>> {
         let pipe = self.client.pipeline();
         for (name, args) in cmds {
             // In a pipeline this `await` only buffers -- it does not hit the server.
@@ -237,12 +249,20 @@ impl Conn {
                     source,
                 })?;
         }
-        pipe.all::<Vec<Value>>()
-            .await
-            .map_err(|source| ConnError::Command {
+
+        let replies = pipe.try_all::<Value>().await;
+        if replies.len() != cmds.len() {
+            return Err(ConnError::Reply {
                 cmd: "PIPELINE",
-                source,
-            })
+                detail: format!("expected {} replies, got {}", cmds.len(), replies.len()),
+            });
+        }
+
+        Ok(replies
+            .into_iter()
+            .zip(cmds.iter())
+            .map(|(reply, (cmd, _))| reply.map_err(|source| ConnError::Command { cmd, source }))
+            .collect())
     }
 }
 

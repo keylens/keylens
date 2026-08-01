@@ -7,6 +7,9 @@
 //! One `XREAD` covers every queue at once — Redis takes multiple streams in a single call
 //! — so watching 40 queues costs one blocked connection, not 40.
 
+use std::time::Duration;
+
+use keylens_bullmq::EventsStatus;
 use keylens_bullmq::QueueKeys;
 use keylens_bullmq::events::{EventKind, entry_id_ms};
 use keylens_conn::{Conn, Value};
@@ -20,6 +23,16 @@ use crate::worker::Update;
 const BLOCK_MS: i64 = 1_000;
 /// Entries per stream per read. A burst larger than this is simply picked up next loop.
 const COUNT: i64 = 500;
+/// Consecutive `XREAD` failures before the reader stops trying.
+///
+/// A retry loop with no ceiling is not resilience, it's a leak: against a server that
+/// denies `XREAD` by ACL, every attempt fails identically forever, and because the
+/// interactive build sends logs to a sink the user never learns why the graph is empty.
+/// Give up, say so, and stop spending a command a second on it.
+const MAX_CONSECUTIVE_FAILURES: u32 = 5;
+/// Backoff between failed reads, doubled per failure and capped.
+const RETRY_BASE: Duration = Duration::from_secs(1);
+const RETRY_MAX: Duration = Duration::from_secs(8);
 
 /// One observed event.
 #[derive(Debug, Clone)]
@@ -35,6 +48,22 @@ pub async fn run(conn: Conn, prefix: String, queues: Vec<String>, tx: Sender<Upd
         return;
     }
 
+    // Ask before parking on it. `XREAD` is the one command here with no fallback, and a
+    // server that doesn't have it would otherwise be probed once a second, silently,
+    // for as long as keylens is open.
+    if !conn.supports_streams() {
+        let why = conn
+            .capabilities()
+            .get(keylens_conn::Feature::Streams)
+            .reason()
+            .unwrap_or("XREAD is not available")
+            .to_string();
+        tx.send(Update::EventsStatus(EventsStatus::Unavailable(why)))
+            .await
+            .ok();
+        return;
+    }
+
     let keys: Vec<String> = queues
         .iter()
         .map(|q| QueueKeys::new(&prefix, q).events())
@@ -44,9 +73,15 @@ pub async fn run(conn: Conn, prefix: String, queues: Vec<String>, tx: Sender<Upd
     // events into the first second of the graph and draw a spike that never happened.
     let mut ids: Vec<String> = vec!["$".to_string(); keys.len()];
 
-    if tx.send(Update::EventsAttached).await.is_err() {
+    if tx
+        .send(Update::EventsStatus(EventsStatus::Live))
+        .await
+        .is_err()
+    {
         return;
     }
+
+    let mut failures: u32 = 0;
 
     loop {
         let mut args: Vec<Value> = vec![
@@ -63,13 +98,30 @@ pub async fn run(conn: Conn, prefix: String, queues: Vec<String>, tx: Sender<Upd
             Ok(v) => v,
             Err(e) => {
                 // A blocking read that times out is not an error, but a dropped connection
-                // is. Either way, backing off and retrying is the right move -- the graph
-                // degrades rather than the app dying.
-                warn!(error = %e, "xread failed; retrying");
-                tokio::time::sleep(std::time::Duration::from_secs(1)).await;
+                // is. Back off and retry -- the graph degrades rather than the app dying --
+                // but only so many times, because a failure that repeats identically is a
+                // permanent one and retrying it forever helps nobody.
+                failures += 1;
+                warn!(error = %e, failures, "xread failed");
+
+                if failures >= MAX_CONSECUTIVE_FAILURES {
+                    warn!("giving up on the events stream after {failures} failures");
+                    tx.send(Update::EventsStatus(EventsStatus::Unavailable(
+                        e.to_string(),
+                    )))
+                    .await
+                    .ok();
+                    return;
+                }
+
+                tokio::time::sleep(retry_delay(failures)).await;
                 continue;
             }
         };
+
+        // A read that came back resets the budget: a single blip mid-session must not
+        // count towards a ceiling meant for permanent failures.
+        failures = 0;
 
         let events = parse_xread(&reply, &keys, &queues, &mut ids);
         if events.is_empty() {
@@ -161,6 +213,14 @@ fn parse_xread(
 
 fn as_text(v: &Value) -> String {
     v.as_string().unwrap_or_default()
+}
+
+/// Exponential backoff, capped. The cap matters more than the curve: the point is to stop
+/// hammering a server that is refusing us, not to converge on some ideal interval.
+fn retry_delay(failures: u32) -> Duration {
+    RETRY_BASE
+        .saturating_mul(1u32 << failures.min(5).saturating_sub(1))
+        .min(RETRY_MAX)
 }
 
 #[cfg(test)]
@@ -255,6 +315,44 @@ mod tests {
         let events = parse_xread(&reply, &keys, &queues, &mut ids);
         assert!(events.is_empty());
         assert_eq!(ids[0], "300-0");
+    }
+
+    #[test]
+    fn retries_back_off_and_stop_climbing() {
+        // The point of the cap is to stop hammering a server that is refusing us. An
+        // uncapped doubling would also overflow the shift long before it got useful.
+        let delays: Vec<u64> = (1..=MAX_CONSECUTIVE_FAILURES)
+            .map(|f| retry_delay(f).as_secs())
+            .collect();
+
+        assert_eq!(
+            delays[0],
+            RETRY_BASE.as_secs(),
+            "first retry is immediate-ish"
+        );
+        assert!(
+            delays.windows(2).all(|w| w[1] >= w[0]),
+            "delays must never shrink: {delays:?}"
+        );
+        assert!(
+            delays.iter().all(|d| *d <= RETRY_MAX.as_secs()),
+            "capped at {}s: {delays:?}",
+            RETRY_MAX.as_secs()
+        );
+    }
+
+    #[test]
+    fn the_retry_budget_is_finite() {
+        // A loop with no ceiling is not resilience: against a permanent failure it spends
+        // one command a second, forever, with the log going to a sink.
+        const { assert!(MAX_CONSECUTIVE_FAILURES > 0) };
+        let total: u64 = (1..MAX_CONSECUTIVE_FAILURES)
+            .map(|f| retry_delay(f).as_secs())
+            .sum();
+        assert!(
+            total <= 60,
+            "the reader should give up inside a minute, not {total}s"
+        );
     }
 
     #[test]

@@ -5,11 +5,13 @@ use std::time::Duration;
 use color_eyre::Result;
 use crossterm::event::{Event, EventStream, KeyEventKind};
 use futures::StreamExt;
+use keylens_bullmq::EventsStatus;
 use keylens_conn::Conn;
 use tokio::sync::mpsc;
 use tracing::warn;
 
 use crate::app::App;
+use crate::config::Target;
 use crate::ui;
 use crate::worker::{Request, Update, Worker};
 
@@ -27,7 +29,8 @@ const INFO_TICK: Duration = Duration::from_secs(5);
 /// managed database look broken.
 const BROWSE_CONNECT_TIMEOUT: Duration = Duration::from_secs(60);
 
-pub async fn run(url: &str) -> Result<()> {
+pub async fn run(target: &Target) -> Result<()> {
+    let url = target.url.as_str();
     // The terminal comes up *before* the connection, so there is something on screen from
     // the first moment. Connecting behind a blank terminal is what forced a tight deadline
     // in the first place: with nothing drawn, a slow link and a hang look identical.
@@ -53,7 +56,7 @@ pub async fn run(url: &str) -> Result<()> {
     let (up_tx, mut up_rx) = mpsc::channel::<Update>(CHANNEL_SIZE);
     let up_tx2 = up_tx.clone();
 
-    let worker = Worker::new(conn);
+    let worker = Worker::with_prefix(conn, target.prefix.clone());
     let worker_handle = tokio::spawn(worker.run(req_rx, up_tx));
 
     let mut app = App::new(server, url.to_string(), req_tx.clone());
@@ -77,7 +80,9 @@ pub async fn run(url: &str) -> Result<()> {
     let result = event_loop(&mut terminal, &mut app, &mut up_rx, &req_tx, streamer).await;
     ratatui::restore();
 
-    // Dropping the sender ends the worker's recv loop.
+    // `app` owns a clone of the request sender and outlives this scope, so dropping this
+    // one does *not* end the worker's recv loop -- the abort is what actually stops it.
+    // Dropped first anyway so the worker isn't handed new work on the way out.
     drop(req_tx);
     worker_handle.abort();
 
@@ -191,6 +196,14 @@ impl StreamerHandle {
             Ok(c) => c,
             Err(e) => {
                 warn!(error = %e, "could not open a connection for the event stream");
+                // Say so in the UI. Interactive logs go to a sink, so a silent return
+                // leaves the queue table claiming it is still "attaching…" forever.
+                self.updates
+                    .send(Update::EventsStatus(EventsStatus::Unavailable(
+                        e.to_string(),
+                    )))
+                    .await
+                    .ok();
                 return;
             }
         };

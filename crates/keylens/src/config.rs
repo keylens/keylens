@@ -18,12 +18,36 @@ pub struct Config {
 pub struct Connection {
     pub name: String,
     pub url: String,
-    /// Hard-disable mutations for this connection regardless of build or flags.
+    /// Reserved for v0.2 mutations, which do not exist yet -- v0.1 is read-only
+    /// throughout, so today this only labels the entry in `keylens connections`. Parsed
+    /// now so a production entry written today keeps meaning what it says later.
     #[serde(default)]
     pub readonly: bool,
-    /// Key prefix hint for lenses, e.g. BullMQ's `bull`.
+    /// Key prefix for the BullMQ lens, when the keyspace does not use the default `bull`.
+    ///
+    /// Detection scans `<prefix>:*:meta`, so on a custom prefix it finds nothing and the
+    /// queues tab never appears -- with no error, because "no queues here" is a perfectly
+    /// normal answer. This is how you tell it where to look instead.
     #[serde(default)]
     pub prefix: Option<String>,
+}
+
+/// A connection resolved from flags, environment and config, with everything downstream
+/// needs to open it.
+#[derive(Debug, Clone, PartialEq)]
+pub struct Target {
+    pub url: String,
+    /// Lens prefix override, if the config named one.
+    pub prefix: Option<String>,
+}
+
+impl Target {
+    pub fn new(url: impl Into<String>) -> Self {
+        Self {
+            url: url.into(),
+            prefix: None,
+        }
+    }
 }
 
 impl Config {
@@ -76,6 +100,37 @@ mod tests {
         // readonly defaults to false so local entries need no boilerplate
         assert!(!cfg.get("local").unwrap().readonly);
         assert!(cfg.get("staging").is_none());
+    }
+
+    #[test]
+    fn a_custom_lens_prefix_survives_parsing() {
+        // The README documents this and it has to actually reach the lens: detection
+        // scans `<prefix>:*:meta`, so a dropped prefix means no queues tab at all, with
+        // no error to explain why.
+        let cfg: Config = toml::from_str(
+            r#"
+            [[connections]]
+            name = "queues"
+            url = "redis://jobs.internal:6379"
+            prefix = "myapp"
+            "#,
+        )
+        .unwrap();
+        assert_eq!(cfg.get("queues").unwrap().prefix.as_deref(), Some("myapp"));
+    }
+
+    #[test]
+    fn a_connection_without_a_prefix_leaves_the_lens_default_alone() {
+        let cfg: Config = toml::from_str(
+            r#"
+            [[connections]]
+            name = "local"
+            url = "redis://127.0.0.1:6379"
+            "#,
+        )
+        .unwrap();
+        assert_eq!(cfg.get("local").unwrap().prefix, None);
+        assert_eq!(Target::new("redis://x").prefix, None);
     }
 
     #[test]

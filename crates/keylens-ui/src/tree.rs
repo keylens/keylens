@@ -128,19 +128,6 @@ impl KeyTree {
         self.find(key).is_some_and(|n| n.is_key)
     }
 
-    /// Attach a type to an already-inserted key. Types arrive after the key list, since
-    /// `SCAN` returns names and typing them is a separate round trip.
-    pub fn set_kind(&mut self, key: &str, kind: Kind) {
-        let mut node = &mut self.root;
-        for segment in key.split(SEPARATOR) {
-            match node.children.get_mut(segment) {
-                Some(child) => node = child,
-                None => return,
-            }
-        }
-        node.kind = Some(kind);
-    }
-
     fn find(&self, path: &str) -> Option<&Node> {
         let mut node = &self.root;
         for segment in path.split(SEPARATOR) {
@@ -165,20 +152,6 @@ impl KeyTree {
         } else {
             self.expanded.insert(path.to_string());
             Some(true)
-        }
-    }
-
-    pub fn expand(&mut self, path: &str) {
-        if self.find(path).is_some_and(|n| !n.children.is_empty()) {
-            self.expanded.insert(path.to_string());
-        }
-    }
-
-    /// Expand every ancestor of a path so the path itself becomes visible.
-    pub fn reveal(&mut self, path: &str) {
-        let segments: Vec<&str> = path.split(SEPARATOR).collect();
-        for i in 1..segments.len() {
-            self.expanded.insert(segments[..i].join(":"));
         }
     }
 
@@ -365,18 +338,6 @@ mod tests {
     }
 
     #[test]
-    fn reveal_expands_ancestors_but_not_the_target() {
-        let mut t = tree(&["a:b:c:d", "a:b:x", "a:b:c:e"]);
-        t.reveal("a:b:c");
-        assert!(t.is_expanded("a:b"));
-        assert!(
-            !t.is_expanded("a:b:c"),
-            "reveal makes the target visible, not opened"
-        );
-        assert!(paths(&t.rows()).contains(&"a:b:c"));
-    }
-
-    #[test]
     fn refresh_keeps_expansion_state() {
         // Re-scanning must not collapse the view the user just arranged.
         let mut t = tree(&["bull:emails:1", "bull:emails:2"]);
@@ -407,19 +368,6 @@ mod tests {
         let mut t = KeyTree::new();
         t.insert("");
         assert!(t.is_empty());
-    }
-
-    #[test]
-    fn set_kind_attaches_to_an_existing_key() {
-        let mut t = tree(&["bull:emails:meta"]);
-        t.set_kind("bull:emails:meta", Kind::Hash);
-        t.expand_all();
-        let row = t
-            .rows()
-            .into_iter()
-            .find(|r| r.path == "bull:emails:meta")
-            .unwrap();
-        assert_eq!(row.kind, Some(Kind::Hash));
     }
 
     #[test]

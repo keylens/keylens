@@ -161,16 +161,36 @@ impl Series {
     }
 }
 
+/// Where the live events reader has got to.
+///
+/// Three states, not a bool, because "we are not seeing events" has three very different
+/// causes and the UI has to say which: still connecting, connected and quiet, or never
+/// going to work on this server. A boolean `attached` collapsed the last two, so a server
+/// without stream support sat on "attaching…" forever.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub enum EventsStatus {
+    /// Opening the reader connection. An empty graph means "not watching yet".
+    #[default]
+    Attaching,
+    /// Reader is on the streams. An empty graph means the queues are genuinely idle.
+    Live,
+    /// The reader gave up, with the reason. Nothing will arrive; say so.
+    Unavailable(String),
+}
+
 /// Throughput across every queue being watched.
 #[derive(Debug, Clone, Default)]
 pub struct Throughput {
     series: HashMap<String, Series>,
-    /// True once the stream reader has actually attached, so the UI can distinguish
-    /// "idle" from "not watching yet".
-    pub attached: bool,
+    pub status: EventsStatus,
 }
 
 impl Throughput {
+    /// Whether events are actually flowing, so an empty graph reads as "idle".
+    pub fn is_live(&self) -> bool {
+        self.status == EventsStatus::Live
+    }
+
     /// `at_ms` is the event's own timestamp, taken from the stream entry id.
     pub fn record(&mut self, queue: &str, kind: EventKind, at_ms: i64) {
         self.series
@@ -320,6 +340,25 @@ mod tests {
         let s = t.series("emails").unwrap();
         assert_eq!(s.window(1_785_515_393, 1, |b| b.failed), vec![2]);
         assert_eq!(s.failed_total, 2);
+    }
+
+    #[test]
+    fn events_status_distinguishes_quiet_from_never_coming() {
+        // As a bool this was one bit for two very different facts, and the UI printed
+        // "attaching…" forever on a server that simply has no XREAD.
+        let mut t = Throughput::default();
+        assert_eq!(t.status, EventsStatus::Attaching, "nothing attached yet");
+        assert!(!t.is_live());
+
+        t.status = EventsStatus::Live;
+        assert!(t.is_live(), "an empty graph now means idle");
+
+        t.status = EventsStatus::Unavailable("NOPERM cannot run 'xread'".into());
+        assert!(!t.is_live());
+        assert!(
+            matches!(&t.status, EventsStatus::Unavailable(why) if why.contains("NOPERM")),
+            "the reason has to survive to the UI"
+        );
     }
 
     #[test]

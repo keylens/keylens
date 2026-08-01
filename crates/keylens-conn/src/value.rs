@@ -113,7 +113,14 @@ pub enum KeyValue {
     /// Key vanished between listing and reading -- normal on a live keyspace.
     Missing,
     /// Too big to read safely on a server that lacks the bounded read command.
-    TooLarge(&'static str, usize),
+    TooLarge {
+        /// The Redis type, for the message: `this hash holds more than …`.
+        what: &'static str,
+        limit: usize,
+        /// What `limit` counts. A string's cap is bytes; a collection's is elements, and
+        /// telling someone a string "holds more than 65536 entries" is just wrong.
+        unit: &'static str,
+    },
     Unsupported(String),
 }
 
@@ -127,7 +134,7 @@ impl KeyValue {
             KeyValue::Set(v) => v.len(),
             KeyValue::ZSet(v) => v.len(),
             KeyValue::Stream(v) => v.len(),
-            KeyValue::Missing | KeyValue::Unsupported(_) | KeyValue::TooLarge(..) => 0,
+            KeyValue::Missing | KeyValue::Unsupported(_) | KeyValue::TooLarge { .. } => 0,
         }
     }
 
@@ -206,9 +213,14 @@ impl Conn {
 
     /// Read up to [`PAGE`] elements starting at `offset`.
     ///
-    /// `offset` is honoured exactly for ordered types (list, zset, stream). Hash and set
-    /// are unordered, so it is used as a page counter over `HSCAN`/`SSCAN` cursors --
-    /// which is why the viewer labels those pages "next", not by index.
+    /// `offset` is honoured exactly for the ordered types (list, zset, stream), which is
+    /// what `LRANGE`/`ZRANGE`/`XRANGE` index by.
+    ///
+    /// Hash and set **ignore it** and always return the first cursor page. That is a
+    /// limitation, not a convention: `HSCAN`/`SSCAN` are resumed by an opaque cursor from
+    /// the previous reply, not by an element index, so paging them needs the caller to
+    /// carry that cursor back in. Until this signature does, claiming otherwise here would
+    /// describe an API that does not exist.
     pub async fn read_value(&self, key: &str, kind: Kind, offset: usize) -> Result<KeyValue> {
         let start = offset as i64;
         let stop = start + PAGE as i64 - 1;
@@ -225,8 +237,13 @@ impl Conn {
                             vec![key.into(), 0.into(), (MAX_STRING_BYTES as i64 - 1).into()],
                         )
                         .await?;
+                    // Measure the *reply*, not the rendered text. `display_string` turns a
+                    // binary payload into `<N bytes> …200 chars`, which is far shorter than
+                    // the bytes it stands for -- so checking the rendered length silently
+                    // dropped the marker on exactly the values most likely to be truncated.
+                    let truncated = reply_byte_len(&reply) >= MAX_STRING_BYTES;
                     let mut s = display_string(&reply);
-                    if s.len() >= MAX_STRING_BYTES {
+                    if truncated {
                         s.push_str("\n\n... truncated ...");
                     }
                     KeyValue::String(s)
@@ -236,7 +253,11 @@ impl Conn {
                     // instead of requested.
                     KeyValue::String(display_string(&self.cmd("GET", vec![key.into()]).await?))
                 } else {
-                    KeyValue::TooLarge("string", MAX_STRING_BYTES)
+                    KeyValue::TooLarge {
+                        what: "string",
+                        limit: MAX_STRING_BYTES,
+                        unit: "bytes",
+                    }
                 }
             }
 
@@ -269,7 +290,11 @@ impl Conn {
                 } else if size_ok(self, key, "HLEN", PAGE).await? {
                     KeyValue::Hash(whole_collection(self, key, "HGETALL").await?)
                 } else {
-                    KeyValue::TooLarge("hash", PAGE)
+                    KeyValue::TooLarge {
+                        what: "hash",
+                        limit: PAGE,
+                        unit: "fields",
+                    }
                 }
             }
 
@@ -286,7 +311,11 @@ impl Conn {
                     let reply = self.cmd("SMEMBERS", vec![key.into()]).await?;
                     KeyValue::Set(as_string_vec(&reply))
                 } else {
-                    KeyValue::TooLarge("set", PAGE)
+                    KeyValue::TooLarge {
+                        what: "set",
+                        limit: PAGE,
+                        unit: "members",
+                    }
                 }
             }
 
@@ -313,6 +342,17 @@ impl Conn {
 
         Ok(value)
     }
+}
+
+/// Byte length of a reply, before it is rendered for display.
+///
+/// [`display_string`] is lossy about size on purpose -- it abbreviates binary payloads --
+/// so anything deciding "was this truncated" has to ask the reply, not the rendering.
+fn reply_byte_len(v: &Value) -> usize {
+    v.as_bytes()
+        .map(|b| b.len())
+        .or_else(|| v.as_string().map(|s| s.len()))
+        .unwrap_or(0)
 }
 
 /// Measure a key with `cmd` and report whether it is under `limit`.
@@ -490,5 +530,73 @@ mod tests {
     fn value_len_counts_rows() {
         assert_eq!(KeyValue::List(vec!["a".into(), "b".into()]).len(), 2);
         assert!(KeyValue::Missing.is_empty());
+    }
+
+    #[test]
+    fn truncation_is_judged_on_the_reply_not_the_rendering() {
+        // `display_string` abbreviates a binary payload to `<N bytes> …200 chars`, which is
+        // *shorter* than what it stands for. Measuring the rendered text meant a 64KB
+        // msgpack value came back looking complete, with no truncation marker at all --
+        // silently wrong on exactly the values most likely to be cut.
+        let binary = Value::Bytes(vec![0xF0u8; MAX_STRING_BYTES].into());
+
+        assert_eq!(reply_byte_len(&binary), MAX_STRING_BYTES);
+        assert!(
+            display_string(&binary).len() < MAX_STRING_BYTES,
+            "the rendering is much shorter, which is why it must not be the measure"
+        );
+        assert!(reply_byte_len(&binary) >= MAX_STRING_BYTES, "so this fires");
+    }
+
+    #[test]
+    fn reply_byte_len_reads_utf8_and_binary_alike() {
+        assert_eq!(reply_byte_len(&Value::from("abc")), 3);
+        // Multi-byte UTF-8: bytes, not chars, because the cap is a transfer bound.
+        assert_eq!(reply_byte_len(&Value::from("日本")), 6);
+        assert_eq!(reply_byte_len(&Value::Bytes(vec![0, 1, 2, 3].into())), 4);
+        assert_eq!(reply_byte_len(&Value::Null), 0);
+    }
+
+    #[test]
+    fn a_short_value_is_not_marked_truncated() {
+        let short = Value::from("hello");
+        assert!(reply_byte_len(&short) < MAX_STRING_BYTES);
+    }
+
+    #[test]
+    fn oversized_values_carry_the_unit_their_limit_is_counted_in() {
+        // "this string holds more than 65536 entries" was the wrong noun: a string's cap
+        // is bytes, a hash's is fields, a set's is members.
+        for (value, unit) in [
+            (
+                KeyValue::TooLarge {
+                    what: "string",
+                    limit: MAX_STRING_BYTES,
+                    unit: "bytes",
+                },
+                "bytes",
+            ),
+            (
+                KeyValue::TooLarge {
+                    what: "hash",
+                    limit: PAGE,
+                    unit: "fields",
+                },
+                "fields",
+            ),
+            (
+                KeyValue::TooLarge {
+                    what: "set",
+                    limit: PAGE,
+                    unit: "members",
+                },
+                "members",
+            ),
+        ] {
+            let KeyValue::TooLarge { unit: got, .. } = value else {
+                unreachable!()
+            };
+            assert_eq!(got, unit);
+        }
     }
 }

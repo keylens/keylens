@@ -533,9 +533,12 @@ fn value_lines(value: &KeyValue, width: usize) -> Vec<Line<'static>> {
 
         // Not an error: this server has no cursor-based read for the type, so keylens
         // measured the key first and declined rather than pulling the whole thing.
-        KeyValue::TooLarge(what, limit) => vec![
+        KeyValue::TooLarge { what, limit, unit } => vec![
             Line::from(Span::styled(
-                format!("this {what} holds more than {limit} entries"),
+                format!(
+                    "this {what} is larger than {} {unit}",
+                    format::count(*limit as u64)
+                ),
                 Theme::warn(),
             )),
             Line::from(Span::styled(
@@ -566,9 +569,13 @@ fn json_line(line: String) -> Line<'static> {
 }
 
 fn draw_hint(frame: &mut Frame, app: &App, area: Rect) {
-    let keys: &[(&str, &str)] = match app.mode {
-        Mode::Search => &[],
-        _ if app.view == View::Keys => &[
+    // Derived, not written down. The tab count changes when a lens matches, and a hint
+    // that says `1-6` next to seven tabs is a hint that has stopped being true.
+    let views = format!("1-{}", app.views().len());
+
+    let keys: Vec<(&str, &str)> = match app.mode {
+        Mode::Search => Vec::new(),
+        _ if app.view == View::Keys => vec![
             ("j/k", "move"),
             ("↵", "open"),
             ("/", "filter"),
@@ -577,24 +584,24 @@ fn draw_hint(frame: &mut Frame, app: &App, area: Rect) {
             ("r", "rescan"),
             ("E/C", "expand"),
             ("⇥", "pane"),
-            ("1-6", "view"),
+            (views.as_str(), "view"),
             ("?", "help"),
             ("q", "quit"),
         ],
-        _ if app.view == View::Queues => &[
+        _ if app.view == View::Queues => vec![
             ("j/k", "move"),
             ("↵", "open"),
             ("h", "back"),
             ("[/]", "state"),
             ("r", "reload"),
-            ("1-7", "view"),
+            (views.as_str(), "view"),
             ("?", "help"),
             ("q", "quit"),
         ],
-        _ => &[
+        _ => vec![
             ("j/k", "scroll"),
             ("r", "reload"),
-            ("1-7", "view"),
+            (views.as_str(), "view"),
             ("?", "help"),
             ("q", "quit"),
         ],
@@ -616,7 +623,7 @@ fn draw_hint(frame: &mut Frame, app: &App, area: Rect) {
 
     let mut spans = vec![Span::raw(" ")];
     for (key, what) in keys {
-        spans.push(Span::styled(*key, Theme::accent()));
+        spans.push(Span::styled(key.to_string(), Theme::accent()));
         spans.push(Span::styled(format!(" {what}  "), Theme::dim()));
     }
     frame.render_widget(Line::from(spans), area);

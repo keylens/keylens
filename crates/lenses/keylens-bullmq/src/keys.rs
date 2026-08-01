@@ -105,11 +105,23 @@ impl State {
         }
     }
 
+    /// Whether this state is stored as a LIST rather than a ZSET.
+    ///
+    /// This is the underlying fact; [`count_cmd`](Self::count_cmd) and the range command
+    /// used to page jobs are both derived from it. Reading job listing off `count_cmd()`
+    /// -- comparing it to the string `"LLEN"` -- made a counting decision silently govern
+    /// a paging decision, so changing how a state is counted would have quietly broken how
+    /// its jobs are listed.
+    pub fn is_list_backed(&self) -> bool {
+        matches!(self, State::Waiting | State::Active)
+    }
+
     /// The command that counts this state, which depends on the underlying Redis type.
     pub fn count_cmd(&self) -> &'static str {
-        match self {
-            State::Waiting | State::Active => "LLEN",
-            _ => "ZCARD",
+        if self.is_list_backed() {
+            "LLEN"
+        } else {
+            "ZCARD"
         }
     }
 }
@@ -238,6 +250,33 @@ mod tests {
         assert_eq!(State::Delayed.count_cmd(), "ZCARD");
         assert_eq!(State::Failed.count_cmd(), "ZCARD");
         assert_eq!(State::WaitingChildren.count_cmd(), "ZCARD");
+    }
+
+    #[test]
+    fn the_backing_type_is_one_fact_that_both_commands_agree_on() {
+        // The job lister used to decide LRANGE-vs-ZREVRANGE by string-matching
+        // `count_cmd() == "LLEN"`, which made a *counting* choice silently govern a
+        // *paging* choice. They must never be able to disagree.
+        for s in State::ALL {
+            assert_eq!(
+                s.count_cmd() == "LLEN",
+                s.is_list_backed(),
+                "{s:?} counts with {} but reports is_list_backed = {}",
+                s.count_cmd(),
+                s.is_list_backed()
+            );
+        }
+    }
+
+    #[test]
+    fn exactly_the_two_list_backed_states_are_list_backed() {
+        // BullMQ stores `wait` and `active` as LISTs and everything else as ZSETs. Adding
+        // a state without classifying it would page it with the wrong command.
+        let list_backed: Vec<State> = State::ALL
+            .into_iter()
+            .filter(|s| s.is_list_backed())
+            .collect();
+        assert_eq!(list_backed, vec![State::Waiting, State::Active]);
     }
 
     #[test]

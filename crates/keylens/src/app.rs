@@ -258,6 +258,10 @@ impl App {
                     self.detail_scroll = 0;
                     self.stream = stream;
                     self.detail = Some((*meta, *value));
+                    // A key that loaded is proof the last failure is over. The value pane
+                    // renders `error` in place of the value, so leaving a stale one set
+                    // meant one bad key hid every key selected after it until a rescan.
+                    self.error = None;
                 }
             }
 
@@ -274,7 +278,7 @@ impl App {
             Update::PubSub(s) => self.pubsub = s,
 
             Update::Detected(d) => self.detections = d,
-            Update::EventsAttached => self.throughput.attached = true,
+            Update::EventsStatus(s) => self.throughput.status = s,
             Update::Events(events) => {
                 for e in events {
                     self.throughput.record(&e.queue, e.kind, e.at_ms);
@@ -399,12 +403,7 @@ impl App {
         };
         self.jobs = PaneState::Loading;
         let state = self.job_state;
-        self.send(Request::LoadJobs {
-            queue,
-            state,
-            offset: 0,
-        })
-        .await;
+        self.send(Request::LoadJobs { queue, state }).await;
     }
 
     async fn load_job(&mut self) {
@@ -519,18 +518,23 @@ impl App {
     }
 
     async fn load_selected(&mut self) {
-        let Some(row) = self.selected_row() else {
+        let Some((path, is_key)) = self.selected_row().map(|r| (r.path.clone(), r.is_key)) else {
             return;
         };
-        if !row.is_key {
+
+        // Moving the cursor retires the previous key's failure. Without this the error
+        // stays on screen through the whole load of the *next* key, which reads as though
+        // the new key failed too.
+        self.error = None;
+
+        if !is_key {
             self.detail = None;
             self.stream = None;
             self.pending_key = None;
             return;
         }
-        let key = row.path.clone();
-        self.pending_key = Some(key.clone());
-        self.send(Request::Select { key, offset: 0 }).await;
+        self.pending_key = Some(path.clone());
+        self.send(Request::Select { key: path }).await;
     }
 
     async fn rescan(&mut self) {

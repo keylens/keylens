@@ -6,7 +6,7 @@
 use clap::{Parser, Subcommand};
 use color_eyre::eyre::{Result, eyre};
 
-use keylens::config::Config;
+use keylens::config::{Config, Target};
 use keylens::{browse, probe};
 
 const DEFAULT_URL: &str = "redis://127.0.0.1:6379";
@@ -78,12 +78,12 @@ async fn main() -> Result<()> {
         return list_connections();
     }
 
-    let url = resolve_url(&cli)?;
+    let target = resolve_target(&cli)?;
 
     match cli.command {
-        Some(Command::Probe { queues }) => probe::run(&url, queues).await,
+        Some(Command::Probe { queues }) => probe::run(&target, queues).await,
         // Bare `keylens` opens the browser -- the common case should need no subcommand.
-        Some(Command::Browse) | None => browse::run(&url).await,
+        Some(Command::Browse) | None => browse::run(&target).await,
         Some(Command::Connections) => unreachable!("handled above"),
     }
 }
@@ -189,29 +189,38 @@ fn mask_url(url: &str) -> String {
 }
 
 /// Precedence: `--url` (or `KEYLENS_URL`) > `--name` from config > default.
-fn resolve_url(cli: &Cli) -> Result<String> {
+///
+/// Only the `--name` path can carry a lens prefix, because that is the only path with a
+/// config entry behind it to read one from.
+fn resolve_target(cli: &Cli) -> Result<Target> {
     if let Some(url) = &cli.url {
-        return Ok(url.clone());
+        return Ok(Target::new(url.clone()));
     }
 
     if let Some(name) = &cli.name {
         let cfg = Config::load_default();
-        return cfg.get(name).map(|c| c.url.clone()).ok_or_else(|| {
-            let known: Vec<_> = cfg.connections.iter().map(|c| c.name.clone()).collect();
-            if known.is_empty() {
-                eyre!(
-                    "no connection named `{name}`; no config file found at {}",
-                    Config::default_path()
-                        .map(|p| p.display().to_string())
-                        .unwrap_or_else(|| "<unknown>".into())
-                )
-            } else {
-                eyre!("no connection named `{name}`; known: {}", known.join(", "))
-            }
-        });
+        return cfg
+            .get(name)
+            .map(|c| Target {
+                url: c.url.clone(),
+                prefix: c.prefix.clone(),
+            })
+            .ok_or_else(|| {
+                let known: Vec<_> = cfg.connections.iter().map(|c| c.name.clone()).collect();
+                if known.is_empty() {
+                    eyre!(
+                        "no connection named `{name}`; no config file found at {}",
+                        Config::default_path()
+                            .map(|p| p.display().to_string())
+                            .unwrap_or_else(|| "<unknown>".into())
+                    )
+                } else {
+                    eyre!("no connection named `{name}`; known: {}", known.join(", "))
+                }
+            });
     }
 
-    Ok(DEFAULT_URL.to_string())
+    Ok(Target::new(DEFAULT_URL))
 }
 
 #[cfg(test)]

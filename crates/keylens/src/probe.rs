@@ -7,7 +7,10 @@ use keylens_bullmq::{BullMqLens, State};
 use keylens_conn::{Conn, Feature};
 use keylens_lens::Registry;
 
-pub async fn run(url: &str, show_queues: bool) -> Result<()> {
+use crate::config::Target;
+
+pub async fn run(target: &Target, show_queues: bool) -> Result<()> {
+    let url = &target.url;
     println!("connecting to {url}");
     let conn = Conn::connect(url, "probe").await?;
     let server = conn.server();
@@ -55,7 +58,10 @@ pub async fn run(url: &str, show_queues: bool) -> Result<()> {
     println!();
     println!("lenses");
     let mut registry = Registry::new();
-    registry.register(Arc::new(BullMqLens::default()));
+    registry.register(Arc::new(match &target.prefix {
+        Some(p) => BullMqLens::new(p.clone()),
+        None => BullMqLens::default(),
+    }));
 
     let detections = registry.detect_all(&conn).await;
     if detections.is_empty() {

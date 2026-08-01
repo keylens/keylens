@@ -93,7 +93,10 @@ impl Feature {
     pub fn affects(&self) -> &'static str {
         match self {
             Feature::ServerInfo => "stats dashboard",
-            Feature::Config => "config pane",
+            // No pane reads CONFIG today. It stays probed because `keylens probe` exists to
+            // tell you what a managed host will let you do, and CONFIG being blocked is the
+            // single best predictor of what else will be.
+            Feature::Config => "nothing yet; a signal for how locked down this host is",
             Feature::ClientList => "clients pane",
             Feature::Slowlog => "slowlog pane",
             Feature::MemoryStats => "memory breakdown",
@@ -128,14 +131,6 @@ impl Capabilities {
 
     pub fn has(&self, f: Feature) -> bool {
         self.get(f).is_available()
-    }
-
-    pub fn iter(&self) -> impl Iterator<Item = (&Feature, &Availability)> {
-        self.map.iter()
-    }
-
-    pub fn has_module(&self, name: &str) -> bool {
-        self.modules.iter().any(|m| m.eq_ignore_ascii_case(name))
     }
 }
 
@@ -211,6 +206,36 @@ mod tests {
             classify(&err("ERR This instance has cluster support disabled")),
             Availability::Denied(_)
         ));
+    }
+
+    #[test]
+    fn every_probed_capability_is_consulted_somewhere() {
+        // `Streams` was probed, labelled, and reported by `keylens probe` -- and then never
+        // read. The live events reader parked on `XREAD` regardless, so a server without
+        // stream support got one failing command per second for the whole session. A
+        // capability nobody asks about is a capability that does nothing.
+        let sources = [
+            include_str!("conn.rs"),
+            include_str!("value.rs"),
+            include_str!("server.rs"),
+            include_str!("stream.rs"),
+        ];
+
+        for feature in Feature::ALL {
+            // These two are answered by their own call path rather than by a `has()` check:
+            // INFO by whether it parsed, CONFIG by the probe report alone (see `affects`).
+            if matches!(feature, Feature::ServerInfo | Feature::Config) {
+                continue;
+            }
+            // Being *probed* is not being *used*. The only thing that counts is a call
+            // that changes what keylens does: `has(Feature::X)`.
+            let gate = format!("has(Feature::{feature:?})");
+            assert!(
+                sources.iter().any(|src| src.contains(&gate)),
+                "Feature::{feature:?} is probed but no `{gate}` gates anything on it -- \
+                 either use it or drop it from the enum"
+            );
+        }
     }
 
     #[test]

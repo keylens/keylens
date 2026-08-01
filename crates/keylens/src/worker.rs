@@ -5,7 +5,7 @@
 //! broken. So: the worker owns the [`Conn`] and the scan cursor, the UI owns the tree and
 //! the selection, and they exchange messages over bounded channels.
 
-use keylens_bullmq::{BullMqLens, Job, JobRef, QueueSummary, State};
+use keylens_bullmq::{BullMqLens, EventsStatus, Job, JobRef, QueueSummary, State};
 use keylens_conn::{
     ClientInfo, ClusterTopology, Conn, Feature, KeyMeta, KeyValue, Kind, PubSubChannel, ServerInfo,
     SlowEntry, StreamInfo, Value,
@@ -38,10 +38,9 @@ pub enum Request {
     },
     /// Continue the current scan.
     More,
-    /// Load metadata and a value page for one key.
+    /// Load metadata and the first value page for one key.
     Select {
         key: String,
-        offset: usize,
     },
     RefreshInfo,
 
@@ -56,7 +55,6 @@ pub enum Request {
     LoadJobs {
         queue: String,
         state: State,
-        offset: usize,
     },
     LoadJob {
         queue: String,
@@ -89,8 +87,9 @@ pub enum Update {
     PubSub(PaneState<Vec<PubSubChannel>>),
 
     Detected(Vec<Detection>),
-    /// The stream reader has attached, so an empty graph means "idle", not "not watching".
-    EventsAttached,
+    /// How the live events reader is getting on -- attaching, live, or never going to
+    /// work here. The graph reads very differently depending on which.
+    EventsStatus(EventsStatus),
     Events(Vec<crate::events::StreamEvent>),
     Queues(PaneState<Vec<QueueSummary>>),
     Jobs {
@@ -122,13 +121,23 @@ pub struct Worker {
 
 impl Worker {
     pub fn new(conn: Conn) -> Self {
+        Self::with_prefix(conn, None)
+    }
+
+    /// `prefix` overrides the lens's default `bull`, for a keyspace that uses another one.
+    /// Detection scans `<prefix>:*:meta`, so without this a custom prefix simply looks
+    /// like a server with no queues on it.
+    pub fn with_prefix(conn: Conn, prefix: Option<String>) -> Self {
         Self {
             conn,
             cursor: "0".into(),
             pattern: None,
             kind: None,
             complete: false,
-            bullmq: BullMqLens::default(),
+            bullmq: match prefix {
+                Some(p) => BullMqLens::new(p),
+                None => BullMqLens::default(),
+            },
         }
     }
 
@@ -142,13 +151,11 @@ impl Worker {
                     self.complete = false;
                     self.scan_batch(true).await
                 }
-                Request::More => {
-                    if self.complete {
-                        continue;
-                    }
-                    self.scan_batch(false).await
-                }
-                Request::Select { key, offset } => self.detail(&key, offset).await,
+                // A request always gets a reply, including this one. The UI sets `loading`
+                // when it asks for more; answering an already-finished scan with silence
+                // would leave the status bar spinning with nothing on the way.
+                Request::More => self.scan_batch(false).await,
+                Request::Select { key } => self.detail(&key).await,
                 Request::RefreshInfo => {
                     // Servers that don't implement `INFO` would otherwise fail this on
                     // every tick and paint the error over whatever pane is open.
@@ -198,15 +205,11 @@ impl Worker {
                     })
                 }
 
-                Request::LoadJobs {
-                    queue,
-                    state,
-                    offset,
-                } => Update::Jobs {
+                Request::LoadJobs { queue, state } => Update::Jobs {
                     state,
                     data: match self
                         .bullmq
-                        .jobs(&self.conn, &queue, state, offset, JOB_PAGE)
+                        .jobs(&self.conn, &queue, state, 0, JOB_PAGE)
                         .await
                     {
                         Ok(j) => PaneState::Ready(j),
@@ -291,8 +294,11 @@ impl Worker {
         keys.into_iter()
             .enumerate()
             .map(|(i, key)| {
+                // One key failing to type -- deleted mid-batch, say -- costs that key its
+                // tag and nothing else. It used to cost the whole batch its types.
                 let kind = kinds
                     .get(i)
+                    .and_then(|r| r.as_ref().ok())
                     .map(|v| Kind::parse(&keylens_conn::value::display_string(v)));
                 (key, kind)
             })
@@ -362,12 +368,12 @@ impl Worker {
         PaneState::Ready(Some(Box::new(JobDetail { job, logs })))
     }
 
-    async fn detail(&self, key: &str, offset: usize) -> Update {
+    async fn detail(&self, key: &str) -> Update {
         let meta = match self.conn.key_meta(key).await {
             Ok(m) => m,
             Err(e) => return Update::Error(e.to_string()),
         };
-        let value = match self.conn.read_value(key, meta.kind, offset).await {
+        let value = match self.conn.read_value(key, meta.kind, 0).await {
             Ok(v) => v,
             Err(e) => return Update::Error(e.to_string()),
         };

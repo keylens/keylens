@@ -16,7 +16,7 @@ pub mod job;
 pub mod keys;
 pub mod lens;
 
-pub use events::{EventKind, Throughput};
+pub use events::{EventKind, EventsStatus, Throughput};
 pub use job::{Job, JobRef};
 pub use keys::{QueueKeys, State};
 pub use lens::{BullMqLens, QueueSummary};

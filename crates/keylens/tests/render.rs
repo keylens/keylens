@@ -4,11 +4,12 @@
 //! assumption that a pane is wide enough for its content. `TestBackend` renders into an
 //! in-memory buffer, so these run in CI with no terminal and no Redis.
 
+use crossterm::event::{KeyCode, KeyEvent};
 use keylens::app::{App, Mode, View};
 use keylens::events::StreamEvent;
 use keylens::ui;
 use keylens::worker::{JobDetail, Request, Update};
-use keylens_bullmq::{EventKind, JobRef, QueueSummary, State};
+use keylens_bullmq::{EventKind, EventsStatus, JobRef, QueueSummary, State};
 use keylens_conn::{KeyMeta, KeyValue, Kind, ServerInfo, StreamEntry};
 use keylens_lens::{Confidence, Detection};
 use keylens_ui::PaneState;
@@ -364,7 +365,7 @@ fn throughput_column_distinguishes_idle_from_not_yet_watching() {
     let out = render(&mut app, 130, 24);
     assert!(out.contains("attaching to event streams"), "{out}");
 
-    app.apply(Update::EventsAttached);
+    app.apply(Update::EventsStatus(EventsStatus::Live));
     let out = render(&mut app, 130, 24);
     assert!(out.contains("live"), "{out}");
     assert!(
@@ -379,7 +380,7 @@ fn throughput_column_draws_a_sparkline_from_stream_events() {
     app.apply(Update::Queues(PaneState::Ready(vec![queue(
         "emails", false, 0,
     )])));
-    app.apply(Update::EventsAttached);
+    app.apply(Update::EventsStatus(EventsStatus::Live));
 
     // Events timestamped "now" so they land inside the rendered window.
     let now_ms = std::time::SystemTime::now()
@@ -425,7 +426,7 @@ fn the_queue_table_fits_its_pane() {
         false,
         500,
     )])));
-    app.apply(Update::EventsAttached);
+    app.apply(Update::EventsStatus(EventsStatus::Live));
 
     for width in [80u16, 100, 120, 160, 200] {
         let out = render(&mut app, width, 20);
@@ -756,4 +757,129 @@ fn splash_degrades_on_a_narrow_terminal() {
     let out = render(&mut app, 40, 20);
     assert!(out.contains("KEYLENS"));
     assert!(!out.contains("█"), "should fall back to plain text:\n{out}");
+}
+
+#[test]
+fn a_failed_key_does_not_hide_the_next_key_that_loads() {
+    // The value pane renders `error` *instead of* the value, so an error that outlives the
+    // key it belongs to blanks every key selected afterwards. This used to persist until
+    // the next full rescan: one bad key made the pane look permanently broken.
+    let (mut app, _rx) = app_with(&["k1", "k2"]);
+
+    app.set_pending_key(Some("k1".into()));
+    app.apply(Update::Error("command `TYPE` failed: boom".into()));
+    assert!(
+        render(&mut app, 100, 24).contains("boom"),
+        "error should show"
+    );
+
+    app.set_pending_key(Some("k2".into()));
+    app.apply(Update::Detail {
+        meta: meta("k2", Kind::String),
+        value: Box::new(KeyValue::String("fresh-value".into())),
+        stream: None,
+    });
+
+    let out = render(&mut app, 100, 24);
+    assert!(
+        out.contains("fresh-value"),
+        "a key that loaded must replace the previous key's error:\n{out}"
+    );
+    assert!(
+        !out.contains("boom"),
+        "the stale error must be gone:\n{out}"
+    );
+}
+
+#[tokio::test]
+async fn moving_the_cursor_clears_the_previous_key_s_error() {
+    // Not just on arrival of the next value -- while it loads, too. Otherwise the old
+    // error sits under the new selection and reads as though *that* key failed.
+    let (mut app, _rx) = app_with(&["k1", "k2"]);
+    app.apply(Update::Error("boom".into()));
+
+    app.handle_key(KeyEvent::from(KeyCode::Char('j'))).await;
+
+    let out = render(&mut app, 100, 24);
+    assert!(
+        !out.contains("boom"),
+        "navigating retires the error:\n{out}"
+    );
+    assert!(
+        out.contains("loading"),
+        "and shows the pending load:\n{out}"
+    );
+}
+
+#[test]
+fn an_oversized_value_is_described_in_its_own_units() {
+    // A string's cap is bytes and a collection's is elements. Telling someone a string
+    // "holds more than 65536 entries" is simply the wrong noun.
+    let (mut app, _rx) = app_with(&["big"]);
+    app.set_pending_key(Some("big".into()));
+    app.apply(Update::Detail {
+        meta: meta("big", Kind::String),
+        value: Box::new(KeyValue::TooLarge {
+            what: "string",
+            limit: 65_536,
+            unit: "bytes",
+        }),
+        stream: None,
+    });
+
+    let out = render(&mut app, 100, 24);
+    assert!(out.contains("65,536 bytes"), "{out}");
+    assert!(
+        !out.contains("entries"),
+        "a string does not hold entries:\n{out}"
+    );
+
+    app.apply(Update::Detail {
+        meta: meta("big", Kind::Hash),
+        value: Box::new(KeyValue::TooLarge {
+            what: "hash",
+            limit: 200,
+            unit: "fields",
+        }),
+        stream: None,
+    });
+    assert!(render(&mut app, 100, 24).contains("200 fields"));
+}
+
+#[test]
+fn the_view_hint_counts_the_tabs_that_actually_exist() {
+    // Hardcoding `1-6` meant the hint contradicted the tab bar the moment a lens matched
+    // and the queues tab appeared.
+    let (mut app, _rx) = app_with(&["cache:1"]);
+    assert_eq!(app.views().len(), 6);
+    assert!(render(&mut app, 130, 24).contains("1-6 view"));
+
+    let (mut app, _rx) = with_bullmq(&["bull:emails:1"]);
+    assert_eq!(app.views().len(), 7);
+    let out = render(&mut app, 130, 24);
+    assert!(out.contains("1-7 view"), "{out}");
+    assert!(!out.contains("1-6 view"), "{out}");
+}
+
+#[test]
+fn a_server_without_streams_says_so_instead_of_attaching_forever() {
+    // `attached: bool` collapsed "connected and quiet" into "not connected yet", so a
+    // server that can never deliver an event sat on "attaching…" for the whole session.
+    let (mut app, _rx) = with_bullmq(&[]);
+    app.apply(Update::Queues(PaneState::Ready(vec![queue(
+        "emails", false, 0,
+    )])));
+    app.apply(Update::EventsStatus(EventsStatus::Unavailable(
+        "NOPERM cannot run 'xread'".into(),
+    )));
+
+    let out = render(&mut app, 130, 24);
+    assert!(out.contains("live throughput unavailable"), "{out}");
+    assert!(out.contains("NOPERM"), "name the reason:\n{out}");
+    assert!(
+        !out.contains("attaching to event streams"),
+        "it is not still attaching:\n{out}"
+    );
+    // The counts above are still real -- only the graph is unavailable.
+    assert!(out.contains("emails"), "{out}");
 }

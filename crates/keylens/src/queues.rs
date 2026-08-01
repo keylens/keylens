@@ -1,6 +1,6 @@
 //! Rendering for the BullMQ lens: queue table, job list, job detail.
 
-use keylens_bullmq::State;
+use keylens_bullmq::{EventsStatus, State};
 use keylens_ui::PaneState;
 use keylens_ui::format;
 use keylens_ui::theme::Theme;
@@ -118,10 +118,12 @@ pub fn render(app: &App, width: u16) -> Vec<Line<'static>> {
 /// completes or fails rather than at the next poll.
 fn throughput_cells(app: &App, queue: &str, now: i64, spark_w: usize) -> Vec<Span<'static>> {
     let Some(series) = app.throughput.series(queue) else {
-        let msg = if app.throughput.attached {
-            "idle"
-        } else {
-            "…"
+        // Three different reasons for an empty cell, three different words. "idle" on a
+        // server that will never deliver an event is a lie the user can act on.
+        let msg = match &app.throughput.status {
+            EventsStatus::Live => "idle",
+            EventsStatus::Attaching => "…",
+            EventsStatus::Unavailable(_) => "n/a",
         };
         return vec![
             Span::styled(format!("  {msg:<spark_w$}"), Theme::dim()),
@@ -236,6 +238,23 @@ fn queue_table(app: &App, width: u16) -> Vec<Line<'static>> {
 
     lines.push(Line::raw(""));
     let total_rate = app.throughput.total_rate(now_secs, 10);
+    let (events_text, events_style) = match &app.throughput.status {
+        EventsStatus::Live => (
+            format!("   ● live · {total_rate:.1} events/sec across all queues"),
+            Theme::ok(),
+        ),
+        EventsStatus::Attaching => ("   ○ attaching to event streams…".to_string(), Theme::dim()),
+        // Naming the reason is the whole point: the counts above are still real, it is
+        // only the live graph that this server cannot feed.
+        EventsStatus::Unavailable(why) => (
+            format!(
+                "   ○ live throughput unavailable — {}",
+                format::truncate(why, 60)
+            ),
+            Theme::warn(),
+        ),
+    };
+
     lines.push(Line::from(vec![
         Span::styled(
             format!(
@@ -245,18 +264,7 @@ fn queue_table(app: &App, width: u16) -> Vec<Line<'static>> {
             ),
             Theme::dim(),
         ),
-        Span::styled(
-            if app.throughput.attached {
-                format!("   ● live · {total_rate:.1} events/sec across all queues")
-            } else {
-                "   ○ attaching to event streams…".to_string()
-            },
-            if app.throughput.attached {
-                Theme::ok()
-            } else {
-                Theme::dim()
-            },
-        ),
+        Span::styled(events_text, events_style),
     ]));
 
     lines

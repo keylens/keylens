@@ -7,6 +7,7 @@
 
 use fred::prelude::Value;
 
+use crate::capability::Feature;
 use crate::conn::Conn;
 use crate::error::Result;
 use crate::value::display_string;
@@ -65,8 +66,24 @@ pub struct ConsumerInfo {
 }
 
 impl Conn {
+    /// Whether this server answered the stream probe.
+    ///
+    /// Exposed because the caller that most needs it is the *live events reader*, which
+    /// parks on `XREAD` in a retry loop -- on a server without streams that loop is an
+    /// infinite sequence of failing commands, so it has to ask before it starts.
+    pub fn supports_streams(&self) -> bool {
+        self.capabilities().has(Feature::Streams)
+    }
+
     /// Everything about a stream that isn't its entries.
+    ///
+    /// Returns an empty [`StreamInfo`] on a server without stream support rather than
+    /// firing three `XINFO`/`XPENDING` calls that can only fail.
     pub async fn stream_info(&self, key: &str) -> Result<StreamInfo> {
+        if !self.supports_streams() {
+            return Ok(StreamInfo::default());
+        }
+
         let raw = self.cmd("XINFO", vec!["STREAM".into(), key.into()]).await?;
         let f = fields(&raw);
 
