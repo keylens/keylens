@@ -1,6 +1,6 @@
 [package]
 name = "keylens"
-description = "A TUI for Redis and Valkey that understands your keys"
+description = "A TUI for Redis, Valkey and Recached that understands your keys"
 keywords = ["redis", "valkey", "tui", "bullmq", "cli"]
 categories = ["command-line-utilities", "database"]
 readme = "README.md"

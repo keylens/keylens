@@ -19,6 +19,9 @@ const WORDMARK: [&str; 6] = [
 
 /// Width of the block wordmark in columns.
 pub const WORDMARK_WIDTH: u16 = 59;
+
+const TAGLINE: &str = "a TUI for Redis, Valkey and Recached that understands your keys";
+const TAGLINE_SHORT: &str = "understands your keys";
 /// Columns covered by `KEY`; the rest is `LENS`. Splitting here is what gives the
 /// two-tone brand read rather than one flat block of colour.
 const KEY_COLUMNS: usize = 24;
@@ -65,8 +68,14 @@ pub fn splash(
     lines.extend(wordmark(width));
 
     lines.push(Line::raw(""));
+    // The full tagline is wider than the wordmark, so it needs its own threshold —
+    // the splash doesn't wrap, and a sentence cut off mid-word looks broken.
     lines.push(Line::from(Span::styled(
-        "a TUI for Redis and Valkey that understands your keys",
+        if (width as usize) >= TAGLINE.chars().count() {
+            TAGLINE
+        } else {
+            TAGLINE_SHORT
+        },
         Theme::label(),
     )));
     lines.push(Line::raw(""));
@@ -132,6 +141,26 @@ mod tests {
             widths.iter().all(|w| *w == WORDMARK_WIDTH as usize),
             "rows have differing widths: {widths:?}"
         );
+    }
+
+    #[test]
+    fn nothing_on_the_splash_is_wider_than_the_terminal() {
+        // The splash does not wrap, so anything over the width is silently cut off —
+        // and a tagline sliced mid-word looks broken rather than minimal.
+        for width in [40u16, 62, 70, 100, 140] {
+            for line in splash(
+                width,
+                "redis://127.0.0.1:6379",
+                Some(("Redis", "8.10.0")),
+                "…",
+            ) {
+                let rendered: String = line.spans.iter().map(|s| s.content.as_ref()).collect();
+                assert!(
+                    rendered.chars().count() <= width as usize,
+                    "at width {width}, line overflows: {rendered:?}"
+                );
+            }
+        }
     }
 
     #[test]

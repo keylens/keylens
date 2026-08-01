@@ -1,6 +1,7 @@
 //! Connection, capability probing and vendor detection for keylens.
 //!
-//! Everything that talks to Redis or Valkey goes through [`Conn`]. See its docs for the
+//! Everything that talks to a Redis-compatible server -- Redis, Valkey, Recached and
+//! friends -- goes through [`Conn`]. See its docs for the
 //! invariants that buys us.
 
 pub mod capability;

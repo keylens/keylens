@@ -11,9 +11,9 @@
 # (roughly 75+ stars / 30+ forks, or comparable evidence of use). Until then the
 # tap is the route.
 class Keylens < Formula
-  desc "TUI for Redis and Valkey that understands your keys"
+  desc "TUI for Redis, Valkey and Recached that understands your keys"
   homepage "https://github.com/keylens/keylens"
-  version "0.1.0"
+  version "0.1.1"
   license "Apache-2.0"
 
   on_macos do

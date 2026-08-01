@@ -1,4 +1,4 @@
-//! keylens -- a TUI for Redis and Valkey that understands your keys.
+//! keylens -- a TUI for Redis, Valkey and Recached that understands your keys.
 //!
 //! v0.1 is read-only by construction. That is a feature: it means you can point it at
 //! production on day one.
@@ -15,14 +15,15 @@ const DEFAULT_URL: &str = "redis://127.0.0.1:6379";
 #[command(
     name = "keylens",
     version,
-    about = "A TUI for Redis and Valkey that understands your keys"
+    about = "A TUI for Redis, Valkey and Recached that understands your keys"
 )]
 struct Cli {
     /// Connection URL. Supports redis://, rediss://, redis-sentinel://, redis-cluster://
     #[arg(short, long, env = "KEYLENS_URL", global = true)]
     url: Option<String>,
 
-    /// Name of a connection from ~/.config/keylens/config.toml
+    /// Name of a connection from your config file. Run `keylens connections` to see them
+    /// and the exact path on this platform.
     #[arg(short, long, global = true)]
     name: Option<String>,
 

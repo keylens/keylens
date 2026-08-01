@@ -75,7 +75,7 @@ let detections = registry.detect_all(&conn).await; // strongest confidence first
 
 Pure key-layout logic (name parsing, key building, state→command mapping) should be unit
 tested with no Redis. Anything touching a live server belongs in the integration harness
-so it runs across the whole vendor matrix — Redis, Valkey, Dragonfly.
+so it runs across the whole vendor matrix — Redis, Valkey, Recached, Dragonfly.
 
 If your lens targets a library with its own test fixtures, drive the **real library** in
 `fixtures/` and assert your model matches what that library reports. That's what catches

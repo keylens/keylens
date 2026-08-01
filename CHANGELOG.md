@@ -5,9 +5,34 @@ All notable changes to keylens are documented here.
 The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
-## [Unreleased]
 
-## [0.1.0] — unreleased
+## [0.1.1] — 2026-08-01
+
+Documentation and presentation. No behaviour changes to the browser, the lens system, or
+anything that talks to a server.
+
+### Added
+
+- A full **Installation** section: Homebrew, the install script and its `VERSION` /
+  `INSTALL_DIR` knobs, `cargo install`, per-platform archives, checksum verification, and
+  building from source.
+- A full **Usage** section: connection URL forms, named connections with the config path
+  for each platform, every command, a complete key reference per view, and the
+  environment variables.
+- `docs/demo.tape` — the README demo is rendered from a script, so it stays honest as the
+  UI changes.
+
+### Changed
+
+- keylens is described as a TUI for **Redis, Valkey and Recached** throughout, matching
+  what v0.1.0 actually supports.
+- `--name` help no longer hardcodes a Linux config path that is wrong on macOS and
+  Windows; it points at `keylens connections`, which prints the real one.
+- The splash falls back to a short tagline on terminals narrower than the full line. The
+  splash does not wrap, so the longer three-vendor tagline would otherwise be cut
+  mid-word.
+
+## [0.1.0] — 2026-08-01
 
 First release. **Read-only by construction** — safe to point at production.
 
@@ -60,8 +85,6 @@ First release. **Read-only by construction** — safe to point at production.
 - `KEYS`, `FLUSHALL`, `FLUSHDB`, `MONITOR`, `DEBUG`, `HGETALL` and `SMEMBERS` are never
   issued. A workspace test fails the build if any appears in source — an unbounded
   collection read blocks a production server exactly as hard as `KEYS` does.
-- Vendor is detected from `INFO server_name`, never assumed: Redis, Valkey, Dragonfly,
-  KeyDB and Garnet are distinguished at runtime.
 
 ### Interface
 
@@ -75,5 +98,6 @@ First release. **Read-only by construction** — safe to point at production.
 - In the browser, logs go to `KEYLENS_LOG_FILE` or nowhere — never to stderr, which would
   paint over the rendered frame.
 
-[Unreleased]: https://github.com/keylens/keylens/compare/v0.1.0...HEAD
+[Unreleased]: https://github.com/keylens/keylens/compare/v0.1.1...HEAD
+[0.1.1]: https://github.com/keylens/keylens/releases/tag/v0.1.1
 [0.1.0]: https://github.com/keylens/keylens/releases/tag/v0.1.0
