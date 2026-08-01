@@ -1058,3 +1058,66 @@ async fn the_batched_key_read_agrees_with_the_sequential_one() {
         conn.cmd("DEL", vec![key.into()]).await.ok();
     }
 }
+
+/// The one-round-trip read must agree with the sequential path it replaced, for every type.
+///
+/// This is the test that matters for `read_key`. Its whole design is that five of its six
+/// speculative commands fail with `WRONGTYPE`, and a slot-mapping mistake does not produce
+/// an error -- it produces a *plausible* answer, a hash reporting a list's length, with
+/// every individual reply well-formed. Only comparing against the slow path catches that.
+#[tokio::test]
+#[ignore = "requires docker compose fixtures"]
+async fn a_one_round_trip_read_agrees_with_the_sequential_one() {
+    let conn = conn().await;
+
+    let seed: Vec<(&'static str, &'static str, Vec<&'static str>)> = vec![
+        ("keylens:rk:str", "SET", vec!["hello world"]),
+        ("keylens:rk:hash", "HSET", vec!["a", "1", "b", "2"]),
+        ("keylens:rk:list", "RPUSH", vec!["x", "y", "z"]),
+        ("keylens:rk:set", "SADD", vec!["m1", "m2"]),
+        ("keylens:rk:zset", "ZADD", vec!["1.5", "alpha"]),
+        ("keylens:rk:stream", "XADD", vec!["*", "event", "completed"]),
+    ];
+    for (key, cmd, args) in &seed {
+        let mut argv: Vec<keylens_conn::Value> = vec![(*key).into()];
+        argv.extend(args.iter().map(|a| (*a).into()));
+        conn.cmd(cmd, argv).await.unwrap();
+    }
+    conn.cmd("EXPIRE", vec!["keylens:rk:str".into(), 600.into()])
+        .await
+        .unwrap();
+
+    for (key, _, _) in &seed {
+        let (meta, value) = conn.read_key(key).await.unwrap();
+
+        // The sequential path, computed independently.
+        let head = conn.key_head(key).await.unwrap();
+        let size = conn.key_size(key, head.kind).await.unwrap();
+        let expected = conn.read_value(key, head.kind, 0).await.unwrap();
+
+        assert_eq!(meta.kind, head.kind, "{key}: wrong type");
+        assert_eq!(
+            meta.size, size,
+            "{key}: wrong size -- check the slot mapping"
+        );
+        assert_eq!(meta.ttl_ms.is_some(), head.ttl_ms.is_some(), "{key}: ttl");
+        assert_eq!(
+            format!("{value:?}"),
+            format!("{expected:?}"),
+            "{key}: speculative value differs from the sequential read"
+        );
+        assert!(!value.is_empty(), "{key}: read nothing back");
+    }
+
+    // A key that does not exist reads as missing, not as an error and not as an empty
+    // value of whatever type the previous key happened to be.
+    let (meta, value) = conn.read_key("keylens:rk:nope").await.unwrap();
+    assert_eq!(meta.kind, Kind::None);
+    assert_eq!(meta.size, 0);
+    assert!(meta.ttl_ms.is_none());
+    assert!(matches!(value, KeyValue::Missing), "{value:?}");
+
+    for (key, _, _) in &seed {
+        conn.cmd("UNLINK", vec![(*key).into()]).await.ok();
+    }
+}

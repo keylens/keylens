@@ -17,6 +17,27 @@ pub const PAGE: usize = 200;
 /// Cap on a single string value. Longer strings are truncated with a marker.
 pub const MAX_STRING_BYTES: usize = 64 * 1024;
 
+/// The types [`Conn::read_key`] speculates over, in the order its pipeline sends them.
+///
+/// Both the size block and the value block follow this order and [`Kind::slot`] indexes
+/// into both, so the ordering lives here and nowhere else.
+const SPECULATIVE_KINDS: [Kind; 6] = [
+    Kind::String,
+    Kind::Hash,
+    Kind::List,
+    Kind::Set,
+    Kind::ZSet,
+    Kind::Stream,
+];
+
+// Fixed slots in the speculative pipeline. `MEMORY USAGE` is conditional, so it goes
+// *last* — that way including or omitting it cannot shift anything else.
+const SLOT_TYPE: usize = 0;
+const SLOT_PTTL: usize = 1;
+const SIZE_BASE: usize = 2;
+const VALUE_BASE: usize = SIZE_BASE + SPECULATIVE_KINDS.len();
+const SLOT_MEMORY: usize = VALUE_BASE + SPECULATIVE_KINDS.len();
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Kind {
     String,
@@ -68,6 +89,12 @@ impl Kind {
             Kind::None => "-",
             Kind::Other => "?",
         }
+    }
+
+    /// Position of this type in [`SPECULATIVE_KINDS`], and so in both blocks of the
+    /// speculative pipeline. `None` for the types it does not speculate over.
+    fn slot(&self) -> Option<usize> {
+        SPECULATIVE_KINDS.iter().position(|k| k == self)
     }
 
     /// Command that reports how many elements the key holds.
@@ -246,6 +273,117 @@ impl Conn {
         })
     }
 
+    /// Everything the detail pane needs about a key, in **one round trip**.
+    ///
+    /// Type, TTL, memory, size and the first page of the value all come back together.
+    /// Done sequentially this is three round trips, because both the size command and the
+    /// read command depend on the type — which is why this asks for *every* type's size
+    /// and value at once and keeps only the pair the type turns out to justify.
+    ///
+    /// The five wrong ones fail with `WRONGTYPE`, which Redis rejects on the type check
+    /// before doing any work at all: they cost a few bytes on the wire and nothing on the
+    /// server. [`Conn::pipeline`] already reports per-command results, so their failure is
+    /// ordinary rather than fatal.
+    ///
+    /// At 35ms this saves 70ms nobody notices. Against a managed endpoint measured at
+    /// 390ms it is the difference between a key opening in 0.4s and in 1.2s, on every
+    /// single keypress — which is what makes browsing feel broken rather than distant.
+    pub async fn read_key(&self, key: &str) -> Result<(KeyMeta, KeyValue)> {
+        // Speculation only pays when the bounded reads exist for every type. Without them
+        // strings and collections need a measure-then-read *pair* that cannot be
+        // pipelined, so those servers take the sequential path and keep the guarantee that
+        // matters more than the round trip: no unbounded read, ever.
+        if !(self.capabilities().has(Feature::GetRange)
+            && self.capabilities().has(Feature::CursorCollectionScan))
+        {
+            return self.read_key_sequentially(key).await;
+        }
+
+        let want_memory = self.capabilities().has(Feature::MemoryStats);
+
+        let mut cmds: Vec<(&'static str, Vec<Value>)> = Vec::with_capacity(SLOT_MEMORY + 1);
+        cmds.push(("TYPE", vec![key.into()]));
+        cmds.push(("PTTL", vec![key.into()]));
+        for kind in SPECULATIVE_KINDS {
+            cmds.push((size_cmd_or_filler(kind), vec![key.into()]));
+        }
+        for kind in SPECULATIVE_KINDS {
+            cmds.push(value_cmd(kind, key));
+        }
+        if want_memory {
+            cmds.push(("MEMORY", vec!["USAGE".into(), key.into()]));
+        }
+
+        let replies = self.pipeline(&cmds).await?;
+        let at = |i: usize| replies.get(i).and_then(|r| r.as_ref().ok());
+
+        let kind = at(SLOT_TYPE)
+            .map(|v| Kind::parse(&display_string(v)))
+            .unwrap_or(Kind::None);
+        // PTTL: -1 = no expiry, -2 = key gone. Both mean "nothing to show".
+        let ttl_raw = at(SLOT_PTTL).and_then(|v| v.as_i64()).unwrap_or(-1);
+        let slot = kind.slot();
+
+        let meta = KeyMeta {
+            key: key.into(),
+            kind,
+            ttl_ms: (ttl_raw >= 0).then_some(ttl_raw),
+            // A size that failed is a missing number, not a missing key.
+            size: slot
+                .and_then(|s| at(SIZE_BASE + s))
+                .and_then(|v| v.as_u64())
+                .unwrap_or(0),
+            // MEMORY USAGE is blocked on several managed hosts; absence is not an error.
+            memory: want_memory
+                .then(|| at(SLOT_MEMORY).and_then(|v| v.as_u64()))
+                .flatten(),
+        };
+
+        let value = match slot.and_then(|s| at(VALUE_BASE + s)) {
+            Some(reply) => decode_value(kind, reply)?,
+            None => absent(kind),
+        };
+
+        Ok((meta, value))
+    }
+
+    /// The three-round-trip path, for servers without the bounded read commands.
+    ///
+    /// Still collapsed where it can be: the size and the value both need the type but not
+    /// each other, so they go out together.
+    async fn read_key_sequentially(&self, key: &str) -> Result<(KeyMeta, KeyValue)> {
+        let head = self.key_head(key).await?;
+
+        if head.kind == Kind::None {
+            return Ok((
+                KeyMeta {
+                    key: key.into(),
+                    kind: head.kind,
+                    ttl_ms: None,
+                    size: 0,
+                    memory: None,
+                },
+                KeyValue::Missing,
+            ));
+        }
+
+        let (size, value) = tokio::join!(
+            self.key_size(key, head.kind),
+            self.read_value(key, head.kind, 0),
+        );
+
+        Ok((
+            KeyMeta {
+                key: key.into(),
+                kind: head.kind,
+                ttl_ms: head.ttl_ms,
+                size: size.unwrap_or(0),
+                memory: head.memory,
+            },
+            value?,
+        ))
+    }
+
     /// Read up to [`PAGE`] elements starting at `offset`.
     ///
     /// `offset` is honoured exactly for the ordered types (list, zset, stream), which is
@@ -272,16 +410,7 @@ impl Conn {
                             vec![key.into(), 0.into(), (MAX_STRING_BYTES as i64 - 1).into()],
                         )
                         .await?;
-                    // Measure the *reply*, not the rendered text. `display_string` turns a
-                    // binary payload into `<N bytes> …200 chars`, which is far shorter than
-                    // the bytes it stands for -- so checking the rendered length silently
-                    // dropped the marker on exactly the values most likely to be truncated.
-                    let truncated = reply_byte_len(&reply) >= MAX_STRING_BYTES;
-                    let mut s = display_string(&reply);
-                    if truncated {
-                        s.push_str("\n\n... truncated ...");
-                    }
-                    KeyValue::String(s)
+                    decode_string(&reply)
                 } else if size_ok(self, key, "STRLEN", MAX_STRING_BYTES).await? {
                     // No GETRANGE on this server. STRLEN first, then a whole GET only if
                     // the value is small enough -- the bound is preserved, just measured
@@ -321,7 +450,7 @@ impl Conn {
                             vec![key.into(), "0".into(), "COUNT".into(), (PAGE as i64).into()],
                         )
                         .await?;
-                    KeyValue::Hash(as_field_pairs(&scan_items(&reply)?))
+                    decode_hash(&reply)?
                 } else if size_ok(self, key, "HLEN", PAGE).await? {
                     KeyValue::Hash(whole_collection(self, key, "HGETALL").await?)
                 } else {
@@ -341,7 +470,7 @@ impl Conn {
                             vec![key.into(), "0".into(), "COUNT".into(), (PAGE as i64).into()],
                         )
                         .await?;
-                    KeyValue::Set(scan_items(&reply)?.iter().map(display_string).collect())
+                    decode_set(&reply)?
                 } else if size_ok(self, key, "SCARD", PAGE).await? {
                     let reply = self.cmd("SMEMBERS", vec![key.into()]).await?;
                     KeyValue::Set(as_string_vec(&reply))
@@ -370,13 +499,109 @@ impl Conn {
                 KeyValue::Stream(as_stream_entries(&reply))
             }
 
-            Kind::Other => {
-                KeyValue::Unsupported("module type -- no viewer for this key yet".to_string())
-            }
+            Kind::Other => absent(Kind::Other),
         };
 
         Ok(value)
     }
+}
+
+/// The size command for a type that [`Conn::read_key`] speculates over.
+///
+/// Every [`SPECULATIVE_KINDS`] entry has one, so the filler is unreachable in practice.
+/// It exists because the pipeline's slots are positional: returning nothing here would
+/// shorten the reply list and silently misalign every field after it. A harmless `TYPE`
+/// holds the slot, and [`Kind::slot`] never points at it anyway.
+fn size_cmd_or_filler(kind: Kind) -> &'static str {
+    kind.size_cmd().unwrap_or("TYPE")
+}
+
+/// The bounded first-page read for one type. Same slot-holding rule as
+/// [`size_cmd_or_filler`].
+fn value_cmd(kind: Kind, key: &str) -> (&'static str, Vec<Value>) {
+    let stop = PAGE as i64 - 1;
+    let count = PAGE as i64;
+    match kind {
+        // GETRANGE, not GET: a 500MB string must not be pulled into the TUI.
+        Kind::String => (
+            "GETRANGE",
+            vec![key.into(), 0.into(), (MAX_STRING_BYTES as i64 - 1).into()],
+        ),
+        Kind::Hash => (
+            "HSCAN",
+            vec![key.into(), "0".into(), "COUNT".into(), count.into()],
+        ),
+        Kind::List => ("LRANGE", vec![key.into(), 0.into(), stop.into()]),
+        Kind::Set => (
+            "SSCAN",
+            vec![key.into(), "0".into(), "COUNT".into(), count.into()],
+        ),
+        Kind::ZSet => (
+            "ZRANGE",
+            vec![key.into(), 0.into(), stop.into(), "WITHSCORES".into()],
+        ),
+        Kind::Stream => (
+            "XRANGE",
+            vec![
+                key.into(),
+                "-".into(),
+                "+".into(),
+                "COUNT".into(),
+                count.into(),
+            ],
+        ),
+        _ => ("TYPE", vec![key.into()]),
+    }
+}
+
+/// Turn one type's reply into a value. The single decoder per type, shared by the
+/// speculative read and the sequential one.
+fn decode_value(kind: Kind, reply: &Value) -> Result<KeyValue> {
+    Ok(match kind {
+        Kind::String => decode_string(reply),
+        Kind::Hash => decode_hash(reply)?,
+        Kind::List => KeyValue::List(as_string_vec(reply)),
+        Kind::Set => decode_set(reply)?,
+        Kind::ZSet => KeyValue::ZSet(as_scored_pairs(reply)),
+        Kind::Stream => KeyValue::Stream(as_stream_entries(reply)),
+        Kind::None | Kind::Other => absent(kind),
+    })
+}
+
+/// What to show when there is no value to decode.
+fn absent(kind: Kind) -> KeyValue {
+    match kind {
+        Kind::Other => {
+            KeyValue::Unsupported("module type -- no viewer for this key yet".to_string())
+        }
+        // Either the key is gone, or its read failed because the type changed between the
+        // `TYPE` in the pipeline and the read a few commands later. Both mean there is
+        // nothing to render for the type we were told about.
+        _ => KeyValue::Missing,
+    }
+}
+
+fn decode_string(reply: &Value) -> KeyValue {
+    // Measure the *reply*, not the rendered text. `display_string` turns a binary payload
+    // into `<N bytes> …200 chars`, which is far shorter than the bytes it stands for -- so
+    // checking the rendered length silently dropped the marker on exactly the values most
+    // likely to be truncated.
+    let truncated = reply_byte_len(reply) >= MAX_STRING_BYTES;
+    let mut s = display_string(reply);
+    if truncated {
+        s.push_str("\n\n... truncated ...");
+    }
+    KeyValue::String(s)
+}
+
+fn decode_hash(reply: &Value) -> Result<KeyValue> {
+    Ok(KeyValue::Hash(as_field_pairs(&scan_items(reply)?)))
+}
+
+fn decode_set(reply: &Value) -> Result<KeyValue> {
+    Ok(KeyValue::Set(
+        scan_items(reply)?.iter().map(display_string).collect(),
+    ))
 }
 
 /// Byte length of a reply, before it is rendered for display.
@@ -501,6 +726,74 @@ mod tests {
         assert_eq!(Kind::parse("none"), Kind::None);
         // An unknown type is a module type, not a bug -- render a placeholder, don't panic.
         assert_eq!(Kind::parse("ReJSON-RL"), Kind::Other);
+    }
+
+    #[test]
+    fn speculative_slots_line_up_with_the_pipeline_that_fills_them() {
+        // The reply list is positional: slot `SIZE_BASE + n` is only the size of
+        // `SPECULATIVE_KINDS[n]` for as long as both blocks are built from that array in
+        // that order. Get this wrong and a hash reports a list's length -- with no error
+        // anywhere, because every reply is individually well-formed.
+        assert_eq!(SIZE_BASE, 2, "TYPE and PTTL come first");
+        assert_eq!(VALUE_BASE, SIZE_BASE + SPECULATIVE_KINDS.len());
+        assert_eq!(SLOT_MEMORY, VALUE_BASE + SPECULATIVE_KINDS.len());
+
+        for (i, kind) in SPECULATIVE_KINDS.iter().enumerate() {
+            assert_eq!(kind.slot(), Some(i), "{kind:?} indexes the wrong slot");
+        }
+
+        // The types with no slot must never index into either block.
+        for kind in [Kind::None, Kind::Other] {
+            assert_eq!(kind.slot(), None, "{kind:?} must not claim a slot");
+        }
+    }
+
+    #[test]
+    fn every_speculated_kind_has_a_real_size_and_value_command() {
+        // Both helpers fall back to a `TYPE` filler so a missing entry cannot shorten the
+        // pipeline and misalign it. That filler is a safety net, not a plan: if one of
+        // these types ever reaches it, the pane silently shows a type name where a value
+        // should be.
+        for kind in SPECULATIVE_KINDS {
+            assert_ne!(
+                size_cmd_or_filler(kind),
+                "TYPE",
+                "{kind:?} fell back to the slot filler instead of a real size command"
+            );
+            assert_ne!(
+                value_cmd(kind, "k").0,
+                "TYPE",
+                "{kind:?} fell back to the slot filler instead of a real read command"
+            );
+        }
+    }
+
+    #[test]
+    fn speculative_reads_are_all_bounded() {
+        // The crate's one hard rule: no unbounded collection read, ever. Speculating over
+        // six types at once multiplies the cost of getting this wrong by six.
+        const UNBOUNDED: [&str; 4] = ["GET", "HGETALL", "SMEMBERS", "LRANGE_ALL"];
+        for kind in SPECULATIVE_KINDS {
+            let (cmd, args) = value_cmd(kind, "k");
+            assert!(
+                !UNBOUNDED.contains(&cmd),
+                "{kind:?} speculates with the unbounded command {cmd}"
+            );
+            let rendered: Vec<String> = args.iter().map(display_string).collect();
+            assert!(
+                rendered.iter().any(|a| a == "COUNT")
+                    || rendered.iter().any(|a| a.parse::<i64>().is_ok()),
+                "{kind:?} has neither a COUNT nor a range bound: {rendered:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn a_module_type_is_unsupported_not_missing() {
+        // These render very differently, and confusing them tells someone their key is
+        // gone when it is merely a type keylens has no viewer for.
+        assert!(matches!(absent(Kind::Other), KeyValue::Unsupported(_)));
+        assert!(matches!(absent(Kind::None), KeyValue::Missing));
     }
 
     #[test]

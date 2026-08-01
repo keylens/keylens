@@ -18,16 +18,48 @@ use crate::worker::{Request, Update, Worker};
 /// Bounded so a burst of keystrokes applies backpressure instead of queuing unbounded
 /// scan work the user has already scrolled past.
 const CHANNEL_SIZE: usize = 32;
-/// Server stats refresh interval.
-const INFO_TICK: Duration = Duration::from_secs(5);
+/// Bounds on the server stats refresh. The interval between them is derived from the
+/// measured round trip -- see [`info_tick`].
+const INFO_TICK_MIN: Duration = Duration::from_secs(5);
+const INFO_TICK_MAX: Duration = Duration::from_secs(60);
+/// How many round trips apart to space stats refreshes.
+const INFO_TICK_RTTS: u32 = 20;
+
+/// Bounds on the selection debounce. See [`select_debounce`].
+const SELECT_DEBOUNCE_MIN: Duration = Duration::from_millis(90);
+const SELECT_DEBOUNCE_MAX: Duration = Duration::from_millis(400);
+
+/// How often to refresh server stats, given how far away the server is.
+///
+/// `INFO` returns several KB and costs a round trip the key browser wants. On localhost a
+/// fixed 5s tick is free. Against a server measured at 390ms it spends a fifth of the
+/// connection on stats nobody is looking at, and at the 1.2s that same link averaged under
+/// packet loss the refreshes no longer even fit between ticks.
+fn info_tick(rtt: Duration) -> Duration {
+    if rtt.is_zero() {
+        // Zero means the PING failed, not that the server is infinitely close.
+        return INFO_TICK_MIN;
+    }
+    (rtt * INFO_TICK_RTTS).clamp(INFO_TICK_MIN, INFO_TICK_MAX)
+}
 
 /// How long the cursor must sit still before the key under it is fetched.
 ///
-/// Reading a key is several round trips, so fetching on every cursor move means holding
-/// `j` for a second queues dozens of them — and against a remote server every reply but
-/// the last is thrown away as stale anyway. Short enough to feel immediate on a deliberate
-/// move, long enough that scrolling through a list costs one request at the end of it.
-const SELECT_DEBOUNCE: Duration = Duration::from_millis(90);
+/// Reading a key is a round trip, so fetching on every cursor move means holding `j` for a
+/// second queues dozens of them — and against a remote server every reply but the last is
+/// thrown away as stale anyway. Short enough to feel immediate on a deliberate move, long
+/// enough that scrolling through a list costs one request at the end of it.
+///
+/// Scaled by distance because the right answer is not a constant: at 35ms a 90ms wait is
+/// most of the cost of the fetch, while at 390ms it is noise next to a round trip the user
+/// is going to wait for regardless — and there, one wasted fetch is worth far more than
+/// the 100ms spent avoiding it.
+fn select_debounce(rtt: Duration) -> Duration {
+    if rtt.is_zero() {
+        return SELECT_DEBOUNCE_MIN;
+    }
+    (rtt / 2).clamp(SELECT_DEBOUNCE_MIN, SELECT_DEBOUNCE_MAX)
+}
 
 /// Deadline for the browser's connect.
 ///
@@ -59,6 +91,9 @@ pub async fn run(target: &Target) -> Result<()> {
     };
 
     let server = conn.server().clone();
+    // Read before the worker takes ownership. Everything the event loop paces itself by is
+    // derived from this one measurement.
+    let rtt = conn.rtt();
 
     let (req_tx, req_rx) = mpsc::channel::<Request>(CHANNEL_SIZE);
     let (up_tx, mut up_rx) = mpsc::channel::<Update>(CHANNEL_SIZE);
@@ -85,7 +120,7 @@ pub async fn run(target: &Target) -> Result<()> {
         task: None,
     };
 
-    let result = event_loop(&mut terminal, &mut app, &mut up_rx, &req_tx, streamer).await;
+    let result = event_loop(&mut terminal, &mut app, &mut up_rx, &req_tx, streamer, rtt).await;
     ratatui::restore();
 
     // `app` owns a clone of the request sender and outlives this scope, so dropping this
@@ -244,9 +279,11 @@ async fn event_loop(
     updates: &mut mpsc::Receiver<Update>,
     requests: &mpsc::Sender<Request>,
     mut streamer: StreamerHandle,
+    rtt: Duration,
 ) -> Result<()> {
     let mut events = EventStream::new();
-    let mut info_tick = tokio::time::interval(INFO_TICK);
+    let debounce = select_debounce(rtt);
+    let mut info_tick = tokio::time::interval(info_tick(rtt));
     info_tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
 
     // When the pending selection should be fetched. Pushed back by every keypress, so a
@@ -272,7 +309,7 @@ async fn event_loop(
                 app.flush_selection().await;
                 // Still pending means the worker was saturated; come back to it.
                 if app.selection_pending() {
-                    fetch_at = Some(tokio::time::Instant::now() + SELECT_DEBOUNCE);
+                    fetch_at = Some(tokio::time::Instant::now() + debounce);
                 }
                 dirty = true;
             }
@@ -282,7 +319,7 @@ async fn event_loop(
                     Some(Ok(Event::Key(key))) if key.kind == KeyEventKind::Press => {
                         app.handle_key(key).await;
                         if app.selection_pending() {
-                            fetch_at = Some(tokio::time::Instant::now() + SELECT_DEBOUNCE);
+                            fetch_at = Some(tokio::time::Instant::now() + debounce);
                         }
                         dirty = true;
                     }
@@ -317,5 +354,44 @@ async fn event_loop(
         if dirty {
             terminal.draw(|f| ui::draw(f, app))?;
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn pacing_scales_with_distance() {
+        // The two links this was tuned against: a droplet at 35ms and a managed endpoint
+        // at 390ms, both DigitalOcean, measured from the same machine.
+        let near = Duration::from_millis(35);
+        let far = Duration::from_millis(390);
+
+        // Near, the floors win -- there is nothing to save by backing off.
+        assert_eq!(info_tick(near), INFO_TICK_MIN);
+        assert_eq!(select_debounce(near), SELECT_DEBOUNCE_MIN);
+
+        // Far, both back off, because a round trip is now a scarce resource.
+        assert!(info_tick(far) > INFO_TICK_MIN);
+        assert!(select_debounce(far) > SELECT_DEBOUNCE_MIN);
+    }
+
+    #[test]
+    fn a_failed_ping_falls_back_to_the_floor_not_to_zero() {
+        // `Conn::rtt` reports zero when the PING did not come back. Reading that as "this
+        // server is infinitely close" would pick the most aggressive pacing for a server
+        // we know least about.
+        assert_eq!(info_tick(Duration::ZERO), INFO_TICK_MIN);
+        assert_eq!(select_debounce(Duration::ZERO), SELECT_DEBOUNCE_MIN);
+    }
+
+    #[test]
+    fn pacing_is_capped_so_a_terrible_link_still_refreshes() {
+        // Backing off without a ceiling means a link bad enough stops updating entirely,
+        // which reads as a frozen UI rather than a slow one.
+        let awful = Duration::from_secs(10);
+        assert_eq!(info_tick(awful), INFO_TICK_MAX);
+        assert_eq!(select_debounce(awful), SELECT_DEBOUNCE_MAX);
     }
 }

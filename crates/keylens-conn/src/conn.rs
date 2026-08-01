@@ -8,6 +8,8 @@
 //! * Every call is capability-aware, so managed hosts degrade instead of erroring.
 
 use fred::prelude::*;
+use fred::socket2::TcpKeepalive;
+use fred::types::config::UnresponsiveConfig;
 use fred::types::{ClusterHash, CustomCommand};
 use tracing::debug;
 
@@ -40,11 +42,35 @@ const PROBE_KEY: &str = "keylens:__probe__";
 /// status and lets the user cancel; this value only has to stop `probe` hanging silently.
 pub const DEFAULT_CONNECT_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(20);
 
+/// Ceiling on any single command once the connection is up.
+///
+/// fred defaults this to zero, which means *no* timeout: a reply that never arrives is
+/// awaited forever. That is not hypothetical on a lossy link — a DigitalOcean managed
+/// endpoint measured at 390ms best case answered 9.7s at worst, and a connection silently
+/// dropped by the load balancer in front of it never answers at all. One unbounded await
+/// is enough to wedge a whole task.
+///
+/// Generous, so it does not fire on a link that is slow but alive. Finite, so a dead one
+/// surfaces as an error the user can see instead of a pane that says `loading…` forever.
+pub const COMMAND_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(20);
+
+/// How long a connection may go without answering anything before it is torn down.
+///
+/// Above [`COMMAND_TIMEOUT`] on purpose: an individual command should time out and report
+/// itself first. This is the backstop for a socket that is half-open — one that accepted
+/// our bytes and will never reply — which fred otherwise never notices.
+const UNRESPONSIVE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(30);
+
+/// TCP keepalive idle time, so a connection dropped by a NAT or a load balancer is
+/// discovered by the kernel rather than by the user's next keypress.
+const KEEPALIVE_IDLE: std::time::Duration = std::time::Duration::from_secs(30);
+
 pub struct Conn {
     client: Client,
     server: ServerInfo,
     caps: Capabilities,
     label: String,
+    rtt: std::time::Duration,
 }
 
 impl Conn {
@@ -66,6 +92,10 @@ impl Conn {
     ) -> Result<Self> {
         let config = Config::from_url(url).map_err(|e| ConnError::Url(e.to_string()))?;
         let client = Builder::from_config(config)
+            .with_performance_config(|c| {
+                // See COMMAND_TIMEOUT: fred's default here is "wait forever".
+                c.default_command_timeout = COMMAND_TIMEOUT;
+            })
             .with_connection_config(|c| {
                 // Generous, because these are *per-step* limits and the client's own
                 // handshake is already four round trips (PING, CLIENT ID, INFO, ROLE).
@@ -75,7 +105,29 @@ impl Conn {
                 // job; these only need to stop a wedged socket waiting forever.
                 c.connection_timeout = std::time::Duration::from_secs(30);
                 c.internal_command_timeout = std::time::Duration::from_secs(30);
+
+                // Nagle holds a small write back hoping for more to coalesce; the peer's
+                // delayed ACK holds the reply that would release it. A request/response
+                // protocol never has anything to coalesce, so the pair buys nothing and
+                // costs tens of milliseconds on every command. Every serious Redis client
+                // disables it; fred leaves it to the OS unless asked.
+                c.tcp.nodelay = Some(true);
+                c.tcp.keepalive = Some(TcpKeepalive::new().with_time(KEEPALIVE_IDLE));
+
+                // Without this fred has no way to notice a half-open socket, so a command
+                // sent into one is awaited until COMMAND_TIMEOUT and every reconnect that
+                // would have fixed it never happens.
+                c.unresponsive = UnresponsiveConfig {
+                    max_timeout: Some(UNRESPONSIVE_TIMEOUT),
+                    ..Default::default()
+                };
             })
+            // `Builder::from_config` leaves the reconnect policy unset, so a dropped
+            // connection stayed dropped: every later command failed against a client that
+            // would never try to come back. Unlimited attempts, backing off to 10s, is the
+            // right shape for a TUI someone leaves open — but only because
+            // COMMAND_TIMEOUT now bounds the wait, so retrying cannot mean hanging.
+            .set_policy(ReconnectPolicy::new_exponential(0, 100, 10_000, 2))
             .build()
             .map_err(ConnError::Connect)?;
 
@@ -91,6 +143,12 @@ impl Conn {
             // A server answering with non-RESP bytes (a TLS alert, say) fails here with
             // `Protocol Error: Expected string`, which tells the user nothing on its own.
             client.init().await.map_err(|e| classify_connect(url, e))?;
+
+            // One timed `PING`, so everything downstream can size itself against how far
+            // away this server actually is rather than against a constant tuned on
+            // localhost. Costs one round trip here and saves many later: the stats refresh
+            // and the selection debounce are both derived from it.
+            let rtt = measure_rtt(&client).await;
 
             // A missing `INFO` must not stop us connecting. Some Redis-compatible servers
             // don't implement it at all, and locked-down managed hosts block it -- in both
@@ -110,10 +168,10 @@ impl Conn {
             {
                 caps.set(Feature::ServerInfo, Availability::Available);
             }
-            Ok::<_, ConnError>((server, caps))
+            Ok::<_, ConnError>((server, caps, rtt))
         };
 
-        let (server, caps) = match tokio::time::timeout(timeout, handshake).await {
+        let (server, caps, rtt) = match tokio::time::timeout(timeout, handshake).await {
             Ok(Ok(v)) => v,
             Ok(Err(e)) => {
                 // Stop the background reconnect loop, or it keeps the process alive after
@@ -132,12 +190,21 @@ impl Conn {
             server,
             caps,
             label: label.into(),
+            rtt,
         })
     }
 
     /// Whether this server answered `INFO` at all.
     pub fn has_server_info(&self) -> bool {
         self.caps.has(Feature::ServerInfo)
+    }
+
+    /// Measured round trip to this server, from a single `PING` at connect time.
+    ///
+    /// Zero when the server did not answer it, which callers must read as "no measurement"
+    /// and fall back to their own floor — never as "this server is infinitely close".
+    pub fn rtt(&self) -> std::time::Duration {
+        self.rtt
     }
 
     pub fn label(&self) -> &str {
@@ -270,6 +337,28 @@ fn classify_from(e: &ConnError) -> Availability {
     match e {
         ConnError::Command { source, .. } => classify(source),
         _ => Availability::Unsupported,
+    }
+}
+
+/// Time one `PING`.
+///
+/// A failure is reported as zero rather than an error: a server that will not answer
+/// `PING` is not one to size timings against, and refusing to connect over a missing
+/// *measurement* would be absurd.
+async fn measure_rtt(client: &Client) -> std::time::Duration {
+    let started = std::time::Instant::now();
+    match client
+        .custom::<Value, Value>(
+            CustomCommand::new_static("PING", ClusterHash::FirstKey, false),
+            vec![],
+        )
+        .await
+    {
+        Ok(_) => started.elapsed(),
+        Err(e) => {
+            debug!(error = %e, "PING failed; continuing without a latency measurement");
+            std::time::Duration::ZERO
+        }
     }
 }
 

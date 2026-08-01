@@ -5,6 +5,8 @@
 //! broken. So: the worker owns the [`Conn`] and the scan cursor, the UI owns the tree and
 //! the selection, and they exchange messages over bounded channels.
 
+use std::sync::Arc;
+
 use keylens_bullmq::{BullMqLens, EventsStatus, Job, JobRef, QueueSummary, State};
 use keylens_conn::{
     ClientInfo, ClusterTopology, Conn, Feature, KeyMeta, KeyValue, Kind, PubSubChannel, ServerInfo,
@@ -109,7 +111,7 @@ pub struct JobDetail {
 }
 
 pub struct Worker {
-    conn: Conn,
+    conn: Arc<Conn>,
     cursor: String,
     pattern: Option<String>,
     kind: Option<Kind>,
@@ -117,6 +119,24 @@ pub struct Worker {
     /// Re-created with the detected prefix once detection runs, so a keyspace using a
     /// custom BullMQ prefix works without configuration.
     bullmq: BullMqLens,
+    /// The key read currently in flight, if any. Held so a newer selection can cancel it.
+    detail_task: Option<tokio::task::JoinHandle<()>>,
+    /// The stats refresh currently in flight, so a slow `INFO` is never asked for twice
+    /// over.
+    info_task: Option<tokio::task::JoinHandle<()>>,
+}
+
+impl Drop for Worker {
+    fn drop(&mut self) {
+        // `run` consumes the worker, so this fires when the UI aborts it. The spawned
+        // tasks hold their own `Arc<Conn>` and would otherwise outlive the terminal.
+        for task in [self.detail_task.take(), self.info_task.take()]
+            .into_iter()
+            .flatten()
+        {
+            task.abort();
+        }
+    }
 }
 
 impl Worker {
@@ -129,7 +149,7 @@ impl Worker {
     /// like a server with no queues on it.
     pub fn with_prefix(conn: Conn, prefix: Option<String>) -> Self {
         Self {
-            conn,
+            conn: Arc::new(conn),
             cursor: "0".into(),
             pattern: None,
             kind: None,
@@ -138,6 +158,8 @@ impl Worker {
                 Some(p) => BullMqLens::new(p),
                 None => BullMqLens::default(),
             },
+            detail_task: None,
+            info_task: None,
         }
     }
 
@@ -155,17 +177,27 @@ impl Worker {
                 // when it asks for more; answering an already-finished scan with silence
                 // would leave the status bar spinning with nothing on the way.
                 Request::More => self.scan_batch(false).await,
-                Request::Select { key } => self.detail(&key).await,
+
+                // Reading a key runs on its own task, sharing the connection -- fred
+                // multiplexes, so this costs no second handshake.
+                //
+                // What it buys is that `Select` no longer queues behind `Rescan` or
+                // `Detect`, each of which walks up to 40 sequential `SCAN` pages. Against
+                // a server measured at 390ms that queue was sixteen seconds long, and
+                // every keypress made during it looked like a hang.
+                Request::Select { key } => {
+                    self.spawn_detail(key, &tx);
+                    continue;
+                }
+
                 Request::RefreshInfo => {
                     // Servers that don't implement `INFO` would otherwise fail this on
                     // every tick and paint the error over whatever pane is open.
                     if !self.conn.has_server_info() {
                         continue;
                     }
-                    match self.conn.refresh_info().await {
-                        Ok(info) => Update::Info(Box::new(info)),
-                        Err(e) => Update::Error(e.to_string()),
-                    }
+                    self.spawn_info(&tx);
+                    continue;
                 }
 
                 Request::LoadSlowlog => Update::Slowlog(
@@ -368,63 +400,70 @@ impl Worker {
         PaneState::Ready(Some(Box::new(JobDetail { job, logs })))
     }
 
-    /// Two round trips, not five.
+    /// Read one key on its own task, cancelling whatever read was already running.
     ///
-    /// `TYPE`/`PTTL`/`MEMORY USAGE` go in one pipeline; the size and the value both need
-    /// the type but not each other, so they go out together. Sequentially this was five
-    /// round trips per keypress -- over a second each against a managed host on another
-    /// continent, which is what made scrolling the tree feel broken.
-    async fn detail(&self, key: &str) -> Update {
-        let head = match self.conn.key_head(key).await {
-            Ok(h) => h,
-            Err(e) => return Update::Error(e.to_string()),
-        };
+    /// Cancelling is not just tidiness. The UI already discards a reply whose key is no
+    /// longer selected, so a superseded read was pure waste -- and on the link this exists
+    /// for, waste is measured in whole seconds of the only round trips available.
+    fn spawn_detail(&mut self, key: String, tx: &Sender<Update>) {
+        if let Some(task) = self.detail_task.take() {
+            task.abort();
+        }
 
-        if head.kind == Kind::None {
-            return Update::Detail {
-                meta: Box::new(KeyMeta {
-                    key: key.into(),
-                    kind: head.kind,
-                    ttl_ms: None,
-                    size: 0,
-                    memory: None,
-                }),
-                value: Box::new(KeyValue::Missing),
-                stream: None,
+        let conn = self.conn.clone();
+        let tx = tx.clone();
+        self.detail_task = Some(tokio::spawn(async move {
+            let update = detail(&conn, &key).await;
+            tx.send(update).await.ok();
+        }));
+    }
+
+    /// Refresh server stats on their own task, unless the last refresh is still out.
+    ///
+    /// Skipping rather than queueing matters once `INFO` takes longer than the tick: the
+    /// requests would otherwise stack up, each one spending a round trip the key browser
+    /// wanted.
+    fn spawn_info(&mut self, tx: &Sender<Update>) {
+        if self.info_task.as_ref().is_some_and(|t| !t.is_finished()) {
+            return;
+        }
+
+        let conn = self.conn.clone();
+        let tx = tx.clone();
+        self.info_task = Some(tokio::spawn(async move {
+            let update = match conn.refresh_info().await {
+                Ok(info) => Update::Info(Box::new(info)),
+                Err(e) => Update::Error(e.to_string()),
             };
-        }
+            tx.send(update).await.ok();
+        }));
+    }
+}
 
-        let (size, value) = tokio::join!(
-            self.conn.key_size(key, head.kind),
-            self.conn.read_value(key, head.kind, 0),
-        );
+/// One round trip, not five.
+///
+/// Type, TTL, memory, size and the first page of the value all arrive together -- see
+/// [`Conn::read_key`] for how, and why it is worth speculating over six types to get it.
+/// Sequentially this was five round trips per keypress, over a second each against a
+/// managed host on another continent, which is what made scrolling the tree feel broken.
+async fn detail(conn: &Conn, key: &str) -> Update {
+    let (meta, value) = match conn.read_key(key).await {
+        Ok(pair) => pair,
+        Err(e) => return Update::Error(e.to_string()),
+    };
 
-        let value = match value {
-            Ok(v) => v,
-            Err(e) => return Update::Error(e.to_string()),
-        };
-        let meta = KeyMeta {
-            key: key.into(),
-            kind: head.kind,
-            ttl_ms: head.ttl_ms,
-            // A size that failed is a missing number, not a missing key.
-            size: size.unwrap_or(0),
-            memory: head.memory,
-        };
+    // Consumer-group state is the reason to open a stream at all, but it's several extra
+    // round trips, so it's fetched only for streams. A failure here degrades to "entries
+    // only" rather than failing the whole key.
+    let stream = if meta.kind == Kind::Stream {
+        conn.stream_info(key).await.ok().map(Box::new)
+    } else {
+        None
+    };
 
-        // Consumer-group state is the reason to open a stream at all, but it's several
-        // extra round trips, so it's fetched only for streams. A failure here degrades to
-        // "entries only" rather than failing the whole key.
-        let stream = if meta.kind == Kind::Stream {
-            self.conn.stream_info(key).await.ok().map(Box::new)
-        } else {
-            None
-        };
-
-        Update::Detail {
-            meta: Box::new(meta),
-            value: Box::new(value),
-            stream,
-        }
+    Update::Detail {
+        meta: Box::new(meta),
+        value: Box::new(value),
+        stream,
     }
 }

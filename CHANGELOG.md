@@ -6,6 +6,49 @@ The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 
+## [0.1.4] — 2026-08-01
+
+Browsing a distant server is usable, and a dead connection says so instead of hanging.
+
+Measured against two DigitalOcean endpoints from the same machine: a droplet at 35ms with
+no loss, and a managed Valkey cluster at 390ms with heavy packet loss (PING averaged 1173ms
+and tailed to 9753ms). Everything below is aimed at the second one.
+
+### Fixed
+
+- **A command could be awaited forever.** fred defaults `default_command_timeout` to zero,
+  which means no timeout at all, and `Builder::from_config` leaves the reconnect policy
+  unset — so a connection dropped by the load balancer in front of a managed database
+  stayed dropped, and the request sent into it never returned. Because the worker handled
+  requests one at a time, that single stuck `await` stalled every key selected afterwards:
+  the value pane sat on `loading…` and never moved. Commands are now bounded at 20s, the
+  client reconnects with exponential backoff, and a half-open socket is detected rather
+  than waited on.
+- **`TCP_NODELAY` was never set.** Nagle held small writes waiting for more to coalesce
+  while the peer's delayed ACK held the reply that would release them. A request/response
+  protocol has nothing to coalesce, so this was pure added latency on every command. TCP
+  keepalive is now set too, so a connection dropped by a NAT is found by the kernel rather
+  than by the user's next keypress.
+
+### Changed
+
+- **Reading a key takes one round trip, down from three.** Both the size command and the
+  read command depend on the key's type, so they used to wait for `TYPE` to come back.
+  keylens now asks for every type's size and value at once and keeps the pair the type
+  turns out to justify — the five wrong ones fail with `WRONGTYPE`, which Redis rejects on
+  the type check before doing any work. At 35ms this saves 70ms nobody notices; at 390ms
+  it is the difference between a key opening in 0.4s and in 1.2s, on every keypress.
+- **Selecting a key no longer queues behind a scan.** `Rescan` and `Detect` each walk up to
+  40 sequential `SCAN` pages — sixteen seconds at 390ms — and every keypress made during
+  that wait used to sit in line behind them. Key reads now run on their own task over the
+  same multiplexed connection, and a superseded read is cancelled rather than left to spend
+  round trips on a reply the UI has already decided to discard.
+- **The stats refresh paces itself by distance.** A single timed `PING` at connect sizes
+  both the `INFO` tick and the selection debounce. A fixed 5s tick spent a fifth of a
+  390ms connection on stats nobody was looking at; refreshes now spread out as the server
+  gets further away, and are skipped entirely while the previous one is still outstanding.
+
+
 ## [0.1.3] — 2026-08-01
 
 Connecting to a distant server works, and you can watch it happen.
