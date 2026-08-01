@@ -108,7 +108,7 @@ jobs:
           cp target/${{ matrix.target }}/release/${{ env.BINARY_NAME }} dist/
           cp README.md LICENSE dist/
           tar -czf "${ASSET}.tar.gz" -C dist .
-          echo "ASSET=${ASSET}.tar.gz" >> $GITHUB_ENV
+          echo "ASSET=${ASSET}.tar.gz" >> "$GITHUB_ENV"
 
       - name: Package (zip — Windows)
         if: matrix.archive == 'zip'
@@ -245,14 +245,15 @@ jobs:
       - name: Generate checksums (SHA-256)
         run: |
           cd artifacts
-          sha256sum * > checksums.txt
+          # `--` so an asset whose name starts with a dash cannot be read as a flag.
+          sha256sum -- * > checksums.txt
           cat checksums.txt
 
       - name: Extract release notes from tag
         id: notes
         run: |
           TAG="${{ github.event.inputs.tag || github.ref_name }}"
-          echo "tag=${TAG}" >> $GITHUB_OUTPUT
+          echo "tag=${TAG}" >> "$GITHUB_OUTPUT"
 
       - name: Create GitHub Release
         uses: softprops/action-gh-release@v2
