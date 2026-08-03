@@ -170,8 +170,9 @@ mod tests {
 
     #[test]
     fn recognises_recached() {
-        // Recached does not implement INFO today; this is ready for when it does, and
-        // covers both the explicit `server_name` and a version-key fallback.
+        // Recached has answered INFO since 0.2.3, reporting `recached_version` alongside a
+        // `redis_version` of 6.2.0 and no `server_name` — so the version-key fallback is the
+        // path that actually fires there. The `server_name` case is kept for when it adds one.
         assert_eq!(
             ServerInfo::parse("server_name:recached\r\nredis_version:7.2.0\r\n").vendor,
             Vendor::Recached

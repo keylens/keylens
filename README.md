@@ -409,14 +409,24 @@ the reason.
 |---|---|---|---|
 | Key browser, all 6 value types | ✅ | ✅ | ✅ |
 | Server stats (`INFO`) | ✅ | ✅ | ✅ since 0.2.3 |
-| Slowlog / clients / cluster / pub-sub | ✅ | ✅ | — not implemented |
+| Bounded reads (`HSCAN`/`SSCAN`/`GETRANGE`) | ✅ | ✅ | ✅ since 0.2.4 |
+| Clients pane (`CLIENT LIST`) | ✅ | ✅ | ✅ since 0.2.4 |
+| Slowlog / cluster | ✅ | ✅ | — not implemented |
+| Pub/sub pane | ✅ | ✅ | — no `PUBSUB CHANNELS` |
 | Streams + consumer groups | ✅ | ✅ | — no stream types |
 | BullMQ lens | ✅ | ✅ | — needs streams |
 
-Recached has no `HSCAN`/`SSCAN`/`GETRANGE`, so keylens measures a key with `HLEN`/`SCARD`/
-`STRLEN` first and reads it whole only when it's small. The bound is preserved — it's
-enforced client-side instead of requested server-side — and an oversized key says so
-rather than being fetched.
+Recached 0.2.4 added `GETRANGE`, `HSCAN`, `SSCAN` and `ZSCAN`, so keylens now asks it for
+bounded reads directly, the same as Redis. Against 0.2.3 and earlier the probe finds them
+missing and falls back to measuring a key with `HLEN`/`SCARD`/`STRLEN` first, reading it
+whole only when it's small: the bound is preserved — enforced client-side instead of
+requested server-side — and an oversized key says so rather than being fetched.
+
+Recached carries `SUBSCRIBE`/`PSUBSCRIBE`/`PUBLISH`, so messaging works, but not the
+`PUBSUB CHANNELS`/`NUMSUB` introspection the pub/sub pane is built on — the pane lists
+channels a server already knows about, which is a question Recached has no command to
+answer. `MEMORY USAGE`, `MODULE LIST` and `SCAN ... TYPE` are likewise absent, so the
+memory breakdown and the server-side type filter degrade there too.
 
 The same machinery is what makes keylens behave on Upstash, ElastiCache and MemoryDB,
 which block subsets of `CONFIG`, `CLIENT`, `MEMORY` and `DEBUG`.
