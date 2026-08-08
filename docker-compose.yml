@@ -41,6 +41,13 @@ services:
   # as of 0.2.3, which is why the live test asserts consistency rather than
   # asserting the feature is missing.
   #
+  # The tag is pinned deliberately, not left stale: 0.2.3 is the last release
+  # before HSCAN/SSCAN/GETRANGE landed, and the client-side fallback for a server
+  # without them needs a server without them to run against. Current Recached
+  # (0.3.x) also has PUBSUB introspection, MEMORY USAGE and MODULE LIST — see the
+  # compatibility table in the README, and point KEYLENS_TEST_RECACHED_URL at a
+  # v0.3.2 container to check that column.
+  #
   #   docker compose --profile recached up -d
   #   KEYLENS_TEST_RECACHED_URL=redis://127.0.0.1:6381 \
   #     cargo test --test live -- --ignored

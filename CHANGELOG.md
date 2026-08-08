@@ -6,6 +6,58 @@ The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 
+## [0.1.5] — 2026-08-08
+
+No behaviour change. The compatibility claims and the tests behind them were describing a
+Recached that shipped three releases ago.
+
+### Fixed
+
+- **Two live tests asserted a dependency's *missing* features.** `reads_values_without_
+  hscan_sscan_or_getrange` opened with `assert!(!has(GetRange))` and
+  `assert!(!has(CursorCollectionScan))`, and the oversized-hash test required the refusal
+  that only the no-`HSCAN` path produces. Both passed solely because the compose profile
+  pins Recached 0.2.3 — the release before those commands landed — so pointing
+  `KEYLENS_TEST_RECACHED_URL` at anything current failed a test about keylens because a
+  server got better. This is the failure the `INFO` test one screen up already warned
+  about in a comment, committed in the same file.
+
+  They now assert the property that holds on either path: values read back correctly
+  whichever branch the capabilities select, and an oversized hash is bounded by `HSCAN`'s
+  `COUNT` where that exists and declined where it doesn't — never `HGETALL`. Which path
+  ran is printed, not required. Verified against both 0.2.3 and 0.3.2 containers; each
+  takes a different branch and both pass.
+
+- **A live test depended on a key an earlier test forgot to delete.** `connects_and_
+  browses_whatever_info_the_server_offers` ended in `assert!(!keys.is_empty())`, but
+  nothing seeds the Recached fixture — the BullMQ producer only feeds Redis. It passed on
+  whatever the previously-run test left behind, and failed outright against a freshly
+  started container, which is exactly how anyone runs it the first time. It seeds and
+  cleans up its own key now.
+
+### Changed
+
+- **The compatibility matrix matches Recached 0.3.2.** It claimed Recached had no
+  `PUBSUB CHANNELS`, `MEMORY USAGE` or `MODULE LIST`; all three shipped in Recached 0.3.0,
+  so the pub/sub pane, the memory breakdown and the module check work there now. `SLOWLOG`
+  and `CLUSTER` were also collapsed into one "not implemented" row despite failing
+  differently — `SLOWLOG` is an unknown command, while `CLUSTER` is refused with Redis's
+  own `ERR This instance has cluster support disabled`, which `classify()` deliberately
+  reports as the server's own sentence rather than as a missing command. Separate rows.
+  The column is now the output of `keylens probe` against `v0.3.2`, and says so, since
+  `docs/COMPAT.md` — the generated version that would stop this recurring — still doesn't
+  exist.
+
+- **The README no longer calls the Recached image a private package.** It is a public GHCR
+  package and needs no `docker login`; `docker-compose.yml` has said so in a comment the
+  whole time, two files away. The profile exists so the ordinary two-server fixture doesn't
+  pull a third image, which is the real reason. Both files now also record that the `v0.2.3`
+  pin is deliberate — the client-side fallback needs a server that actually lacks the
+  cursor reads — and that the fixture therefore isn't what the compatibility table
+  describes.
+
+---
+
 ## [0.1.4] — 2026-08-01
 
 Browsing a distant server is usable, and a dead connection says so instead of hanging.

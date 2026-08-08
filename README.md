@@ -405,28 +405,47 @@ keylens probes each server at connect and degrades to what it finds, rather than
 a feature set. A pane whose command is missing says *unavailable on this server* and names
 the reason.
 
-| | Redis 8 | Valkey 8 | Recached |
+| | Redis 8 | Valkey 8 | Recached 0.3 |
 |---|---|---|---|
 | Key browser, all 6 value types | ✅ | ✅ | ✅ |
 | Server stats (`INFO`) | ✅ | ✅ | ✅ since 0.2.3 |
 | Bounded reads (`HSCAN`/`SSCAN`/`GETRANGE`) | ✅ | ✅ | ✅ since 0.2.4 |
 | Clients pane (`CLIENT LIST`) | ✅ | ✅ | ✅ since 0.2.4 |
-| Slowlog / cluster | ✅ | ✅ | — not implemented |
-| Pub/sub pane | ✅ | ✅ | — no `PUBSUB CHANNELS` |
+| Pub/sub pane (`PUBSUB CHANNELS`) | ✅ | ✅ | ✅ since 0.3.0 |
+| Memory breakdown (`MEMORY USAGE`) | ✅ | ✅ | ✅ since 0.3.0 |
+| Module-backed viewers (`MODULE LIST`) | ✅ | ✅ | ✅ since 0.3.0, always empty |
+| Server-side type filter (`SCAN … TYPE`) | ✅ | ✅ | — filtered client-side |
+| Slowlog | ✅ | ✅ | — not implemented |
+| Cluster topology | ✅ | ✅ | — standalone only |
 | Streams + consumer groups | ✅ | ✅ | — no stream types |
 | BullMQ lens | ✅ | ✅ | — needs streams |
 
-Recached 0.2.4 added `GETRANGE`, `HSCAN`, `SSCAN` and `ZSCAN`, so keylens now asks it for
-bounded reads directly, the same as Redis. Against 0.2.3 and earlier the probe finds them
-missing and falls back to measuring a key with `HLEN`/`SCARD`/`STRLEN` first, reading it
-whole only when it's small: the bound is preserved — enforced client-side instead of
-requested server-side — and an oversized key says so rather than being fetched.
+The Recached column is what `keylens probe` reports against `ghcr.io/recached-dev/recached:v0.3.2`;
+it is maintained by hand, which is why [ROADMAP.md](ROADMAP.md) wants it generated from the probe
+instead. Nothing keys off these versions at runtime — keylens gates on the capability it detected,
+never on a version string — so a Recached that gains a command lights the pane up with no change here.
 
-Recached carries `SUBSCRIBE`/`PSUBSCRIBE`/`PUBLISH`, so messaging works, but not the
-`PUBSUB CHANNELS`/`NUMSUB` introspection the pub/sub pane is built on — the pane lists
-channels a server already knows about, which is a question Recached has no command to
-answer. `MEMORY USAGE`, `MODULE LIST` and `SCAN ... TYPE` are likewise absent, so the
-memory breakdown and the server-side type filter degrade there too.
+Recached 0.2.4 added `GETRANGE`, `HSCAN`, `SSCAN` and `ZSCAN`, so keylens asks it for bounded
+reads directly, the same as Redis. Against 0.2.3 and earlier the probe finds them missing and
+falls back to measuring a key with `HLEN`/`SCARD`/`STRLEN` first, reading it whole only when it's
+small: the bound is preserved — enforced client-side instead of requested server-side — and an
+oversized key says so rather than being fetched.
+
+Recached 0.3.0 added `PUBSUB CHANNELS`/`NUMSUB`/`NUMPAT`, `MEMORY USAGE` and `MODULE LIST`, so the
+pub/sub pane, the memory breakdown and the module check all work there now; earlier releases
+carried `SUBSCRIBE`/`PUBLISH` but no way to enumerate what was subscribed, which is the question
+the pane is built on.
+
+What still degrades, and how keylens tells the difference:
+
+- **`SCAN … TYPE`** answers `ERR syntax error`, not `unknown command` — the reply an older Redis
+  gives too. The probe reads it as unsupported rather than as a blocked command, and the type
+  filter runs client-side.
+- **`SLOWLOG`** is `unknown command`, so the slowlog pane says *not implemented by this server*.
+- **`CLUSTER`** is refused with Redis's own sentence, `ERR This instance has cluster support
+  disabled`, so the pane shows that instead of claiming the command is missing. `INFO` carries
+  `cluster_enabled:0` alongside it.
+- **No stream types**, so the stream viewer and the BullMQ lens have nothing to read.
 
 The same machinery is what makes keylens behave on Upstash, ElastiCache and MemoryDB,
 which block subsets of `CONFIG`, `CLIENT`, `MEMORY` and `DEBUG`.
@@ -462,7 +481,8 @@ docker compose up -d --build
 | Valkey 8 | `redis://127.0.0.1:6380` |
 | Recached (optional) | `redis://127.0.0.1:6381` |
 
-Recached sits behind a compose profile, since its image is a private package today:
+Recached sits behind a compose profile so the ordinary two-server fixture doesn't pull a third
+image. The image is a public GHCR package — no `docker login`:
 
 ```sh
 docker compose --profile recached up -d
@@ -470,6 +490,11 @@ KEYLENS_TEST_RECACHED_URL=redis://127.0.0.1:6381 cargo test --test live -- --ign
 ```
 
 Its live tests skip cleanly when that variable isn't set, so CI stays green without it.
+
+The profile pins `v0.2.3` on purpose: it is the last release without `HSCAN`/`SSCAN`/`GETRANGE`,
+and the fallback path for a server that lacks them needs a real server that lacks them to test
+against. That means the fixture is *not* what the compatibility table above describes — point
+`KEYLENS_TEST_RECACHED_URL` at a `v0.3.2` container to exercise the current one.
 
 Then:
 
@@ -517,4 +542,4 @@ The ordering there is a judgement call and the issue tracker is where to argue w
 
 ## License
 
-[Apache-2.0](LICENSE)
+[Apache-2.0](LICENSE) — © 2026 ThinkGrid Labs

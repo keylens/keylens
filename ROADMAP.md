@@ -2,7 +2,7 @@
 
 Where keylens is going and, more usefully, what it is knowingly missing today.
 
-**Today: v0.1.4 — read-only, single binary, one lens (BullMQ).**
+**Today: v0.1.5 — read-only, single binary, one lens (BullMQ).**
 
 Nothing here has a date. Items are ordered within each section by how much they undercut
 what keylens already claims to do, which is a more honest ranking than a calendar.

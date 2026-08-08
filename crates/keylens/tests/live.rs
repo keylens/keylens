@@ -664,14 +664,35 @@ async fn connects_and_browses_whatever_info_the_server_offers() {
         );
     }
 
-    // Either way the browser must work, which is the point.
+    // Either way the browser must work, which is the point. Seed the key it looks for --
+    // unlike the Redis fixture there is no producer filling this server, so the assertion
+    // used to pass only on whatever an earlier test happened to leave behind, and failed
+    // against a freshly started container.
+    let key = "keylens:t:scanme";
+    conn.cmd("SET", vec![key.into(), "v".into()]).await.unwrap();
     let keys = scan_all(&conn, None, None).await;
-    assert!(!keys.is_empty(), "SCAN should still walk the keyspace");
+    conn.cmd("DEL", vec![key.into()]).await.ok();
+    assert!(
+        keys.iter().any(|k| k == key),
+        "SCAN should still walk the keyspace; got {} keys",
+        keys.len()
+    );
 }
 
+/// The same values must come back whichever read path the server's capabilities select.
+///
+/// This used to assert `!has(GetRange)` and `!has(CursorCollectionScan)` — pinning a
+/// dependency's *missing* feature, the exact thing the INFO test above warns against. It
+/// passed only because the compose fixture pins Recached 0.2.3; Recached 0.2.4 added all
+/// three commands, so pointing `KEYLENS_TEST_RECACHED_URL` at anything current failed a
+/// test about keylens because a server got better.
+///
+/// What is worth asserting is the property that must hold either way: the value is read
+/// correctly. Which path did it is reported, not required — on a server without the cursor
+/// variants, reading the right value *is* the fallback working.
 #[tokio::test]
 #[ignore = "requires docker compose fixtures"]
-async fn reads_values_without_hscan_sscan_or_getrange() {
+async fn reads_values_whichever_read_path_the_server_supports() {
     let Some(url) = recached_url() else {
         eprintln!("skipping: set KEYLENS_TEST_RECACHED_URL");
         return;
@@ -679,8 +700,19 @@ async fn reads_values_without_hscan_sscan_or_getrange() {
     let conn = Conn::connect(&url, "test").await.unwrap();
 
     use keylens_conn::Feature;
-    assert!(!conn.capabilities().has(Feature::GetRange));
-    assert!(!conn.capabilities().has(Feature::CursorCollectionScan));
+    eprintln!(
+        "read path: strings via {}, collections via {}",
+        if conn.capabilities().has(Feature::GetRange) {
+            "GETRANGE"
+        } else {
+            "STRLEN + GET"
+        },
+        if conn.capabilities().has(Feature::CursorCollectionScan) {
+            "HSCAN/SSCAN"
+        } else {
+            "HLEN/SCARD + whole read"
+        }
+    );
 
     // Seed one key of each type the server supports.
     conn.cmd("SET", vec!["keylens:t:str".into(), "hello".into()])
@@ -725,30 +757,60 @@ async fn reads_values_without_hscan_sscan_or_getrange() {
     assert_eq!(members, vec!["m".to_string()]);
 }
 
+/// An oversized hash is never read whole — by either path.
+///
+/// The two paths decline differently and both are correct, so the assertion is the
+/// property rather than one path's answer: with `HSCAN` the read is bounded by `COUNT`,
+/// and without it keylens measures with `HLEN` first and refuses rather than falling back
+/// to `HGETALL`. Asserting only the second made this a test of which Recached was running.
 #[tokio::test]
 #[ignore = "requires docker compose fixtures"]
-async fn an_oversized_collection_is_declined_rather_than_read_whole() {
-    // The safety property: without HSCAN, keylens measures first and refuses a big hash
-    // instead of falling back to HGETALL.
+async fn an_oversized_collection_is_never_read_whole() {
+    use keylens_conn::value::PAGE;
+    use keylens_conn::{Feature, Value};
+
     let Some(url) = recached_url() else {
         eprintln!("skipping: set KEYLENS_TEST_RECACHED_URL");
         return;
     };
     let conn = Conn::connect(&url, "test").await.unwrap();
 
+    // Far enough over PAGE that a server merely overshooting the COUNT hint -- which is
+    // allowed -- still cannot account for a whole-hash read.
+    const FIELDS: usize = PAGE * 10 + 50;
     let key = "keylens:t:bighash";
     conn.cmd("DEL", vec![key.into()]).await.ok();
-    for i in 0..(keylens_conn::value::PAGE + 50) {
-        conn.cmd("HSET", vec![key.into(), format!("f{i}").into(), "v".into()])
-            .await
-            .unwrap();
+    for chunk in (0..FIELDS).collect::<Vec<_>>().chunks(500) {
+        let writes: Vec<(&'static str, Vec<Value>)> = chunk
+            .iter()
+            .map(|i| ("HSET", vec![key.into(), format!("f{i}").into(), "v".into()]))
+            .collect();
+        for reply in conn.pipeline(&writes).await.unwrap() {
+            reply.unwrap();
+        }
     }
 
     let v = conn.read_value(key, Kind::Hash, 0).await.unwrap();
-    assert!(
-        matches!(v, KeyValue::TooLarge { what: "hash", .. }),
-        "an oversized hash must be declined, got {v:?}"
-    );
+    match v {
+        KeyValue::TooLarge { what: "hash", .. } => {
+            assert!(
+                !conn.capabilities().has(Feature::CursorCollectionScan),
+                "declining is the no-HSCAN path; a server with HSCAN should have paged"
+            );
+        }
+        KeyValue::Hash(fields) => {
+            assert!(
+                conn.capabilities().has(Feature::CursorCollectionScan),
+                "the only way to page a hash is HSCAN"
+            );
+            assert!(
+                fields.len() < FIELDS,
+                "read {} of {FIELDS} fields -- that is HGETALL wearing a cursor",
+                fields.len()
+            );
+        }
+        other => panic!("expected a bounded page or a refusal, got {other:?}"),
+    }
     conn.cmd("DEL", vec![key.into()]).await.ok();
 }
 
