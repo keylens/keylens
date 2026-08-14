@@ -1,11 +1,15 @@
 [package]
 name = "keylens-bullmq"
-description = "BullMQ lens for keylens: queues, job states and live throughput"
+description = "BullMQ lens for keylens: queue states, job detail with per-attempt stack traces, and live throughput from the BullMQ events stream on Redis or Valkey"
+keywords = ["bullmq", "redis", "queue", "jobs", "tui"]
+categories = ["database", "asynchronous"]
+readme = "README.md"
 version.workspace = true
 edition.workspace = true
 rust-version.workspace = true
 license.workspace = true
 repository.workspace = true
+homepage.workspace = true
 authors.workspace = true
 
 [dependencies]

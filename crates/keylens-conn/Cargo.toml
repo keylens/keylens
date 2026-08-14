@@ -1,11 +1,15 @@
 [package]
 name = "keylens-conn"
-description = "Connection, capability probing and vendor detection for keylens"
+description = "Redis, Valkey and Recached connection, capability probing and vendor detection — the layer that lets keylens degrade instead of erroring on managed hosts"
+keywords = ["redis", "valkey", "recached", "capabilities", "probe"]
+categories = ["database", "network-programming"]
+readme = "README.md"
 version.workspace = true
 edition.workspace = true
 rust-version.workspace = true
 license.workspace = true
 repository.workspace = true
+homepage.workspace = true
 authors.workspace = true
 
 [dependencies]

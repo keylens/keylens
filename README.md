@@ -1,6 +1,25 @@
-# keylens
+<h1 align="center">keylens</h1>
 
-**A TUI for Redis, Valkey and Recached that understands your keys.**
+<p align="center">
+  <strong>A terminal UI for Redis, Valkey and Recached that understands your keys.</strong><br>
+  A fast, read-only Redis TUI with a pluggable <strong>lens</strong> system — point it at
+  production on day one.
+</p>
+
+<p align="center">
+  <a href="https://crates.io/crates/keylens"><img alt="keylens on crates.io" src="https://img.shields.io/crates/v/keylens.svg"></a>
+  <a href="https://crates.io/crates/keylens"><img alt="Downloads on crates.io" src="https://img.shields.io/crates/d/keylens.svg"></a>
+  <a href="https://github.com/keylens/keylens/actions/workflows/ci.yml"><img alt="CI status" src="https://github.com/keylens/keylens/actions/workflows/ci.yml/badge.svg"></a>
+  <a href="#license"><img alt="License: MIT OR Apache-2.0" src="https://img.shields.io/badge/license-MIT%20OR%20Apache--2.0-blue.svg"></a>
+  <img alt="Runs on macOS, Linux and Windows" src="https://img.shields.io/badge/platform-macOS%20%7C%20Linux%20%7C%20Windows-lightgrey.svg">
+  <img alt="Read-only" src="https://img.shields.io/badge/v0.1-read--only-brightgreen.svg">
+</p>
+
+<!--
+  A rendered demo belongs here, and it is the highest-value thing this README is missing.
+  `docs/demo.tape` produces it; see "Demo" below. Once docs/demo.gif is committed:
+  <p align="center"><img src="docs/demo.gif" alt="keylens browsing a Redis keyspace and showing live BullMQ queue throughput" width="900"></p>
+-->
 
 Every Redis client shows you keys. None of them understand what your keys *mean*.
 
@@ -18,6 +37,54 @@ Valkey 8, and [Recached](https://github.com/recached-dev/recached) — see
 [compatibility](#compatibility).
 
 > **v0.1 is read-only.** That's a feature — you can point it at production on day one.
+
+**keylens** is a single-binary **Redis TUI**, **Valkey TUI** and **Recached TUI** written
+in **Rust** — a terminal alternative to `redis-cli`, **RedisInsight** and Redis Desktop
+Manager, and a faster read on **BullMQ** queues than **BullBoard**. It browses the
+keyspace with `SCAN`
+(never `KEYS`), inspects all six value types plus **streams and consumer groups**, shows
+an `INFO` dashboard, slowlog, clients, cluster and pub/sub panes, and renders **live job
+throughput** from BullMQ's events stream. Works against **Upstash**, **ElastiCache**,
+**MemoryDB**, **Aiven**, **DigitalOcean**, **Dragonfly** and **KeyDB** — capabilities are
+probed and missing commands degrade instead of erroring. macOS, Linux and Windows.
+
+---
+
+## Contents
+
+- [Why keylens](#why-keylens)
+- [Installation](#installation)
+- [Usage](#usage) — [quick start](#quick-start) · [connecting](#connecting) · [named connections](#named-connections) · [commands](#commands) · [keys](#keys) · [environment](#environment)
+- [What it looks like](#what-it-looks-like)
+- [Compatibility](#compatibility)
+- [FAQ](#faq)
+- [Demo](#demo)
+- [Development](#development)
+- [Design constraints](#design-constraints)
+- [Writing a lens](#writing-a-lens)
+- [Roadmap](#roadmap)
+- [License](#license)
+
+---
+
+## Why keylens
+
+|  | keylens | `redis-cli` | RedisInsight / Desktop Manager | BullBoard / Taskforce |
+|---|---|---|---|---|
+| **Runs in** | your terminal, one binary | your terminal | a desktop app or a browser | a web app you deploy |
+| **Understands your keyspace** | yes — pluggable lenses | no | no | BullMQ only |
+| **Job queue view** | BullMQ, with per-attempt stack traces | no | no | yes |
+| **Live throughput** | event-level, from the events stream | no | no | polled counts |
+| **Safe on production** | read-only in v0.1, `KEYS` never issued | you can run anything | varies | writes by design |
+| **Managed hosts** | probed, degrades per command | manual | partial | n/a |
+| **Streams + consumer groups** | group state first, worst consumer ranked | raw `XINFO` | limited | n/a |
+| **Install** | one binary, no runtime | bundled with Redis | app install | Node service |
+| **Extensible** | write a lens — Sidekiq, Celery, RQ | no | no | no |
+
+Read that as scope, not scoring. `redis-cli` is the right tool for running a command.
+BullBoard is the right tool if you want to retry jobs from a web UI. keylens is for the
+moment you're staring at an unfamiliar keyspace, or a queue that's backing up, and you
+want to understand it from a terminal without touching it.
 
 ---
 
@@ -253,7 +320,7 @@ KEYLENS_LOG=debug KEYLENS_LOG_FILE=/tmp/keylens.log keylens
 
 ---
 
-## Status
+## What it looks like
 
 `keylens` with no arguments opens the browser:
 
@@ -450,9 +517,81 @@ What still degrades, and how keylens tells the difference:
 The same machinery is what makes keylens behave on Upstash, ElastiCache and MemoryDB,
 which block subsets of `CONFIG`, `CLIENT`, `MEMORY` and `DEBUG`.
 
-## Regenerating the demo
+## FAQ
 
-The GIF at the top is rendered from a script, so it stays honest as the UI changes:
+### What is a lens?
+
+A detector, a data model, and a view. A lens recognises a keyspace pattern — BullMQ's
+`bull:<queue>:*` shape, say — and replaces the raw key tree with UI built for that domain:
+queue states, job detail, live throughput. keylens grows a tab because of what's in your
+keyspace, not because you flipped a flag. Writing one is documented in
+[docs/LENS.md](docs/LENS.md), and it needs no changes to core, so Sidekiq, Celery, RQ or
+Horizon support can live in a separate crate.
+
+### Is it safe to run against production?
+
+That's what v0.1 is designed for. It is read-only throughout — there is no code path that
+writes — and `KEYS` is never issued, only cursor-paged `SCAN` with a bounded `COUNT`. A
+workspace test fails the build if `KEYS`, `HGETALL` or `SMEMBERS` appear outside the one
+audited fallback. Unbounded collection reads are treated the same way as `KEYS`, because
+`HGETALL` on a two-million-field hash blocks the server just as hard. Mutations are a v0.2
+question and will be gated behind the `readonly` connection flag that already exists.
+
+### Does it work with Upstash, ElastiCache, MemoryDB or Aiven?
+
+Yes. Managed hosts block subsets of `CONFIG`, `CLIENT`, `MEMORY`, `MONITOR` and `DEBUG`;
+keylens probes each capability at connect and renders an explicit "unavailable on this
+server" state for the panes it can't fill, rather than failing to start. Run
+`keylens probe` against an unfamiliar host to see exactly what it will and won't do.
+Note that most managed hosts are TLS-only, so the scheme is `rediss://`.
+
+### Does it support Redis Cluster and Sentinel?
+
+Yes — `redis-cluster://` and `redis-sentinel://host:26379/mymaster`. There's a cluster
+topology pane, which distinguishes "this is a standalone server" from "your host blocked
+`CLUSTER`" because those are the same probe failure but not the same problem.
+
+### How is this different from RedisInsight?
+
+RedisInsight is a desktop application and shows you keys and types. keylens is a single
+binary in your terminal — usable over SSH, in a container, on a jump box — and its point
+is interpretation rather than display: a lens turns a keyspace into the thing it
+represents. It's also read-only by design, which RedisInsight isn't.
+
+### How is the BullMQ view different from BullBoard?
+
+BullBoard polls `getJobCounts` on a timer, which is why its graphs are coarse. BullMQ
+already writes every state transition to a Redis stream, so keylens runs **one blocking
+`XREAD` across every queue** and gets event-level throughput at sub-second resolution with
+near-zero server load — the graph moves the instant a job fails. Job detail shows the
+stack trace for *each attempt*, not just the last. BullBoard remains the right tool for
+retrying and removing jobs; keylens v0.1 won't write.
+
+### Which BullMQ versions work?
+
+Detection reads `meta.version`, and the lens is written against current BullMQ (v6) while
+still reading older field names — `attemptsMade` is stored as `atm` in v6, and reading
+only the long name reports every job as attempt 0. Note that BullMQ v6 made the storage
+driver an optional peer dependency, so a v6 user can run BullMQ on Postgres with no Redis
+keyspace at all; there's nothing for the lens to read in that case.
+
+### Does it need Docker, Node, or a runtime?
+
+No. It's a single static-ish binary with no runtime. Docker is only used for the
+development fixtures.
+
+### Can I use it as a library?
+
+Yes — `keylens-conn` (connection and capability probing), `keylens-lens` (the extension
+point), `keylens-ui` (ratatui widgets) and `keylens-bullmq` are all published on
+crates.io. The dual MIT/Apache-2.0 license is there so linking them is uncontroversial.
+
+---
+
+## Demo
+
+`docs/demo.tape` renders the demo from a script, so it stays honest as the UI changes.
+The GIF itself is not committed yet — render it locally:
 
 ```sh
 brew install vhs                  # pulls ttyd + ffmpeg
@@ -542,4 +681,25 @@ The ordering there is a judgement call and the issue tracker is where to argue w
 
 ## License
 
-[Apache-2.0](LICENSE) — © 2026 ThinkGrid Labs
+Dual-licensed under either of
+
+- Apache License, Version 2.0 ([LICENSE-APACHE](LICENSE-APACHE))
+- MIT license ([LICENSE-MIT](LICENSE-MIT))
+
+at your option. `SPDX-License-Identifier: MIT OR Apache-2.0` — © 2026 ThinkGrid Labs.
+
+This is the Rust ecosystem's convention, and it matters here because keylens ships
+libraries, not just a binary: `keylens-lens` is a public extension point, so anyone
+writing a lens links against these crates. Apache-2.0 carries an express patent grant,
+which is what a company's legal review wants to see; MIT keeps the crates usable from
+GPLv2 projects that Apache-2.0 alone would exclude.
+
+Unless you state otherwise, any contribution you intentionally submit for inclusion in
+this work shall be dual-licensed as above, with no additional terms or conditions.
+
+---
+
+<sub>Keywords: Redis TUI, Valkey TUI, Recached, redis-cli alternative, RedisInsight
+alternative, Redis GUI, Redis browser, keyspace explorer, BullMQ dashboard, BullBoard
+alternative, job queue monitoring, Redis streams, consumer groups, Redis slowlog, Rust,
+ratatui, terminal UI, Upstash, ElastiCache, MemoryDB, Dragonfly, KeyDB.</sub>

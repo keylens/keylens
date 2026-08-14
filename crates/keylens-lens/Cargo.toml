@@ -1,11 +1,15 @@
 [package]
 name = "keylens-lens"
-description = "The lens extension point for keylens: detect a known keyspace pattern, render domain UI"
+description = "The lens extension point for keylens: detect a known Redis, Valkey or Recached keyspace pattern and render domain UI instead of raw keys"
+keywords = ["redis", "valkey", "recached", "plugin", "keyspace"]
+categories = ["database", "gui"]
+readme = "README.md"
 version.workspace = true
 edition.workspace = true
 rust-version.workspace = true
 license.workspace = true
 repository.workspace = true
+homepage.workspace = true
 authors.workspace = true
 
 [dependencies]

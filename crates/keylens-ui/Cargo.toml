@@ -1,11 +1,15 @@
 [package]
 name = "keylens-ui"
-description = "Shared UI model and widgets for keylens"
+description = "Shared ratatui widgets and UI model for keylens — key tree, value viewers, meters and sparklines for Redis, Valkey and Recached"
+keywords = ["redis", "valkey", "recached", "tui", "ratatui"]
+categories = ["command-line-interface", "gui"]
+readme = "README.md"
 version.workspace = true
 edition.workspace = true
 rust-version.workspace = true
 license.workspace = true
 repository.workspace = true
+homepage.workspace = true
 authors.workspace = true
 
 [dependencies]

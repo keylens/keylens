@@ -106,7 +106,7 @@ jobs:
           ASSET="${{ env.BINARY_NAME }}-${{ matrix.target }}"
           mkdir -p dist
           cp target/${{ matrix.target }}/release/${{ env.BINARY_NAME }} dist/
-          cp README.md LICENSE dist/
+          cp README.md LICENSE-APACHE LICENSE-MIT dist/
           tar -czf "${ASSET}.tar.gz" -C dist .
           echo "ASSET=${ASSET}.tar.gz" >> "$GITHUB_ENV"
 
@@ -118,7 +118,7 @@ jobs:
           New-Item -ItemType Directory -Force dist | Out-Null
           Copy-Item "target\${{ matrix.target }}\release\${{ env.BINARY_NAME }}.exe" dist\
           Copy-Item README.md dist\
-          Copy-Item LICENSE dist\
+          Copy-Item LICENSE-APACHE, LICENSE-MIT dist\
           Compress-Archive -Path dist\* -DestinationPath "${asset}.zip"
           "ASSET=${asset}.zip" | Out-File -FilePath $env:GITHUB_ENV -Append
 

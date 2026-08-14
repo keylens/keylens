@@ -6,6 +6,38 @@ The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 
+## [Unreleased]
+
+Documentation and packaging metadata only. No behaviour change, no code touched.
+
+### Changed
+
+- **Relicensed to dual `MIT OR Apache-2.0`** from Apache-2.0 alone. `LICENSE` is now
+  `LICENSE-APACHE`, and `LICENSE-MIT` joins it. The reason is that keylens publishes four
+  library crates, not just a binary: `keylens-lens` is a public extension point, so anyone
+  writing a lens links against them, and an Apache-only crate is excluded from GPLv2
+  projects and trips license allowlists configured for the Rust ecosystem's dual-license
+  norm. Dual is strictly more permissive than what 0.1.5 shipped under, so no existing
+  user is affected. Sole copyright holder, so no contributor sign-off was needed.
+- **The four library crates now carry `description`, `keywords`, `categories`, `readme`
+  and `homepage`.** They were published with none of those, which left them unsearchable
+  on crates.io and rendering a blank page. Each now symlinks the root README, the same
+  workaround `crates/keylens` already used — `readme = "../../README.md"` is silently not
+  packaged because it points outside the crate directory.
+- README restructured for discoverability: badges, a table of contents, a comparison
+  against `redis-cli`/RedisInsight/BullBoard, and a FAQ.
+
+### Fixed
+
+- **The README claimed "the GIF at the top is rendered from a script".** There is no GIF at
+  the top and `docs/demo.gif` has never been committed — only the `docs/demo.tape` that
+  would produce it. The section now says so.
+
+> Publishing is what makes any of this visible: crates.io renders each crate's README and
+> metadata from the published artifact. That needs a version bump in **both** the
+> workspace `Cargo.toml` and `packaging/homebrew/keylens.rb`, since the tag gate compares
+> the tag against the workspace version.
+
 ## [0.1.5] — 2026-08-08
 
 No behaviour change. The compatibility claims and the tests behind them were describing a
