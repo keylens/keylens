@@ -21,23 +21,9 @@ const BANNED: &[&str] = &[
     "\"FLUSHDB\"",
     "\"MONITOR\"",
     "\"DEBUG\"",
+    "\"HGETALL\"",
+    "\"SMEMBERS\"",
 ];
-
-/// Whole-collection reads, permitted **only** in the one file that measures a key before
-/// reading it.
-///
-/// Not every Redis-compatible server implements `HSCAN`/`SSCAN`/`GETRANGE` — Recached, for
-/// one, does not. Refusing to render a five-field hash on those servers would be silly, so
-/// `value.rs` calls `HLEN`/`SCARD`/`STRLEN` first and only reads the whole thing when it's
-/// small. The bound survives; it's measured client-side instead of requested server-side.
-const SIZE_GATED: &[&str] = &["\"HGETALL\"", "\"SMEMBERS\""];
-
-/// The only file allowed to use [`SIZE_GATED`] commands.
-const SIZE_GATED_FILE: &str = "value.rs";
-
-/// The guard those commands must sit behind. If this helper is ever removed or renamed,
-/// the exception above stops being justified and this test fails.
-const SIZE_GATE_FN: &str = "async fn size_ok(";
 
 fn workspace_root() -> PathBuf {
     // CARGO_MANIFEST_DIR is crates/keylens
@@ -98,13 +84,7 @@ fn no_keyspace_blocking_commands_in_source() {
             if trimmed.starts_with("//") || trimmed.starts_with("*") {
                 continue;
             }
-            let in_gated_file = file.file_name().is_some_and(|f| f == SIZE_GATED_FILE);
-            let checks: Vec<&&str> = BANNED
-                .iter()
-                .chain(SIZE_GATED.iter().filter(|_| !in_gated_file))
-                .collect();
-
-            for banned in checks {
+            for banned in BANNED {
                 if line.contains(*banned) {
                     violations.push(format!(
                         "{}:{}: {}",
@@ -122,36 +102,4 @@ fn no_keyspace_blocking_commands_in_source() {
         "banned command literals found -- use cursor-paged SCAN instead:\n{}",
         violations.join("\n")
     );
-}
-
-#[test]
-fn whole_collection_reads_stay_behind_the_size_gate() {
-    // The exception carved out for `value.rs` is only defensible while the size check
-    // exists. If someone deletes it, the whole-collection reads become the unbounded reads
-    // this suite is here to prevent.
-    let root = workspace_root();
-    let mut files = Vec::new();
-    rust_sources(&root.join("crates"), &mut files);
-
-    let gated: Vec<&PathBuf> = files
-        .iter()
-        .filter(|f| f.file_name().is_some_and(|n| n == SIZE_GATED_FILE))
-        .collect();
-    assert_eq!(gated.len(), 1, "expected exactly one {SIZE_GATED_FILE}");
-
-    let text = fs::read_to_string(gated[0]).expect("read value.rs");
-    assert!(
-        text.contains(SIZE_GATE_FN),
-        "{SIZE_GATED_FILE} uses whole-collection reads but no longer defines `{SIZE_GATE_FN}`"
-    );
-
-    // Every whole-collection call must be reachable only from a size-checked branch.
-    for cmd in SIZE_GATED {
-        if text.contains(cmd) {
-            assert!(
-                text.contains("size_ok(self, key"),
-                "{cmd} appears in {SIZE_GATED_FILE} without a size_ok() guard"
-            );
-        }
-    }
 }

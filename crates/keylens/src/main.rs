@@ -8,6 +8,7 @@ use color_eyre::eyre::{Result, eyre};
 
 use keylens::config::{Config, Target};
 use keylens::{browse, probe};
+use keylens_conn::redact_url;
 
 const DEFAULT_URL: &str = "redis://127.0.0.1:6379";
 
@@ -164,7 +165,7 @@ fn list_connections() -> Result<()> {
         println!(
             "  {:<width$}  {}{}",
             c.name,
-            mask_url(&c.url),
+            redact_url(&c.url),
             if c.readonly { "  [readonly]" } else { "" }
         );
     }
@@ -175,19 +176,6 @@ fn list_connections() -> Result<()> {
 /// Replace any password in a connection URL with `***`.
 ///
 /// `keylens connections` is exactly the command someone runs while screen-sharing.
-fn mask_url(url: &str) -> String {
-    let Some((scheme, rest)) = url.split_once("://") else {
-        return url.to_string();
-    };
-    let Some((creds, host)) = rest.split_once('@') else {
-        return url.to_string();
-    };
-    match creds.split_once(':') {
-        Some((user, _)) => format!("{scheme}://{user}:***@{host}"),
-        None => format!("{scheme}://{creds}@{host}"),
-    }
-}
-
 /// Precedence: `--url` (or `KEYLENS_URL`) > `--name` from config > default.
 ///
 /// Only the `--name` path can carry a lens prefix, because that is the only path with a
@@ -225,17 +213,23 @@ fn resolve_target(cli: &Cli) -> Result<Target> {
 
 #[cfg(test)]
 mod tests {
-    use super::mask_url;
+    use keylens_conn::redact_url;
 
     #[test]
     fn masks_passwords_but_keeps_the_rest_readable() {
         assert_eq!(
-            mask_url("rediss://admin:hunter2@prod.example.com:6379"),
+            redact_url("rediss://admin:hunter2@prod.example.com:6379"),
             "rediss://admin:***@prod.example.com:6379"
         );
         // No password, nothing to hide.
-        assert_eq!(mask_url("redis://127.0.0.1:6379"), "redis://127.0.0.1:6379");
-        assert_eq!(mask_url("redis://user@host:6379"), "redis://user@host:6379");
-        assert_eq!(mask_url("not-a-url"), "not-a-url");
+        assert_eq!(
+            redact_url("redis://127.0.0.1:6379"),
+            "redis://127.0.0.1:6379"
+        );
+        assert_eq!(
+            redact_url("redis://user@host:6379"),
+            "redis://user@host:6379"
+        );
+        assert_eq!(redact_url("not-a-url"), "not-a-url");
     }
 }

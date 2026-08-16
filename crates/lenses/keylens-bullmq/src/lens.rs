@@ -70,22 +70,25 @@ impl BullMqLens {
     /// option otherwise, so we re-validate below rather than trusting the filter.
     async fn scan_meta_keys(&self, conn: &Conn) -> Result<Vec<String>> {
         let pattern = format!("{}:*:meta", self.prefix);
-        let mut cursor = "0".to_string();
         let mut names = Vec::new();
+        let type_filter = conn
+            .capabilities()
+            .has(keylens_conn::Feature::ScanTypeFilter)
+            .then_some("hash");
+        let mut scanner = conn.key_scanner(Some(&pattern), SCAN_COUNT, type_filter);
 
         for _ in 0..MAX_DETECT_PAGES {
-            let page = conn
-                .scan_page(&cursor, Some(&pattern), SCAN_COUNT, Some("hash"))
-                .await?;
+            let Some(keys) = scanner.next_page().await? else {
+                break;
+            };
 
-            for key in &page.keys {
+            for key in &keys {
                 if let Some(name) = queue_name_from_meta_key(&self.prefix, key) {
                     names.push(name);
                 }
             }
 
-            cursor = page.cursor.clone();
-            if page.is_complete() || names.len() >= MAX_QUEUES {
+            if names.len() >= MAX_QUEUES {
                 break;
             }
         }

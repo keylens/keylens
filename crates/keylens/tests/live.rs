@@ -76,15 +76,13 @@ async fn await_failed_jobs(conn: &Conn) -> (String, Vec<(String, f64)>) {
 
 /// Walk the keyspace the way the browser does, with a bound.
 async fn scan_all(conn: &Conn, pattern: Option<&str>, kind: Option<&str>) -> Vec<String> {
-    let mut cursor = "0".to_string();
     let mut keys = Vec::new();
+    let mut scanner = conn.key_scanner(pattern, 500, kind);
     for _ in 0..200 {
-        let page = conn.scan_page(&cursor, pattern, 500, kind).await.unwrap();
-        keys.extend(page.keys);
-        cursor = page.cursor;
-        if cursor == "0" {
+        let Some(page) = scanner.next_page().await.unwrap() else {
             break;
-        }
+        };
+        keys.extend(page);
     }
     keys
 }
@@ -669,9 +667,11 @@ async fn connects_and_browses_whatever_info_the_server_offers() {
     // used to pass only on whatever an earlier test happened to leave behind, and failed
     // against a freshly started container.
     let key = "keylens:t:scanme";
-    conn.cmd("SET", vec![key.into(), "v".into()]).await.unwrap();
+    conn.test_cmd("SET", vec![key.into(), "v".into()])
+        .await
+        .unwrap();
     let keys = scan_all(&conn, None, None).await;
-    conn.cmd("DEL", vec![key.into()]).await.ok();
+    conn.test_cmd("DEL", vec![key.into()]).await.ok();
     assert!(
         keys.iter().any(|k| k == key),
         "SCAN should still walk the keyspace; got {} keys",
@@ -679,7 +679,7 @@ async fn connects_and_browses_whatever_info_the_server_offers() {
     );
 }
 
-/// The same values must come back whichever read path the server's capabilities select.
+/// Values are paged only when the server supports the required bounded read command.
 ///
 /// This used to assert `!has(GetRange)` and `!has(CursorCollectionScan)` — pinning a
 /// dependency's *missing* feature, the exact thing the INFO test above warns against. It
@@ -687,9 +687,9 @@ async fn connects_and_browses_whatever_info_the_server_offers() {
 /// three commands, so pointing `KEYLENS_TEST_RECACHED_URL` at anything current failed a
 /// test about keylens because a server got better.
 ///
-/// What is worth asserting is the property that must hold either way: the value is read
-/// correctly. Which path did it is reported, not required — on a server without the cursor
-/// variants, reading the right value *is* the fallback working.
+/// A missing capability must produce an explicit unsupported result. Falling back to GET,
+/// HGETALL, or SMEMBERS after a separate size check introduces a race in which the value
+/// can grow without bound between the two commands.
 #[tokio::test]
 #[ignore = "requires docker compose fixtures"]
 async fn reads_values_whichever_read_path_the_server_supports() {
@@ -705,64 +705,75 @@ async fn reads_values_whichever_read_path_the_server_supports() {
         if conn.capabilities().has(Feature::GetRange) {
             "GETRANGE"
         } else {
-            "STRLEN + GET"
+            "unsupported"
         },
         if conn.capabilities().has(Feature::CursorCollectionScan) {
             "HSCAN/SSCAN"
         } else {
-            "HLEN/SCARD + whole read"
+            "unsupported"
         }
     );
 
     // Seed one key of each type the server supports.
-    conn.cmd("SET", vec!["keylens:t:str".into(), "hello".into()])
+    conn.test_cmd("SET", vec!["keylens:t:str".into(), "hello".into()])
         .await
         .unwrap();
-    conn.cmd(
+    conn.test_cmd(
         "HSET",
         vec!["keylens:t:hash".into(), "f".into(), "v".into()],
     )
     .await
     .unwrap();
-    conn.cmd("SADD", vec!["keylens:t:set".into(), "m".into()])
+    conn.test_cmd("SADD", vec!["keylens:t:set".into(), "m".into()])
         .await
         .unwrap();
 
-    // Each of these takes the size-checked fallback path.
+    // Servers with bounded commands return values; older servers decline explicitly.
     let s = conn
         .read_value("keylens:t:str", Kind::String, 0)
         .await
         .unwrap();
-    assert!(
-        matches!(s, KeyValue::String(ref v) if v == "hello"),
-        "{s:?}"
-    );
+    if conn.capabilities().has(Feature::GetRange) {
+        assert!(
+            matches!(s, KeyValue::String(ref v) if v == "hello"),
+            "{s:?}"
+        );
+    } else {
+        assert!(matches!(s, KeyValue::Unsupported(_)), "{s:?}");
+    }
 
     let h = conn
         .read_value("keylens:t:hash", Kind::Hash, 0)
         .await
         .unwrap();
-    let KeyValue::Hash(fields) = h else {
-        panic!("expected a hash")
-    };
-    assert_eq!(fields, vec![("f".to_string(), "v".to_string())]);
+    if conn.capabilities().has(Feature::CursorCollectionScan) {
+        let KeyValue::Hash(fields) = h else {
+            panic!("expected a hash")
+        };
+        assert_eq!(fields, vec![("f".to_string(), "v".to_string())]);
+    } else {
+        assert!(matches!(h, KeyValue::Unsupported(_)), "{h:?}");
+    }
 
     let set = conn
         .read_value("keylens:t:set", Kind::Set, 0)
         .await
         .unwrap();
-    let KeyValue::Set(members) = set else {
-        panic!("expected a set")
-    };
-    assert_eq!(members, vec!["m".to_string()]);
+    if conn.capabilities().has(Feature::CursorCollectionScan) {
+        let KeyValue::Set(members) = set else {
+            panic!("expected a set")
+        };
+        assert_eq!(members, vec!["m".to_string()]);
+    } else {
+        assert!(matches!(set, KeyValue::Unsupported(_)), "{set:?}");
+    }
 }
 
 /// An oversized hash is never read whole — by either path.
 ///
 /// The two paths decline differently and both are correct, so the assertion is the
 /// property rather than one path's answer: with `HSCAN` the read is bounded by `COUNT`,
-/// and without it keylens measures with `HLEN` first and refuses rather than falling back
-/// to `HGETALL`. Asserting only the second made this a test of which Recached was running.
+/// and without it keylens refuses rather than falling back to `HGETALL`.
 #[tokio::test]
 #[ignore = "requires docker compose fixtures"]
 async fn an_oversized_collection_is_never_read_whole() {
@@ -779,20 +790,20 @@ async fn an_oversized_collection_is_never_read_whole() {
     // allowed -- still cannot account for a whole-hash read.
     const FIELDS: usize = PAGE * 10 + 50;
     let key = "keylens:t:bighash";
-    conn.cmd("DEL", vec![key.into()]).await.ok();
+    conn.test_cmd("DEL", vec![key.into()]).await.ok();
     for chunk in (0..FIELDS).collect::<Vec<_>>().chunks(500) {
         let writes: Vec<(&'static str, Vec<Value>)> = chunk
             .iter()
             .map(|i| ("HSET", vec![key.into(), format!("f{i}").into(), "v".into()]))
             .collect();
-        for reply in conn.pipeline(&writes).await.unwrap() {
+        for reply in conn.test_pipeline(&writes).await.unwrap() {
             reply.unwrap();
         }
     }
 
     let v = conn.read_value(key, Kind::Hash, 0).await.unwrap();
     match v {
-        KeyValue::TooLarge { what: "hash", .. } => {
+        KeyValue::Unsupported(_) => {
             assert!(
                 !conn.capabilities().has(Feature::CursorCollectionScan),
                 "declining is the no-HSCAN path; a server with HSCAN should have paged"
@@ -811,7 +822,7 @@ async fn an_oversized_collection_is_never_read_whole() {
         }
         other => panic!("expected a bounded page or a refusal, got {other:?}"),
     }
-    conn.cmd("DEL", vec![key.into()]).await.ok();
+    conn.test_cmd("DEL", vec![key.into()]).await.ok();
 }
 
 #[tokio::test]
@@ -835,12 +846,14 @@ async fn one_bad_command_does_not_fail_the_whole_pipeline() {
     let good = "keylens:pipe:good";
     let wrong = "keylens:pipe:wrongtype";
 
-    conn.cmd("DEL", vec![good.into(), wrong.into()]).await.ok();
-    conn.cmd("SET", vec![good.into(), "v".into()])
+    conn.test_cmd("DEL", vec![good.into(), wrong.into()])
+        .await
+        .ok();
+    conn.test_cmd("SET", vec![good.into(), "v".into()])
         .await
         .unwrap();
     // A string, so LLEN against it is a genuine WRONGTYPE from a real server.
-    conn.cmd("SET", vec![wrong.into(), "v".into()])
+    conn.test_cmd("SET", vec![wrong.into(), "v".into()])
         .await
         .unwrap();
 
@@ -862,7 +875,9 @@ async fn one_bad_command_does_not_fail_the_whole_pipeline() {
         replies[2]
     );
 
-    conn.cmd("DEL", vec![good.into(), wrong.into()]).await.ok();
+    conn.test_cmd("DEL", vec![good.into(), wrong.into()])
+        .await
+        .ok();
 }
 
 #[tokio::test]
@@ -878,17 +893,17 @@ async fn a_queue_with_a_mistyped_key_still_renders_its_other_counts() {
     let wait = "keylens-pipetest:q:wait";
     let failed = "keylens-pipetest:q:failed";
 
-    conn.cmd("DEL", vec![meta.into(), wait.into(), failed.into()])
+    conn.test_cmd("DEL", vec![meta.into(), wait.into(), failed.into()])
         .await
         .ok();
-    conn.cmd("HSET", vec![meta.into(), "paused".into(), "1".into()])
+    conn.test_cmd("HSET", vec![meta.into(), "paused".into(), "1".into()])
         .await
         .unwrap();
     // `wait` should be a LIST; make it a string so its LLEN is a WRONGTYPE.
-    conn.cmd("SET", vec![wait.into(), "corrupt".into()])
+    conn.test_cmd("SET", vec![wait.into(), "corrupt".into()])
         .await
         .unwrap();
-    conn.cmd("ZADD", vec![failed.into(), 1.into(), "job-1".into()])
+    conn.test_cmd("ZADD", vec![failed.into(), 1.into(), "job-1".into()])
         .await
         .unwrap();
 
@@ -902,7 +917,7 @@ async fn a_queue_with_a_mistyped_key_still_renders_its_other_counts() {
     assert_eq!(q.count(State::Failed), 1, "the good count survives");
     assert_eq!(q.count(State::Waiting), 0, "the bad one degrades to zero");
 
-    conn.cmd("DEL", vec![meta.into(), wait.into(), failed.into()])
+    conn.test_cmd("DEL", vec![meta.into(), wait.into(), failed.into()])
         .await
         .ok();
 }
@@ -919,12 +934,14 @@ async fn a_zero_limit_page_reads_nothing_rather_than_everything() {
     let wait = "keylens-zerotest:q:wait";
     let logs = "keylens-zerotest:q:job-1:logs";
 
-    conn.cmd("DEL", vec![wait.into(), logs.into()]).await.ok();
+    conn.test_cmd("DEL", vec![wait.into(), logs.into()])
+        .await
+        .ok();
     for i in 0..5 {
-        conn.cmd("RPUSH", vec![wait.into(), format!("job-{i}").into()])
+        conn.test_cmd("RPUSH", vec![wait.into(), format!("job-{i}").into()])
             .await
             .unwrap();
-        conn.cmd("RPUSH", vec![logs.into(), format!("line-{i}").into()])
+        conn.test_cmd("RPUSH", vec![logs.into(), format!("line-{i}").into()])
             .await
             .unwrap();
     }
@@ -943,7 +960,9 @@ async fn a_zero_limit_page_reads_nothing_rather_than_everything() {
         3
     );
 
-    conn.cmd("DEL", vec![wait.into(), logs.into()]).await.ok();
+    conn.test_cmd("DEL", vec![wait.into(), logs.into()])
+        .await
+        .ok();
 }
 
 #[tokio::test]
@@ -954,10 +973,10 @@ async fn a_long_binary_value_is_marked_truncated() {
     let conn = conn().await;
     let key = "keylens:t:binary-big";
 
-    conn.cmd("DEL", vec![key.into()]).await.ok();
+    conn.test_cmd("DEL", vec![key.into()]).await.ok();
     // Non-UTF8 bytes, well past the 64KB cap.
     let payload: Vec<u8> = (0..80_000).map(|i| 0xF0u8.wrapping_add(i as u8)).collect();
-    conn.cmd("SET", vec![key.into(), payload.as_slice().into()])
+    conn.test_cmd("SET", vec![key.into(), payload.as_slice().into()])
         .await
         .unwrap();
 
@@ -971,7 +990,7 @@ async fn a_long_binary_value_is_marked_truncated() {
         &s[..s.len().min(120)]
     );
 
-    conn.cmd("DEL", vec![key.into()]).await.ok();
+    conn.test_cmd("DEL", vec![key.into()]).await.ok();
 }
 
 #[tokio::test]
@@ -1066,9 +1085,9 @@ async fn a_configured_prefix_reaches_the_lens() {
 
     let setup = conn().await;
     let meta = "myapp:orders:meta";
-    setup.cmd("DEL", vec![meta.into()]).await.ok();
+    setup.test_cmd("DEL", vec![meta.into()]).await.ok();
     setup
-        .cmd(
+        .test_cmd(
             "HSET",
             vec![meta.into(), "version".into(), "bullmq:6.0.2".into()],
         )
@@ -1112,7 +1131,7 @@ async fn a_configured_prefix_reaches_the_lens() {
         "the default prefix must not pick up a custom keyspace"
     );
 
-    setup.cmd("DEL", vec![meta.into()]).await.ok();
+    setup.test_cmd("DEL", vec![meta.into()]).await.ok();
 }
 
 #[tokio::test]
@@ -1128,13 +1147,13 @@ async fn the_batched_key_read_agrees_with_the_sequential_one() {
         ("keylens:rtt:list", vec![("RPUSH", vec!["a", "b", "c"])]),
         ("keylens:rtt:str", vec![("SET", vec!["hello"])]),
     ] {
-        conn.cmd("DEL", vec![key.into()]).await.ok();
+        conn.test_cmd("DEL", vec![key.into()]).await.ok();
         for (cmd, args) in seed {
             let mut full: Vec<keylens_conn::Value> = vec![key.into()];
             full.extend(args.iter().map(|a| keylens_conn::Value::from(*a)));
-            conn.cmd(cmd, full).await.unwrap();
+            conn.test_cmd(cmd, full).await.unwrap();
         }
-        conn.cmd("PEXPIRE", vec![key.into(), 600_000.into()])
+        conn.test_cmd("PEXPIRE", vec![key.into(), 600_000.into()])
             .await
             .unwrap();
 
@@ -1152,7 +1171,7 @@ async fn the_batched_key_read_agrees_with_the_sequential_one() {
             "{key}: memory availability must not change"
         );
 
-        conn.cmd("DEL", vec![key.into()]).await.ok();
+        conn.test_cmd("DEL", vec![key.into()]).await.ok();
     }
 }
 
@@ -1178,9 +1197,9 @@ async fn a_one_round_trip_read_agrees_with_the_sequential_one() {
     for (key, cmd, args) in &seed {
         let mut argv: Vec<keylens_conn::Value> = vec![(*key).into()];
         argv.extend(args.iter().map(|a| (*a).into()));
-        conn.cmd(cmd, argv).await.unwrap();
+        conn.test_cmd(cmd, argv).await.unwrap();
     }
-    conn.cmd("EXPIRE", vec!["keylens:rk:str".into(), 600.into()])
+    conn.test_cmd("EXPIRE", vec!["keylens:rk:str".into(), 600.into()])
         .await
         .unwrap();
 
@@ -1215,6 +1234,6 @@ async fn a_one_round_trip_read_agrees_with_the_sequential_one() {
     assert!(matches!(value, KeyValue::Missing), "{value:?}");
 
     for (key, _, _) in &seed {
-        conn.cmd("UNLINK", vec![(*key).into()]).await.ok();
+        conn.test_cmd("UNLINK", vec![(*key).into()]).await.ok();
     }
 }

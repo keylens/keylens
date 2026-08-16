@@ -10,7 +10,10 @@
 use fred::prelude::*;
 use fred::socket2::TcpKeepalive;
 use fred::types::config::UnresponsiveConfig;
+use fred::types::scan::{ScanResult, ScanType, Scanner};
 use fred::types::{ClusterHash, CustomCommand};
+use futures::{Stream, StreamExt, future::join_all};
+use std::pin::Pin;
 use tracing::debug;
 
 use crate::capability::{Availability, Capabilities, Feature, classify};
@@ -22,6 +25,40 @@ use crate::server_info::ServerInfo;
 pub struct ScanPage {
     pub cursor: String,
     pub keys: Vec<String>,
+}
+
+/// A throttled keyspace scan that also walks every primary in Redis Cluster.
+///
+/// A Redis cursor belongs to one server, so a cluster scan cannot be represented by the
+/// single cursor string used by [`ScanPage`]. This wrapper owns fred's per-primary scanner
+/// state and exposes one page at a time without buffering the whole keyspace.
+pub struct KeyScanner {
+    pages: Pin<Box<dyn Stream<Item = std::result::Result<ScanResult, fred::error::Error>> + Send>>,
+}
+
+impl KeyScanner {
+    /// Return the next page, or `None` once every relevant server has returned cursor zero.
+    pub async fn next_page(&mut self) -> Result<Option<Vec<String>>> {
+        match self.pages.next().await {
+            Some(Ok(mut page)) => {
+                let keys = page
+                    .take_results()
+                    .unwrap_or_default()
+                    .into_iter()
+                    .filter_map(|key| key.into_string())
+                    .collect();
+                // Explicitly continue this node. Dropping also continues it, but spelling
+                // this out makes the throttling contract independent of Drop behaviour.
+                page.next();
+                Ok(Some(keys))
+            }
+            Some(Err(source)) => Err(ConnError::Command {
+                cmd: "SCAN",
+                source,
+            }),
+            None => Ok(None),
+        }
+    }
 }
 
 impl ScanPage {
@@ -219,8 +256,29 @@ impl Conn {
         &self.caps
     }
 
-    pub fn client(&self) -> &Client {
-        &self.client
+    /// Whether this connection addresses a sharded Redis Cluster deployment.
+    pub fn is_clustered(&self) -> bool {
+        self.client.is_clustered()
+    }
+
+    /// Start a throttled scan. Cluster connections scan every primary; standalone and
+    /// sentinel connections scan their selected server.
+    pub fn key_scanner(
+        &self,
+        pattern: Option<&str>,
+        count: u32,
+        type_filter: Option<&str>,
+    ) -> KeyScanner {
+        let pattern = pattern.unwrap_or("*").to_string();
+        let scan_type = type_filter.and_then(parse_scan_type);
+        let pages: Pin<
+            Box<dyn Stream<Item = std::result::Result<ScanResult, fred::error::Error>> + Send>,
+        > = if self.client.is_clustered() {
+            Box::pin(self.client.scan_cluster(pattern, Some(count), scan_type))
+        } else {
+            Box::pin(self.client.scan(pattern, Some(count), scan_type))
+        };
+        KeyScanner { pages }
     }
 
     /// Re-read `INFO`. Cheap enough for the stats pane's refresh tick.
@@ -239,6 +297,12 @@ impl Conn {
         count: u32,
         type_filter: Option<&str>,
     ) -> Result<ScanPage> {
+        if self.client.is_clustered() {
+            return Err(ConnError::Reply {
+                cmd: "SCAN",
+                detail: "a single cursor cannot scan Redis Cluster; use Conn::key_scanner".into(),
+            });
+        }
         let mut args: Vec<Value> = vec![cursor.into()];
         if let Some(p) = pattern {
             args.push("MATCH".into());
@@ -269,9 +333,16 @@ impl Conn {
         parse_scan_reply(reply)
     }
 
-    /// Run an arbitrary command. Used by lenses and the console; capability checks are
-    /// the caller's job.
+    /// Run a command through the read-only allowlist used by built-in and third-party
+    /// lenses. Capability checks remain the caller's job.
     pub async fn cmd(&self, name: &'static str, args: Vec<Value>) -> Result<Value> {
+        if !read_only_command(name, &args) {
+            return Err(ConnError::UnsafeCommand(name));
+        }
+        self.execute(name, args).await
+    }
+
+    async fn execute(&self, name: &'static str, args: Vec<Value>) -> Result<Value> {
         self.client
             .custom(
                 CustomCommand::new_static(name, ClusterHash::FirstKey, false),
@@ -279,6 +350,30 @@ impl Conn {
             )
             .await
             .map_err(|source| ConnError::Command { cmd: name, source })
+    }
+
+    /// Raw command access for live-test fixture setup only.
+    #[cfg(feature = "dangerous-test-commands")]
+    #[doc(hidden)]
+    pub async fn test_cmd(&self, name: &'static str, args: Vec<Value>) -> Result<Value> {
+        self.execute(name, args).await
+    }
+
+    /// Blocking stream read with the client library's correct routing and connection flags.
+    pub async fn xread(
+        &self,
+        keys: &[String],
+        ids: &[String],
+        count: u64,
+        block_ms: u64,
+    ) -> Result<Value> {
+        self.client
+            .xread(Some(count), Some(block_ms), keys.to_vec(), ids.to_vec())
+            .await
+            .map_err(|source| ConnError::Command {
+                cmd: "XREAD",
+                source,
+            })
     }
 
     /// Run many commands in one round trip, reporting each command's outcome separately.
@@ -296,12 +391,54 @@ impl Conn {
     /// the pipeline could not be buffered, or came back with a reply count that no longer
     /// lines up with `cmds`, at which point slot `i` is not necessarily command `i`.
     ///
-    /// Cluster caveat: a pipeline spanning multiple hash slots can be rejected. Callers
-    /// that may span slots should be prepared to fall back to sequential calls.
+    /// On Redis Cluster, commands are routed independently in ordered, bounded-concurrency
+    /// chunks so an arbitrary-key batch cannot fail merely because it spans hash slots.
     pub async fn pipeline(
         &self,
         cmds: &[(&'static str, Vec<Value>)],
     ) -> Result<Vec<Result<Value>>> {
+        if let Some((name, _)) = cmds
+            .iter()
+            .find(|(name, args)| !read_only_command(name, args))
+        {
+            return Err(ConnError::UnsafeCommand(name));
+        }
+        self.pipeline_unchecked(cmds).await
+    }
+
+    #[cfg(feature = "dangerous-test-commands")]
+    #[doc(hidden)]
+    pub async fn test_pipeline(
+        &self,
+        cmds: &[(&'static str, Vec<Value>)],
+    ) -> Result<Vec<Result<Value>>> {
+        self.pipeline_unchecked(cmds).await
+    }
+
+    async fn pipeline_unchecked(
+        &self,
+        cmds: &[(&'static str, Vec<Value>)],
+    ) -> Result<Vec<Result<Value>>> {
+        if self.client.is_clustered() {
+            // A regular Redis pipeline is tied to one connection, while arbitrary keys in
+            // a cluster can live on different primaries. Preserve correctness by letting
+            // fred route each command independently, with bounded concurrency. The result
+            // order remains the input order because `buffered` is ordered.
+            let owned: Vec<(&'static str, Vec<Value>)> = cmds
+                .iter()
+                .map(|(name, args)| (*name, args.clone()))
+                .collect();
+            let mut replies = Vec::with_capacity(owned.len());
+            for chunk in owned.chunks(64) {
+                let pending: Vec<_> = chunk
+                    .iter()
+                    .map(|(name, args)| self.execute(name, args.clone()))
+                    .collect();
+                replies.extend(join_all(pending).await);
+            }
+            return Ok(replies);
+        }
+
         let pipe = self.client.pipeline();
         for (name, args) in cmds {
             // In a pipeline this `await` only buffers -- it does not hit the server.
@@ -330,6 +467,45 @@ impl Conn {
             .zip(cmds.iter())
             .map(|(reply, (cmd, _))| reply.map_err(|source| ConnError::Command { cmd, source }))
             .collect())
+    }
+}
+
+/// The public connection surface is intentionally an allowlist. A lens is loaded into a
+/// process that users are encouraged to point at production; letting it spell arbitrary
+/// Redis commands would make the read-only promise a convention rather than a boundary.
+fn read_only_command(name: &str, args: &[Value]) -> bool {
+    let subcommand = || {
+        args.first()
+            .and_then(Value::as_string)
+            .unwrap_or_default()
+            .to_ascii_uppercase()
+    };
+
+    match name {
+        "CLIENT" => matches!(subcommand().as_str(), "INFO" | "LIST"),
+        "CLUSTER" => matches!(subcommand().as_str(), "INFO" | "NODES" | "SHARDS" | "SLOTS"),
+        "CONFIG" => subcommand() == "GET",
+        "MEMORY" => subcommand() == "USAGE",
+        "MODULE" => subcommand() == "LIST",
+        "PUBSUB" => matches!(subcommand().as_str(), "CHANNELS" | "NUMPAT" | "NUMSUB"),
+        "SLOWLOG" => matches!(subcommand().as_str(), "GET" | "LEN"),
+        "XINFO" => matches!(subcommand().as_str(), "STREAM" | "GROUPS" | "CONSUMERS"),
+        "GETRANGE" | "HGET" | "HMGET" | "HSCAN" | "HLEN" | "LLEN" | "LRANGE" | "PTTL" | "SCAN"
+        | "SCARD" | "SSCAN" | "STRLEN" | "TYPE" | "XLEN" | "XPENDING" | "XRANGE" | "ZCARD"
+        | "ZRANGE" | "ZREVRANGE" => true,
+        _ => false,
+    }
+}
+
+fn parse_scan_type(raw: &str) -> Option<ScanType> {
+    match raw {
+        "string" => Some(ScanType::String),
+        "hash" => Some(ScanType::Hash),
+        "list" => Some(ScanType::List),
+        "set" => Some(ScanType::Set),
+        "zset" => Some(ScanType::ZSet),
+        "stream" => Some(ScanType::Stream),
+        _ => None,
     }
 }
 
@@ -504,12 +680,18 @@ fn apply_probe_results(
     }
 }
 
-/// Run every probe in one round trip, falling back to serial calls if the pipeline
-/// cannot be used -- a cluster can reject one that spans hash slots.
+/// Run every probe in one round trip on standalone servers.
+///
+/// Cluster pipelines are tied to one node and these probes include commands with different
+/// routing shapes, so let the client route them independently there.
 async fn run_probe_pipeline(
     client: &Client,
     probes: &[(Feature, &'static str, Vec<Value>)],
 ) -> Vec<std::result::Result<Value, Error>> {
+    if client.is_clustered() {
+        return probe_serially(client, probes).await;
+    }
+
     let pipe = client.pipeline();
     for (_, cmd, args) in probes {
         // In a pipeline this only buffers; it does not reach the server.
@@ -662,5 +844,30 @@ mod tests {
     #[test]
     fn rejects_malformed_scan_reply() {
         assert!(parse_scan_reply(Value::from("nope")).is_err());
+    }
+
+    #[test]
+    fn public_command_surface_rejects_writes_and_unsafe_subcommands() {
+        assert!(read_only_command("TYPE", &[Value::from("k")]));
+        assert!(read_only_command(
+            "CONFIG",
+            &[Value::from("GET"), Value::from("*")]
+        ));
+        assert!(!read_only_command(
+            "CONFIG",
+            &[
+                Value::from("SET"),
+                Value::from("maxmemory"),
+                Value::from("1")
+            ]
+        ));
+        assert!(!read_only_command(
+            "CLIENT",
+            &[Value::from("KILL"), Value::from("ID"), Value::from("1")]
+        ));
+        assert!(!read_only_command(
+            "SET",
+            &[Value::from("k"), Value::from("v")]
+        ));
     }
 }

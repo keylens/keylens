@@ -12,6 +12,11 @@ repository.workspace = true
 homepage.workspace = true
 authors.workspace = true
 
+[features]
+# Enables raw commands only for the workspace's live fixture setup. Never enable this in
+# an application or lens.
+dangerous-test-commands = []
+
 [dependencies]
 fred.workspace = true
 tokio.workspace = true

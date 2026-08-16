@@ -9,8 +9,8 @@ use std::sync::Arc;
 
 use keylens_bullmq::{BullMqLens, EventsStatus, Job, JobRef, QueueSummary, State};
 use keylens_conn::{
-    ClientInfo, ClusterTopology, Conn, Feature, KeyMeta, KeyValue, Kind, PubSubChannel, ServerInfo,
-    SlowEntry, StreamInfo, Value,
+    ClientInfo, ClusterTopology, Conn, Feature, KeyMeta, KeyScanner, KeyValue, Kind, PubSubChannel,
+    ServerInfo, SlowEntry, StreamInfo, Value,
 };
 use keylens_lens::{Detection, Lens};
 use keylens_ui::PaneState;
@@ -23,7 +23,8 @@ const BATCH_TARGET: usize = 500;
 /// page; without this the worker would walk the entire keyspace before rendering anything.
 const MAX_PAGES_PER_BATCH: usize = 40;
 const SCAN_COUNT: u32 = 500;
-/// Cap on how many keys get typed per batch, to bound the pipeline size.
+/// Cap on each typing pipeline. A SCAN page may exceed its COUNT hint, so large replies
+/// are split rather than silently left untyped or incorrectly dropped by a type filter.
 const MAX_TYPED: usize = 1_000;
 const SLOWLOG_ENTRIES: u32 = 128;
 const PUBSUB_CHANNELS: usize = 200;
@@ -112,7 +113,7 @@ pub struct JobDetail {
 
 pub struct Worker {
     conn: Arc<Conn>,
-    cursor: String,
+    scanner: Option<tokio::sync::Mutex<KeyScanner>>,
     pattern: Option<String>,
     kind: Option<Kind>,
     complete: bool,
@@ -150,7 +151,7 @@ impl Worker {
     pub fn with_prefix(conn: Conn, prefix: Option<String>) -> Self {
         Self {
             conn: Arc::new(conn),
-            cursor: "0".into(),
+            scanner: None,
             pattern: None,
             kind: None,
             complete: false,
@@ -167,10 +168,14 @@ impl Worker {
         while let Some(req) = rx.recv().await {
             let update = match req {
                 Request::Rescan { pattern, kind } => {
-                    self.cursor = "0".into();
                     self.pattern = pattern;
                     self.kind = kind;
                     self.complete = false;
+                    self.scanner = Some(tokio::sync::Mutex::new(self.conn.key_scanner(
+                        self.pattern.as_deref(),
+                        SCAN_COUNT,
+                        self.server_type_filter(),
+                    )));
                     self.scan_batch(true).await
                 }
                 // A request always gets a reply, including this one. The UI sets `loading`
@@ -201,17 +206,26 @@ impl Worker {
                 }
 
                 Request::LoadSlowlog => Update::Slowlog(
-                    self.pane(Feature::Slowlog, self.conn.slowlog(SLOWLOG_ENTRIES))
-                        .await,
+                    Self::pane(
+                        self.conn.capabilities().get(Feature::Slowlog),
+                        self.conn.slowlog(SLOWLOG_ENTRIES),
+                    )
+                    .await,
                 ),
                 Request::LoadClients => Update::Clients(
-                    self.pane(Feature::ClientList, self.conn.client_list())
-                        .await,
+                    Self::pane(
+                        self.conn.capabilities().get(Feature::ClientList),
+                        self.conn.client_list(),
+                    )
+                    .await,
                 ),
-                Request::LoadCluster => Update::Cluster(self.cluster().await),
+                Request::LoadCluster => Update::Cluster(Self::cluster(self.conn.clone()).await),
                 Request::LoadPubSub => Update::PubSub(
-                    self.pane(Feature::PubSub, self.conn.pubsub_channels(PUBSUB_CHANNELS))
-                        .await,
+                    Self::pane(
+                        self.conn.capabilities().get(Feature::PubSub),
+                        self.conn.pubsub_channels(PUBSUB_CHANNELS),
+                    )
+                    .await,
                 ),
 
                 Request::Detect => {
@@ -264,27 +278,24 @@ impl Worker {
         let mut pages = 0usize;
 
         while keys.len() < BATCH_TARGET && pages < MAX_PAGES_PER_BATCH && !self.complete {
-            let type_filter = self.kind.map(|k| k.label());
             let page = match self
-                .conn
-                .scan_page(
-                    &self.cursor,
-                    self.pattern.as_deref(),
-                    SCAN_COUNT,
-                    type_filter,
-                )
+                .scanner
+                .as_mut()
+                .expect("scanner created by Rescan")
+                .get_mut()
+                .next_page()
                 .await
             {
-                Ok(p) => p,
+                Ok(Some(p)) => p,
+                Ok(None) => {
+                    self.complete = true;
+                    break;
+                }
                 Err(e) => return Update::Error(e.to_string()),
             };
 
             pages += 1;
-            keys.extend(page.keys.iter().cloned());
-            self.cursor = page.cursor.clone();
-            if page.is_complete() {
-                self.complete = true;
-            }
+            keys.extend(page);
         }
 
         let typed = self.type_keys(keys).await;
@@ -296,43 +307,63 @@ impl Worker {
         }
     }
 
+    fn server_type_filter(&self) -> Option<&str> {
+        self.kind
+            .filter(|_| self.conn.capabilities().has(Feature::ScanTypeFilter))
+            .map(|kind| kind.label())
+    }
+
     /// Resolve each key's type in one round trip.
     ///
     /// When a `TYPE` filter is already active the answer is known, so this is skipped
     /// entirely -- no reason to ask the server what it just filtered on.
     async fn type_keys(&self, keys: Vec<String>) -> Vec<(String, Option<Kind>)> {
-        if let Some(k) = self.kind {
+        if let Some(k) = self.kind
+            && self.conn.capabilities().has(Feature::ScanTypeFilter)
+        {
             return keys.into_iter().map(|key| (key, Some(k))).collect();
         }
         if keys.is_empty() {
             return Vec::new();
         }
 
-        let head = keys.len().min(MAX_TYPED);
-        let cmds: Vec<(&'static str, Vec<Value>)> = keys[..head]
-            .iter()
-            .map(|k| ("TYPE", vec![Value::from(k.as_str())]))
-            .collect();
-
-        let kinds = match self.conn.pipeline(&cmds).await {
-            Ok(v) => v,
-            Err(e) => {
-                // Types are a nicety; the tree is still usable without them.
-                warn!(error = %e, "typing keys failed; continuing untyped");
-                Vec::new()
+        let mut kinds = Vec::with_capacity(keys.len());
+        for chunk in keys.chunks(MAX_TYPED) {
+            let cmds: Vec<(&'static str, Vec<Value>)> = chunk
+                .iter()
+                .map(|k| ("TYPE", vec![Value::from(k.as_str())]))
+                .collect();
+            match self.conn.pipeline(&cmds).await {
+                Ok(mut replies) => kinds.append(&mut replies),
+                Err(e) => {
+                    // Preserve one positional slot per key. Without an active filter an
+                    // unknown type is only a missing tag; with one it must be excluded.
+                    warn!(error = %e, "typing keys failed; continuing untyped");
+                    kinds.extend((0..chunk.len()).map(|_| {
+                        Err(keylens_conn::ConnError::Reply {
+                            cmd: "TYPE",
+                            detail: "typing batch failed".into(),
+                        })
+                    }));
+                }
             }
-        };
+        }
 
+        let requested = self.kind;
         keys.into_iter()
             .enumerate()
-            .map(|(i, key)| {
+            .filter_map(|(i, key)| {
                 // One key failing to type -- deleted mid-batch, say -- costs that key its
                 // tag and nothing else. It used to cost the whole batch its types.
                 let kind = kinds
                     .get(i)
                     .and_then(|r| r.as_ref().ok())
                     .map(|v| Kind::parse(&keylens_conn::value::display_string(v)));
-                (key, kind)
+                if requested.is_some_and(|wanted| kind != Some(wanted)) {
+                    None
+                } else {
+                    Some((key, kind))
+                }
             })
             .collect()
     }
@@ -342,11 +373,10 @@ impl Worker {
     /// The capability check comes first so a blocked command reports *why* it's blocked,
     /// using the reason captured at connect time, rather than whatever generic error the
     /// server happens to return for it.
-    async fn pane<T, F>(&self, feature: Feature, load: F) -> PaneState<T>
+    async fn pane<T, F>(availability: keylens_conn::Availability, load: F) -> PaneState<T>
     where
         F: Future<Output = keylens_conn::Result<T>>,
     {
-        let availability = self.conn.capabilities().get(feature);
         if !availability.is_available() {
             return PaneState::Unavailable(
                 availability
@@ -367,8 +397,8 @@ impl Worker {
     /// disabled"), which the probe correctly records as unavailable. But for this pane the
     /// honest answer is "you're on a standalone server", not "your host blocked this" --
     /// those are very different messages to show someone.
-    async fn cluster(&self) -> PaneState<Box<ClusterTopology>> {
-        let availability = self.conn.capabilities().get(Feature::Cluster);
+    async fn cluster(conn: Arc<Conn>) -> PaneState<Box<ClusterTopology>> {
+        let availability = conn.capabilities().get(Feature::Cluster);
         if let keylens_conn::Availability::Denied(why) = &availability
             && why
                 .to_ascii_lowercase()
@@ -376,8 +406,8 @@ impl Worker {
         {
             return PaneState::Ready(Box::default());
         }
-        self.pane(Feature::Cluster, async {
-            self.conn.cluster_topology().await.map(Box::new)
+        Self::pane(availability, async {
+            conn.cluster_topology().await.map(Box::new)
         })
         .await
     }

@@ -139,15 +139,7 @@ pub enum KeyValue {
     Stream(Vec<StreamEntry>),
     /// Key vanished between listing and reading -- normal on a live keyspace.
     Missing,
-    /// Too big to read safely on a server that lacks the bounded read command.
-    TooLarge {
-        /// The Redis type, for the message: `this hash holds more than …`.
-        what: &'static str,
-        limit: usize,
-        /// What `limit` counts. A string's cap is bytes; a collection's is elements, and
-        /// telling someone a string "holds more than 65536 entries" is just wrong.
-        unit: &'static str,
-    },
+    /// The server cannot provide a safely paged representation of this value.
     Unsupported(String),
 }
 
@@ -161,7 +153,7 @@ impl KeyValue {
             KeyValue::Set(v) => v.len(),
             KeyValue::ZSet(v) => v.len(),
             KeyValue::Stream(v) => v.len(),
-            KeyValue::Missing | KeyValue::Unsupported(_) | KeyValue::TooLarge { .. } => 0,
+            KeyValue::Missing | KeyValue::Unsupported(_) => 0,
         }
     }
 
@@ -289,10 +281,10 @@ impl Conn {
     /// 390ms it is the difference between a key opening in 0.4s and in 1.2s, on every
     /// single keypress — which is what makes browsing feel broken rather than distant.
     pub async fn read_key(&self, key: &str) -> Result<(KeyMeta, KeyValue)> {
-        // Speculation only pays when the bounded reads exist for every type. Without them
-        // strings and collections need a measure-then-read *pair* that cannot be
-        // pipelined, so those servers take the sequential path and keep the guarantee that
-        // matters more than the round trip: no unbounded read, ever.
+        // Speculation only pays when the bounded reads exist for every type. Servers
+        // missing one take the sequential path so the unsupported result is specific to
+        // the selected type. No measure-then-read fallback is safe: the key can grow
+        // between those commands.
         if !(self.capabilities().has(Feature::GetRange)
             && self.capabilities().has(Feature::CursorCollectionScan))
         {
@@ -347,7 +339,7 @@ impl Conn {
         Ok((meta, value))
     }
 
-    /// The three-round-trip path, for servers without the bounded read commands.
+    /// The two-round-trip path, for servers without every bounded read command.
     ///
     /// Still collapsed where it can be: the size and the value both need the type but not
     /// each other, so they go out together.
@@ -411,17 +403,13 @@ impl Conn {
                         )
                         .await?;
                     decode_string(&reply)
-                } else if size_ok(self, key, "STRLEN", MAX_STRING_BYTES).await? {
-                    // No GETRANGE on this server. STRLEN first, then a whole GET only if
-                    // the value is small enough -- the bound is preserved, just measured
-                    // instead of requested.
-                    KeyValue::String(display_string(&self.cmd("GET", vec![key.into()]).await?))
                 } else {
-                    KeyValue::TooLarge {
-                        what: "string",
-                        limit: MAX_STRING_BYTES,
-                        unit: "bytes",
-                    }
+                    // Measuring first and issuing GET second has a race: another client can
+                    // replace the value with a huge string between those commands. On a
+                    // server without GETRANGE there is no genuinely bounded read.
+                    KeyValue::Unsupported(
+                        "this server has no bounded string read (GETRANGE)".into(),
+                    )
                 }
             }
 
@@ -451,14 +439,8 @@ impl Conn {
                         )
                         .await?;
                     decode_hash(&reply)?
-                } else if size_ok(self, key, "HLEN", PAGE).await? {
-                    KeyValue::Hash(whole_collection(self, key, "HGETALL").await?)
                 } else {
-                    KeyValue::TooLarge {
-                        what: "hash",
-                        limit: PAGE,
-                        unit: "fields",
-                    }
+                    KeyValue::Unsupported("this server has no bounded hash read (HSCAN)".into())
                 }
             }
 
@@ -471,15 +453,8 @@ impl Conn {
                         )
                         .await?;
                     decode_set(&reply)?
-                } else if size_ok(self, key, "SCARD", PAGE).await? {
-                    let reply = self.cmd("SMEMBERS", vec![key.into()]).await?;
-                    KeyValue::Set(as_string_vec(&reply))
                 } else {
-                    KeyValue::TooLarge {
-                        what: "set",
-                        limit: PAGE,
-                        unit: "members",
-                    }
+                    KeyValue::Unsupported("this server has no bounded set read (SSCAN)".into())
                 }
             }
 
@@ -595,12 +570,21 @@ fn decode_string(reply: &Value) -> KeyValue {
 }
 
 fn decode_hash(reply: &Value) -> Result<KeyValue> {
-    Ok(KeyValue::Hash(as_field_pairs(&scan_items(reply)?)))
+    let items = scan_items(reply)?;
+    // SCAN COUNT is a target, not a hard limit. Keep the UI/API page bounded even if the
+    // server returns a larger compact-encoding bucket in one step.
+    Ok(KeyValue::Hash(as_field_pairs(
+        &items[..items.len().min(PAGE * 2)],
+    )))
 }
 
 fn decode_set(reply: &Value) -> Result<KeyValue> {
     Ok(KeyValue::Set(
-        scan_items(reply)?.iter().map(display_string).collect(),
+        scan_items(reply)?
+            .iter()
+            .take(PAGE)
+            .map(display_string)
+            .collect(),
     ))
 }
 
@@ -613,39 +597,6 @@ fn reply_byte_len(v: &Value) -> usize {
         .map(|b| b.len())
         .or_else(|| v.as_string().map(|s| s.len()))
         .unwrap_or(0)
-}
-
-/// Measure a key with `cmd` and report whether it is under `limit`.
-///
-/// This is what keeps the whole-collection fallbacks honest. keylens never issues an
-/// unbounded read; on a server without the cursor variants it *measures* first with a
-/// command that server does have, and declines when the answer is too big. The bound is
-/// preserved — it's just enforced client-side instead of requested server-side.
-async fn size_ok(conn: &Conn, key: &str, cmd: &'static str, limit: usize) -> Result<bool> {
-    let n = conn.cmd(cmd, vec![key.into()]).await?.as_u64().unwrap_or(0);
-    Ok(n as usize <= limit)
-}
-
-/// Read a whole hash. Only ever called behind [`size_ok`].
-async fn whole_collection(
-    conn: &Conn,
-    key: &str,
-    cmd: &'static str,
-) -> Result<Vec<(String, String)>> {
-    let reply = conn.cmd(cmd, vec![key.into()]).await?;
-    Ok(match reply {
-        Value::Array(items) => as_field_pairs(&items),
-        Value::Map(map) => map
-            .iter()
-            .map(|(k, v)| {
-                (
-                    k.as_str().unwrap_or_default().to_string(),
-                    display_string(v),
-                )
-            })
-            .collect(),
-        _ => Vec::new(),
-    })
 }
 
 fn as_string_vec(v: &Value) -> Vec<String> {
@@ -772,7 +723,9 @@ mod tests {
     fn speculative_reads_are_all_bounded() {
         // The crate's one hard rule: no unbounded collection read, ever. Speculating over
         // six types at once multiplies the cost of getting this wrong by six.
-        const UNBOUNDED: [&str; 4] = ["GET", "HGETALL", "SMEMBERS", "LRANGE_ALL"];
+        // The workspace guard owns the collection-command list. Keep the two shapes that
+        // require argument-aware checks here: an unbounded string read and a full range.
+        const UNBOUNDED: [&str; 2] = ["GET", "LRANGE_ALL"];
         for kind in SPECULATIVE_KINDS {
             let (cmd, args) = value_cmd(kind, "k");
             assert!(
@@ -892,39 +845,23 @@ mod tests {
     }
 
     #[test]
-    fn oversized_values_carry_the_unit_their_limit_is_counted_in() {
-        // "this string holds more than 65536 entries" was the wrong noun: a string's cap
-        // is bytes, a hash's is fields, a set's is members.
-        for (value, unit) in [
-            (
-                KeyValue::TooLarge {
-                    what: "string",
-                    limit: MAX_STRING_BYTES,
-                    unit: "bytes",
-                },
-                "bytes",
-            ),
-            (
-                KeyValue::TooLarge {
-                    what: "hash",
-                    limit: PAGE,
-                    unit: "fields",
-                },
-                "fields",
-            ),
-            (
-                KeyValue::TooLarge {
-                    what: "set",
-                    limit: PAGE,
-                    unit: "members",
-                },
-                "members",
-            ),
-        ] {
-            let KeyValue::TooLarge { unit: got, .. } = value else {
-                unreachable!()
-            };
-            assert_eq!(got, unit);
-        }
+    fn scan_count_overshoot_is_capped_in_the_decoded_page() {
+        let set_reply = Value::Array(vec![
+            Value::from("1"),
+            Value::Array((0..PAGE + 20).map(|i| Value::from(i as i64)).collect()),
+        ]);
+        let KeyValue::Set(set) = decode_set(&set_reply).unwrap() else {
+            unreachable!()
+        };
+        assert_eq!(set.len(), PAGE);
+
+        let hash_items = (0..PAGE + 20)
+            .flat_map(|i| [Value::from(format!("f{i}")), Value::from("v")])
+            .collect();
+        let hash_reply = Value::Array(vec![Value::from("1"), Value::Array(hash_items)]);
+        let KeyValue::Hash(hash) = decode_hash(&hash_reply).unwrap() else {
+            unreachable!()
+        };
+        assert_eq!(hash.len(), PAGE);
     }
 }

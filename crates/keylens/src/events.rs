@@ -4,15 +4,16 @@
 //! connection for the duration of the block, so sharing the worker's connection would
 //! stall every key lookup behind it.
 //!
-//! One `XREAD` covers every queue at once — Redis takes multiple streams in a single call
-//! — so watching 40 queues costs one blocked connection, not 40.
+//! One `XREAD` covers every queue at once on standalone Redis. In Cluster, Redis requires
+//! all streams in that call to share a hash slot; keylens reports live events unavailable
+//! when the configured BullMQ keys do not provide a shared hash tag.
 
 use std::time::Duration;
 
 use keylens_bullmq::EventsStatus;
 use keylens_bullmq::QueueKeys;
 use keylens_bullmq::events::{EventKind, entry_id_ms};
-use keylens_conn::{Conn, Value};
+use keylens_conn::{Conn, Value, key_slot};
 use tokio::sync::mpsc::Sender;
 use tracing::{debug, warn};
 
@@ -69,6 +70,23 @@ pub async fn run(conn: Conn, prefix: String, queues: Vec<String>, tx: Sender<Upd
         .map(|q| QueueKeys::new(&prefix, q).events())
         .collect();
 
+    if conn.is_clustered()
+        && keys
+            .iter()
+            .map(|key| key_slot(key))
+            .collect::<std::collections::BTreeSet<_>>()
+            .len()
+            > 1
+    {
+        tx.send(Update::EventsStatus(EventsStatus::Unavailable(
+            "live throughput needs the watched streams in one Redis Cluster hash slot; use a shared BullMQ hash-tag prefix"
+                .into(),
+        )))
+        .await
+        .ok();
+        return;
+    }
+
     // `$` means "only entries added from now on". Reading history would replay hours of
     // events into the first second of the graph and draw a spike that never happened.
     let mut ids: Vec<String> = vec!["$".to_string(); keys.len()];
@@ -84,17 +102,7 @@ pub async fn run(conn: Conn, prefix: String, queues: Vec<String>, tx: Sender<Upd
     let mut failures: u32 = 0;
 
     loop {
-        let mut args: Vec<Value> = vec![
-            "COUNT".into(),
-            COUNT.into(),
-            "BLOCK".into(),
-            BLOCK_MS.into(),
-            "STREAMS".into(),
-        ];
-        args.extend(keys.iter().map(|k| Value::from(k.as_str())));
-        args.extend(ids.iter().map(|i| Value::from(i.as_str())));
-
-        let reply = match conn.cmd("XREAD", args).await {
+        let reply = match conn.xread(&keys, &ids, COUNT as u64, BLOCK_MS as u64).await {
             Ok(v) => v,
             Err(e) => {
                 // A blocking read that times out is not an error, but a dropped connection
@@ -364,5 +372,17 @@ mod tests {
         ])]);
         assert!(parse_xread(&reply, &keys, &queues, &mut ids).is_empty());
         assert!(parse_xread(&Value::from("nope"), &keys, &queues, &mut ids).is_empty());
+    }
+
+    #[test]
+    fn cluster_event_streams_need_one_shared_hash_tag() {
+        assert_eq!(
+            key_slot("bull:{tenant}:emails:events"),
+            key_slot("bull:{tenant}:reports:events")
+        );
+        assert_ne!(
+            key_slot("bull:emails:events"),
+            key_slot("bull:reports:events")
+        );
     }
 }

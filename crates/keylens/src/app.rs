@@ -4,7 +4,7 @@ use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
 use keylens_bullmq::{JobRef, QueueSummary, State, Throughput};
 use keylens_conn::{
     ClientInfo, ClusterTopology, KeyMeta, KeyValue, Kind, PubSubChannel, ServerInfo, SlowEntry,
-    StreamInfo,
+    StreamInfo, redact_url,
 };
 use keylens_lens::Detection;
 use keylens_ui::KeyTree;
@@ -87,6 +87,10 @@ const KIND_CYCLE: [Option<Kind>; 7] = [
     Some(Kind::ZSet),
     Some(Kind::Stream),
 ];
+
+fn worker_busy<T>() -> PaneState<T> {
+    PaneState::Failed("worker busy — press r to retry".into())
+}
 
 pub struct App {
     pub tree: KeyTree,
@@ -185,7 +189,9 @@ impl App {
             job: PaneState::Idle,
             throughput: Throughput::default(),
             server,
-            url,
+            // App is public within the library, so enforce the display boundary here too;
+            // callers should not have to remember that Redis URLs can contain passwords.
+            url: redact_url(&url),
             // The connection is already established by the time the TUI starts, so the
             // splash is covering the first scan, not the connect.
             status: "scanning keyspace…".into(),
@@ -370,33 +376,48 @@ impl App {
             }
             View::Slowlog => {
                 if force || self.slowlog.is_idle() {
-                    self.slowlog = PaneState::Loading;
-                    let _ = self.send(Request::LoadSlowlog).await;
+                    self.slowlog = if self.send(Request::LoadSlowlog).await {
+                        PaneState::Loading
+                    } else {
+                        worker_busy()
+                    };
                 }
             }
             View::Clients => {
                 if force || self.clients.is_idle() {
-                    self.clients = PaneState::Loading;
-                    let _ = self.send(Request::LoadClients).await;
+                    self.clients = if self.send(Request::LoadClients).await {
+                        PaneState::Loading
+                    } else {
+                        worker_busy()
+                    };
                 }
             }
             View::Cluster => {
                 if force || self.cluster.is_idle() {
-                    self.cluster = PaneState::Loading;
-                    let _ = self.send(Request::LoadCluster).await;
+                    self.cluster = if self.send(Request::LoadCluster).await {
+                        PaneState::Loading
+                    } else {
+                        worker_busy()
+                    };
                 }
             }
             View::PubSub => {
                 if force || self.pubsub.is_idle() {
-                    self.pubsub = PaneState::Loading;
-                    let _ = self.send(Request::LoadPubSub).await;
+                    self.pubsub = if self.send(Request::LoadPubSub).await {
+                        PaneState::Loading
+                    } else {
+                        worker_busy()
+                    };
                 }
             }
             View::Queues => match self.level {
                 QueueLevel::Queues => {
                     if force || self.queues.is_idle() {
-                        self.queues = PaneState::Loading;
-                        let _ = self.send(Request::LoadQueues).await;
+                        self.queues = if self.send(Request::LoadQueues).await {
+                            PaneState::Loading
+                        } else {
+                            worker_busy()
+                        };
                     }
                 }
                 QueueLevel::Jobs => self.load_jobs().await,
@@ -409,9 +430,12 @@ impl App {
         let Some(queue) = self.selected_queue().map(|q| q.name.clone()) else {
             return;
         };
-        self.jobs = PaneState::Loading;
         let state = self.job_state;
-        let _ = self.send(Request::LoadJobs { queue, state }).await;
+        self.jobs = if self.send(Request::LoadJobs { queue, state }).await {
+            PaneState::Loading
+        } else {
+            worker_busy()
+        };
     }
 
     async fn load_job(&mut self) {
@@ -421,8 +445,11 @@ impl App {
         let Some(id) = self.selected_job().map(|j| j.id.clone()) else {
             return;
         };
-        self.job = PaneState::Loading;
-        let _ = self.send(Request::LoadJob { queue, id }).await;
+        self.job = if self.send(Request::LoadJob { queue, id }).await {
+            PaneState::Loading
+        } else {
+            worker_busy()
+        };
     }
 
     async fn handle_queues_key(&mut self, key: KeyEvent) {
@@ -586,11 +613,15 @@ impl App {
     }
 
     async fn rescan(&mut self) {
-        self.loading = true;
-        self.status = "scanning…".into();
-        self.scan_complete = false;
         let (pattern, kind) = (self.pattern.clone(), self.kind_filter);
-        let _ = self.send(Request::Rescan { pattern, kind }).await;
+        if self.send(Request::Rescan { pattern, kind }).await {
+            self.loading = true;
+            self.status = "scanning…".into();
+            self.scan_complete = false;
+        } else {
+            self.loading = false;
+            self.status = "worker busy — press r to retry".into();
+        }
     }
 
     pub async fn handle_key(&mut self, key: KeyEvent) {
@@ -721,8 +752,12 @@ impl App {
 
             KeyCode::Char('m') => {
                 if !self.scan_complete {
-                    self.loading = true;
-                    let _ = self.send(Request::More).await;
+                    if self.send(Request::More).await {
+                        self.loading = true;
+                    } else {
+                        self.loading = false;
+                        self.status = "worker busy — press m to retry".into();
+                    }
                 }
             }
 
@@ -832,13 +867,20 @@ mod tests {
     use keylens_conn::ServerInfo;
     use tokio::sync::mpsc;
 
-    fn app() -> App {
-        let (tx, _rx) = mpsc::channel(8);
-        App::new(
-            ServerInfo::parse("redis_version:8.0.0\r\n"),
-            "redis://x".into(),
-            tx,
+    fn app_with_rx() -> (App, mpsc::Receiver<Request>) {
+        let (tx, rx) = mpsc::channel(8);
+        (
+            App::new(
+                ServerInfo::parse("redis_version:8.0.0\r\n"),
+                "redis://x".into(),
+                tx,
+            ),
+            rx,
         )
+    }
+
+    fn app() -> App {
+        app_with_rx().0
     }
 
     fn batch(keys: &[&str]) -> Update {
@@ -857,6 +899,31 @@ mod tests {
         assert_eq!(a.rows.len(), 2);
         assert!(!a.loading);
         assert!(a.scan_complete);
+    }
+
+    #[test]
+    fn app_never_stores_a_displayable_password() {
+        let (tx, _rx) = mpsc::channel(1);
+        let a = App::new(
+            ServerInfo::unknown(),
+            "rediss://admin:hunter2@redis.example:6379".into(),
+            tx,
+        );
+        assert_eq!(a.url, "rediss://admin:***@redis.example:6379");
+        assert!(!a.url.contains("hunter2"));
+    }
+
+    #[tokio::test]
+    async fn a_rejected_request_never_leaves_loading_state_behind() {
+        // app() drops the receiver, which exercises the same immediate rejection as a
+        // saturated channel without needing a worker task.
+        let mut a = app();
+        a.rescan().await;
+        assert!(!a.loading);
+        assert!(a.status.contains("worker busy"));
+
+        a.goto(View::Slowlog).await;
+        assert!(matches!(a.slowlog, PaneState::Failed(ref why) if why.contains("worker busy")));
     }
 
     #[test]
@@ -990,12 +1057,13 @@ mod tests {
 
     #[tokio::test]
     async fn opening_a_pane_loads_it_once() {
-        let mut a = app();
+        let (mut a, mut rx) = app_with_rx();
         assert!(a.slowlog.is_idle(), "panes must not load until opened");
 
         a.handle_normal_key(KeyEvent::from(KeyCode::Char('3')))
             .await;
         assert!(matches!(a.slowlog, PaneState::Loading));
+        assert!(matches!(rx.try_recv(), Ok(Request::LoadSlowlog)));
 
         // Coming back to an already-loaded pane must not refire the request.
         a.slowlog = PaneState::Ready(vec![]);
@@ -1004,11 +1072,12 @@ mod tests {
         a.handle_normal_key(KeyEvent::from(KeyCode::Char('3')))
             .await;
         assert!(matches!(a.slowlog, PaneState::Ready(_)));
+        assert!(rx.try_recv().is_err(), "a ready pane must not refire");
     }
 
     #[tokio::test]
     async fn r_reloads_the_pane_that_is_showing() {
-        let mut a = app();
+        let (mut a, mut rx) = app_with_rx();
         a.view = View::Clients;
         a.clients = PaneState::Ready(vec![]);
 
@@ -1018,6 +1087,7 @@ mod tests {
             matches!(a.clients, PaneState::Loading),
             "r should force a reload"
         );
+        assert!(matches!(rx.try_recv(), Ok(Request::LoadClients)));
     }
 
     #[tokio::test]

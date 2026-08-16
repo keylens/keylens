@@ -4,14 +4,14 @@ use std::sync::Arc;
 
 use color_eyre::Result;
 use keylens_bullmq::{BullMqLens, State};
-use keylens_conn::{Conn, Feature};
+use keylens_conn::{Conn, Feature, redact_url};
 use keylens_lens::Registry;
 
 use crate::config::Target;
 
 pub async fn run(target: &Target, show_queues: bool) -> Result<()> {
     let url = &target.url;
-    println!("connecting to {url}");
+    println!("connecting to {}", redact_url(url));
     let conn = Conn::connect(url, "probe").await?;
     let server = conn.server();
 
