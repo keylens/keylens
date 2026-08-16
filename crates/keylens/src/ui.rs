@@ -531,22 +531,6 @@ fn value_lines(value: &KeyValue, width: usize) -> Vec<Line<'static>> {
             Theme::dim(),
         ))],
 
-        // Not an error: this server has no cursor-based read for the type, so keylens
-        // measured the key first and declined rather than pulling the whole thing.
-        KeyValue::TooLarge { what, limit, unit } => vec![
-            Line::from(Span::styled(
-                format!(
-                    "this {what} is larger than {} {unit}",
-                    format::count(*limit as u64)
-                ),
-                Theme::warn(),
-            )),
-            Line::from(Span::styled(
-                "this server has no cursor-based read for it, so keylens will not fetch it whole",
-                Theme::dim(),
-            )),
-        ],
-
         KeyValue::Unsupported(why) => vec![Line::from(Span::styled(why.clone(), Theme::warn()))],
     }
 }

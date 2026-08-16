@@ -6,7 +6,7 @@ use color_eyre::Result;
 use crossterm::event::{Event, EventStream, KeyEventKind};
 use futures::StreamExt;
 use keylens_bullmq::EventsStatus;
-use keylens_conn::Conn;
+use keylens_conn::{Conn, redact_url};
 use tokio::sync::mpsc;
 use tracing::warn;
 
@@ -102,7 +102,7 @@ pub async fn run(target: &Target) -> Result<()> {
     let worker = Worker::with_prefix(conn, target.prefix.clone());
     let worker_handle = tokio::spawn(worker.run(req_rx, up_tx));
 
-    let mut app = App::new(server, url.to_string(), req_tx.clone());
+    let mut app = App::new(server, redact_url(url), req_tx.clone());
     // Detection first: it's cheap, and its result decides whether a queues tab exists and
     // which streams the event reader follows.
     req_tx.send(Request::Detect).await.ok();
@@ -141,6 +141,7 @@ async fn connect_with_splash(
     terminal: &mut ratatui::DefaultTerminal,
     url: &str,
 ) -> Result<Option<Conn>> {
+    let display_url = redact_url(url);
     let started = std::time::Instant::now();
     let mut connecting = Box::pin(Conn::connect_with_timeout(
         url,
@@ -154,7 +155,7 @@ async fn connect_with_splash(
 
     loop {
         terminal.draw(|f| {
-            ui::draw_connecting(f, url, &status_line(started.elapsed()), None);
+            ui::draw_connecting(f, &display_url, &status_line(started.elapsed()), None);
         })?;
 
         tokio::select! {
@@ -165,7 +166,7 @@ async fn connect_with_splash(
                         // Show it here: by the time `main` prints an error the terminal is
                         // already restored and the message can scroll past unread.
                         let message = e.to_string();
-                        await_dismiss(terminal, url, &message, &mut events).await?;
+                        await_dismiss(terminal, &display_url, &message, &mut events).await?;
                         Err(e.into())
                     }
                 };

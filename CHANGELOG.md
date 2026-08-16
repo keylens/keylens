@@ -8,9 +8,27 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
-Documentation and packaging metadata only. No behaviour change, no code touched.
+## [0.1.6] — 2026-08-17
+
+Safety, Redis Cluster correctness, and roadmap accuracy following a full code review.
+
+### Added
+
+- Redis Cluster scans now cover every primary, while arbitrary-key batches route each
+  command correctly across hash slots. Multi-queue event streams report an explicit
+  unavailable state when their keys cannot share one cluster slot.
+- The public connection command surface is read-only by construction. Raw mutating commands
+  are available only behind a live-test feature used to seed fixtures.
+- CI now checks the declared Rust 1.90 minimum supported version.
 
 ### Changed
+
+- Servers without `GETRANGE`, `HSCAN`, or `SSCAN` now show an explicit unsupported value
+  state. The former measure-then-read fallback was racy and could fetch an unbounded value
+  after another client changed the key.
+- Type filters fall back to bounded client-side `TYPE` batches when `SCAN … TYPE` is absent.
+- Lens documentation now distinguishes the public detector/model extension point from the
+  host-integrated UI layer; a generic lens view host is listed before additional lenses.
 
 - **Relicensed to dual `MIT OR Apache-2.0`** from Apache-2.0 alone. `LICENSE` is now
   `LICENSE-APACHE`, and `LICENSE-MIT` joins it. The reason is that keylens publishes four
@@ -29,14 +47,17 @@ Documentation and packaging metadata only. No behaviour change, no code touched.
 
 ### Fixed
 
+- Passwords embedded in Redis URLs are redacted from the TUI, probe output, connection
+  listing, and TLS troubleshooting suggestions.
+- Rejected worker requests no longer leave panes permanently displaying `loading…`.
+
 - **The README claimed "the GIF at the top is rendered from a script".** There is no GIF at
   the top and `docs/demo.gif` has never been committed — only the `docs/demo.tape` that
   would produce it. The section now says so.
 
-> Publishing is what makes any of this visible: crates.io renders each crate's README and
-> metadata from the published artifact. That needs a version bump in **both** the
-> workspace `Cargo.toml` and `packaging/homebrew/keylens.rb`, since the tag gate compares
-> the tag against the workspace version.
+> The release version is kept in sync in the workspace `Cargo.toml` and
+> `packaging/homebrew/keylens.rb`; the tag gate compares the tag against the workspace
+> version.
 
 ## [0.1.5] — 2026-08-08
 

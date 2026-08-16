@@ -375,7 +375,10 @@ BullMQ's events stream rather than by polling:
 BullBoard polls `getJobCounts` on a timer, which is why its graphs are coarse. BullMQ
 already writes every state transition to a Redis STREAM, so **one blocking `XREAD` across
 every queue** gives event-level throughput at sub-second resolution and near-zero server
-load. The graph moves the instant a job fails.
+load. The graph moves the instant a job fails. On Redis Cluster, those event stream keys
+must share a hash slot (normally through a shared BullMQ hash-tag prefix); otherwise the
+pane explains that live throughput is unavailable instead of issuing an invalid cross-slot
+read.
 
 Narrow panes drop columns deliberately — least useful first — rather than clipping the
 graph off the right-hand edge.
@@ -494,9 +497,8 @@ never on a version string — so a Recached that gains a command lights the pane
 
 Recached 0.2.4 added `GETRANGE`, `HSCAN`, `SSCAN` and `ZSCAN`, so keylens asks it for bounded
 reads directly, the same as Redis. Against 0.2.3 and earlier the probe finds them missing and
-falls back to measuring a key with `HLEN`/`SCARD`/`STRLEN` first, reading it whole only when it's
-small: the bound is preserved — enforced client-side instead of requested server-side — and an
-oversized key says so rather than being fetched.
+marks that value viewer unavailable. keylens does not measure and then read the value whole:
+another client could grow it between those commands, defeating the bound.
 
 Recached 0.3.0 added `PUBSUB CHANNELS`/`NUMSUB`/`NUMPAT`, `MEMORY USAGE` and `MODULE LIST`, so the
 pub/sub pane, the memory breakdown and the module check all work there now; earlier releases
@@ -521,19 +523,20 @@ which block subsets of `CONFIG`, `CLIENT`, `MEMORY` and `DEBUG`.
 
 ### What is a lens?
 
-A detector, a data model, and a view. A lens recognises a keyspace pattern — BullMQ's
+A detector and a domain model, plus a host-integrated view. A lens recognises a keyspace pattern — BullMQ's
 `bull:<queue>:*` shape, say — and replaces the raw key tree with UI built for that domain:
 queue states, job detail, live throughput. keylens grows a tab because of what's in your
 keyspace, not because you flipped a flag. Writing one is documented in
-[docs/LENS.md](docs/LENS.md), and it needs no changes to core, so Sidekiq, Celery, RQ or
-Horizon support can live in a separate crate.
+[docs/LENS.md](docs/LENS.md). In v0.1, detection can live in a separate crate, but a new
+interactive domain view still needs explicit registration in the binary; a generic view
+host is on the roadmap.
 
 ### Is it safe to run against production?
 
 That's what v0.1 is designed for. It is read-only throughout — there is no code path that
 writes — and `KEYS` is never issued, only cursor-paged `SCAN` with a bounded `COUNT`. A
-workspace test fails the build if `KEYS`, `HGETALL` or `SMEMBERS` appear outside the one
-audited fallback. Unbounded collection reads are treated the same way as `KEYS`, because
+workspace test fails the build if `KEYS`, `HGETALL` or `SMEMBERS` appear in command source.
+Unbounded collection reads are treated the same way as `KEYS`, because
 `HGETALL` on a two-million-field hash blocks the server just as hard. Mutations are a v0.2
 question and will be gated behind the `readonly` connection flag that already exists.
 
@@ -564,8 +567,9 @@ BullBoard polls `getJobCounts` on a timer, which is why its graphs are coarse. B
 already writes every state transition to a Redis stream, so keylens runs **one blocking
 `XREAD` across every queue** and gets event-level throughput at sub-second resolution with
 near-zero server load — the graph moves the instant a job fails. Job detail shows the
-stack trace for *each attempt*, not just the last. BullBoard remains the right tool for
-retrying and removing jobs; keylens v0.1 won't write.
+stack trace for *each attempt*, not just the last. Redis Cluster requires those streams to
+share a hash slot; otherwise live throughput is explicitly unavailable. BullBoard remains
+the right tool for retrying and removing jobs; keylens v0.1 won't write.
 
 ### Which BullMQ versions work?
 
@@ -631,8 +635,8 @@ KEYLENS_TEST_RECACHED_URL=redis://127.0.0.1:6381 cargo test --test live -- --ign
 Its live tests skip cleanly when that variable isn't set, so CI stays green without it.
 
 The profile pins `v0.2.3` on purpose: it is the last release without `HSCAN`/`SSCAN`/`GETRANGE`,
-and the fallback path for a server that lacks them needs a real server that lacks them to test
-against. That means the fixture is *not* what the compatibility table above describes — point
+and the explicit unsupported path needs a real server that lacks them to test against. That
+means the fixture is *not* what the compatibility table above describes — point
 `KEYLENS_TEST_RECACHED_URL` at a `v0.3.2` container to exercise the current one.
 
 Then:
@@ -670,8 +674,9 @@ These are enforced, not aspirational:
 
 ## Writing a lens
 
-See [docs/LENS.md](docs/LENS.md). A lens is a detector, a model, and a view; you can add
-Sidekiq, Celery, RQ or Horizon support without touching core.
+See [docs/LENS.md](docs/LENS.md). The public crate supports detectors and shared detection
+metadata today. A complete Sidekiq, Celery, RQ, or Horizon view still needs a small core
+integration until the generic lens host on the roadmap lands.
 
 ## Roadmap
 

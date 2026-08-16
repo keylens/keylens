@@ -812,38 +812,20 @@ async fn moving_the_cursor_clears_the_previous_key_s_error() {
 }
 
 #[test]
-fn an_oversized_value_is_described_in_its_own_units() {
-    // A string's cap is bytes and a collection's is elements. Telling someone a string
-    // "holds more than 65536 entries" is simply the wrong noun.
+fn an_unsupported_bounded_read_explains_the_missing_capability() {
     let (mut app, _rx) = app_with(&["big"]);
     app.set_pending_key(Some("big".into()));
     app.apply(Update::Detail {
         meta: meta("big", Kind::String),
-        value: Box::new(KeyValue::TooLarge {
-            what: "string",
-            limit: 65_536,
-            unit: "bytes",
-        }),
+        value: Box::new(KeyValue::Unsupported(
+            "this server has no bounded string read (GETRANGE)".into(),
+        )),
         stream: None,
     });
 
     let out = render(&mut app, 100, 24);
-    assert!(out.contains("65,536 bytes"), "{out}");
-    assert!(
-        !out.contains("entries"),
-        "a string does not hold entries:\n{out}"
-    );
-
-    app.apply(Update::Detail {
-        meta: meta("big", Kind::Hash),
-        value: Box::new(KeyValue::TooLarge {
-            what: "hash",
-            limit: 200,
-            unit: "fields",
-        }),
-        stream: None,
-    });
-    assert!(render(&mut app, 100, 24).contains("200 fields"));
+    assert!(out.contains("no bounded string read"), "{out}");
+    assert!(out.contains("GETRANGE"), "{out}");
 }
 
 #[test]

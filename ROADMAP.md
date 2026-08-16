@@ -2,7 +2,7 @@
 
 Where keylens is going and, more usefully, what it is knowingly missing today.
 
-**Today: v0.1.5 — read-only, single binary, one lens (BullMQ).**
+**Today: v0.1.6 — read-only, single binary, one lens (BullMQ).**
 
 Nothing here has a date. Items are ordered within each section by how much they undercut
 what keylens already claims to do, which is a more honest ranking than a calendar.
@@ -19,13 +19,35 @@ one does not get built.
 - **No unbounded collection read.** `HGETALL` on a two-million-field hash blocks a server
   exactly as hard as `KEYS`, and a key browser is the thing that will meet that hash. Every
   read is cursor-paged or explicitly ranged; where a server lacks the bounded command, the
-  key is *measured* first and declined if it is too big.
+  value is explicitly unavailable. A separate measure-then-read step is not a bound because
+  another client can grow the value between the two commands.
 - **Capabilities are probed, never assumed.** A blocked command produces *unavailable on
   this server* and names the reason. This is what makes keylens behave on Upstash,
   ElastiCache, MemoryDB and DigitalOcean rather than erroring at them.
 - **Read-only is the default and always will be.** Mutations are opt-in, per-connection
   disable-able, and confirmed. "Point it at production" is the promise the project is built
   on; nothing is worth trading it for.
+
+---
+
+## Completed after the v0.1.5 review
+
+- **Credential-safe diagnostics.** URLs shown by the probe, browser, connection list, and
+  TLS guidance redact passwords while the original URL is used only to connect.
+- **Correct Redis Cluster key browsing.** Scans now iterate every primary, arbitrary-key
+  batches route commands per slot, and live BullMQ events either use one shared hash slot or
+  explain why the cross-slot read is unavailable.
+- **Real client-side type filtering.** Servers without `SCAN … TYPE` are filtered with
+  bounded `TYPE` batches instead of silently ignoring the requested type.
+- **Bounded value reads are race-free.** The unsafe `STRLEN`/`HLEN`/`SCARD` followed by
+  `GET`/`HGETALL`/`SMEMBERS` fallbacks are gone. Cursor `COUNT` overshoot is capped before
+  it reaches the UI.
+- **Backpressure is visible.** A full or closed worker queue produces a retryable state;
+  panes no longer remain on `loading…` for requests that were never accepted.
+- **Read-only is an API boundary.** Lens commands pass through an allowlist, mutating raw
+  command access is compiled only for live-test fixture setup, and the underlying client is
+  no longer exposed publicly.
+- **MSRV is tested.** CI checks the workspace on Rust 1.90 as well as stable.
 
 ---
 
@@ -51,16 +73,6 @@ Strings truncate at 64 KB with a marker, which is honest but terminal.
 A key browser that cannot show you the whole key is not finished. This is the single
 biggest gap.
 
-### Cluster: multi-key pipelines span hash slots
-
-`Conn::pipeline` documents that a cluster can reject a pipeline spanning multiple hash
-slots, and says callers that may span slots should fall back to sequential calls. One
-caller does not: `type_keys` pipelines up to 1,000 arbitrary keys in a single batch, which
-on a real cluster is close to guaranteed to span slots.
-
-The failure is quiet — types are treated as a nicety, so the tree renders with every tag
-missing rather than erroring. Quiet is worse. Either group by slot or fall back per batch.
-
 ### Surface connection health
 
 keylens now measures round-trip latency with a timed `PING` at connect and uses it to pace
@@ -76,8 +88,7 @@ The compatibility matrix lives in the README and is maintained by hand, which is
 went stale: it claimed Recached had no `INFO` for two releases after Recached gained it.
 
 The fix is to generate the matrix from the capability probe against each server in the
-test matrix, so it cannot drift from what keylens actually detects. `PLAN.md` promised this
-file; it does not exist.
+test matrix, so it cannot drift from what keylens actually detects.
 
 ### Command console
 
@@ -88,8 +99,7 @@ moments when the panes do not have the shape of the question you are asking.
 
 ## Next — v0.2, mutations
 
-The whole design is already worked out in [`PLAN.md` §2.5 and §3](PLAN.md); this is a
-pointer, not a restatement. The parts that matter:
+The safety design for mutations is:
 
 - **Ported Lua only, never composed commands.** BullMQ ships 49 scripts and reimplementing
   retry as `ZREM` + `LPUSH` will corrupt a production queue under concurrency. Vendor their
@@ -107,18 +117,26 @@ pointer, not a restatement. The parts that matter:
 
 ## Later — the lens ecosystem
 
-A lens is a detector, a data model, and a view. The extension point is real and documented
-in [`docs/LENS.md`](docs/LENS.md); what it lacks is a second example.
+The current public extension point covers detection and domain models. BullMQ's worker
+requests and TUI are still compiled into the binary, so adding a full domain view requires
+host changes. [`docs/LENS.md`](docs/LENS.md) documents that boundary explicitly.
 
-**Cache-namespace lens, first.** Group keys by prefix and show memory share, TTL
+**Generic lens host, first.** Define a host-facing adapter for tabs, requests, updates, and
+rendering so a new domain view can be registered without adding lens-specific variants to
+core enums. This is the prerequisite for claiming plug-in views or encouraging external
+lens crates.
+
+**Cache-namespace lens, second.** Group keys by prefix and show memory share, TTL
 distribution, and keys with no TTL at all — the classic memory leak. It is cheap, it is
 useful on literally any Redis, and it is the proof that the lens system generalises beyond
 job queues. Right now the honest critique is that keylens is a BullMQ tool wearing a Redis
 costume; one non-queue lens retires that.
 
 **Then the queue lenses people keep asking for**: Sidekiq, Celery, RQ, Laravel Horizon.
-Each is self-contained and addable without touching core, which is the property that lets
-this compound past one maintainer.
+After the generic host exists, each should be self-contained and register through it.
+
+**Crate hardening.** Add dependency-policy (`cargo-deny`) and public API compatibility
+checks, then replace the shared root README symlinks with focused per-crate API guides.
 
 **Bull v3 read-only** was in v0.1 scope and only landed as far as detection tolerating it.
 Still worth finishing — v3 keyspaces are everywhere and BullBoard's support for them is

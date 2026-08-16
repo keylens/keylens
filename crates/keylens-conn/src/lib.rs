@@ -10,6 +10,7 @@ pub mod error;
 pub mod server;
 pub mod server_info;
 pub mod stream;
+pub mod url;
 pub mod value;
 
 /// The one place fred's types surface outside this crate.
@@ -22,9 +23,15 @@ pub use fred::prelude::Value;
 pub use fred::types::Map;
 
 pub use capability::{Availability, Capabilities, Feature};
-pub use conn::{Conn, ScanPage};
+pub use conn::{Conn, KeyScanner, ScanPage};
 pub use error::{ConnError, Result};
 pub use server::{ClientInfo, ClusterNode, ClusterTopology, PubSubChannel, SlowEntry};
 pub use server_info::{ServerInfo, Vendor};
 pub use stream::{ConsumerInfo, GroupInfo, StreamInfo};
+pub use url::redact_url;
 pub use value::{KeyMeta, KeyValue, Kind, StreamEntry};
+
+/// Compute the Redis Cluster hash slot for a key, including `{hash-tag}` semantics.
+pub fn key_slot(key: &str) -> u16 {
+    fred::util::redis_keyslot(key.as_bytes())
+}

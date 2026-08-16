@@ -3,14 +3,15 @@
 //! Every Redis client shows you keys. None of them understand what your keys *mean*.
 //! `bull:emails:failed` is a ZSET to `redis-cli`; it's a dead-letter queue to you.
 //!
-//! A lens is three things and nothing more:
+//! A complete lens has three layers:
 //!
 //! 1. a **detector** -- a cheap keyspace probe that says "this looks like BullMQ v6",
 //! 2. a **model** -- the domain objects that pattern implies (queues, jobs, states),
-//! 3. a **view** -- how to render them (lives in the UI layer, keyed by lens id).
+//! 3. a **view** -- how to render them in the host binary.
 //!
-//! That shape is deliberate: a contributor can add Sidekiq or Celery support without
-//! touching core. See `docs/LENS.md`.
+//! This crate currently defines the detector registry and shared detection metadata. A
+//! domain model can live beside its detector, but v0.1 views are compiled into the keylens
+//! binary and still require host integration. See `docs/LENS.md` for the exact boundary.
 
 use std::sync::Arc;
 

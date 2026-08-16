@@ -1,5 +1,7 @@
 use thiserror::Error;
 
+use crate::url::redact_url;
+
 #[derive(Debug, Error)]
 pub enum ConnError {
     #[error("invalid connection url: {0}")]
@@ -42,6 +44,9 @@ pub enum ConnError {
 
     #[error("unexpected reply shape for `{cmd}`: {detail}")]
     Reply { cmd: &'static str, detail: String },
+
+    #[error("command `{0}` is not allowed through the read-only connection API")]
+    UnsafeCommand(&'static str),
 }
 
 /// Classify a connection failure, upgrading the unhelpful protocol error into a TLS hint.
@@ -51,7 +56,7 @@ pub enum ConnError {
 pub fn classify_connect(url: &str, source: fred::error::Error) -> ConnError {
     if looks_like_plaintext_to_tls(url, &source) {
         return ConnError::LikelyNeedsTls {
-            suggestion: to_tls_url(url),
+            suggestion: redact_url(&to_tls_url(url)),
             source,
         };
     }
@@ -76,7 +81,7 @@ pub fn connect_timeout(url: &str, after: std::time::Duration) -> ConnError {
              the connection, then closes it.\nTry `rediss://`:\n\n    {}\n\n\
              Managed hosts — DigitalOcean, Upstash, Aiven, ElastiCache with encryption \
              in transit — are TLS-only.",
-            to_tls_url(url)
+            redact_url(&to_tls_url(url))
         ));
     } else {
         // Over TLS the cause is genuinely ambiguous, so list what to check rather than
@@ -151,7 +156,8 @@ mod tests {
         let err = classify_connect(url, protocol_err());
 
         let msg = err.to_string();
-        assert!(msg.contains("rediss://default:pw@db-do-user-1-0.g.db.ondigitalocean.com:25061"));
+        assert!(msg.contains("rediss://default:***@db-do-user-1-0.g.db.ondigitalocean.com:25061"));
+        assert!(!msg.contains(":pw@"));
         assert!(msg.contains("TLS"));
     }
 
