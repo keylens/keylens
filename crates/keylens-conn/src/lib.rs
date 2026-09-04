@@ -3,6 +3,9 @@
 //! Everything that talks to a Redis-compatible server -- Redis, Valkey, Recached and
 //! friends -- goes through [`Conn`]. See its docs for the
 //! invariants that buys us.
+// `unwrap` in a test is a deliberate assertion, not a reachable panic: the lint that
+// guards the production paths would otherwise force `?` into every fixture.
+#![cfg_attr(test, allow(clippy::unwrap_used, clippy::expect_used, clippy::panic))]
 
 pub mod capability;
 pub mod conn;

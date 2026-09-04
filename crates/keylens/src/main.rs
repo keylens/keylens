@@ -2,6 +2,9 @@
 //!
 //! v0.1 is read-only by construction. That is a feature: it means you can point it at
 //! production on day one.
+// `unwrap` in a test is a deliberate assertion, not a reachable panic: the lint that
+// guards the production paths would otherwise force `?` into every fixture.
+#![cfg_attr(test, allow(clippy::unwrap_used, clippy::expect_used, clippy::panic))]
 
 use clap::{Parser, Subcommand};
 use color_eyre::eyre::{Result, eyre};
@@ -135,7 +138,7 @@ fn init_logging(cli: &Cli) -> Result<()> {
 
 fn list_connections() -> Result<()> {
     let path = Config::default_path();
-    let cfg = Config::load_default();
+    let cfg = Config::load_default()?;
 
     match &path {
         Some(p) => println!("config: {}", p.display()),
@@ -186,7 +189,10 @@ fn resolve_target(cli: &Cli) -> Result<Target> {
     }
 
     if let Some(name) = &cli.name {
-        let cfg = Config::load_default();
+        // A parse failure propagates rather than reading as an empty config. The two are
+        // very different problems and only one of them is the user's to fix by adding an
+        // entry they have, in fact, already added.
+        let cfg = Config::load_default()?;
         return cfg
             .get(name)
             .map(|c| Target {
@@ -195,15 +201,23 @@ fn resolve_target(cli: &Cli) -> Result<Target> {
             })
             .ok_or_else(|| {
                 let known: Vec<_> = cfg.connections.iter().map(|c| c.name.clone()).collect();
-                if known.is_empty() {
-                    eyre!(
-                        "no connection named `{name}`; no config file found at {}",
-                        Config::default_path()
-                            .map(|p| p.display().to_string())
-                            .unwrap_or_else(|| "<unknown>".into())
-                    )
-                } else {
-                    eyre!("no connection named `{name}`; known: {}", known.join(", "))
+                if !known.is_empty() {
+                    return eyre!("no connection named `{name}`; known: {}", known.join(", "));
+                }
+                // Say which empty this is. "No config file" and "a config file listing no
+                // connections" send the user to different places.
+                match Config::default_path() {
+                    Some(p) if p.exists() => eyre!(
+                        "no connection named `{name}`; {} has no [[connections]] entries",
+                        p.display()
+                    ),
+                    Some(p) => eyre!(
+                        "no connection named `{name}`; no config file at {}",
+                        p.display()
+                    ),
+                    None => {
+                        eyre!("no connection named `{name}`; could not resolve a config directory")
+                    }
                 }
             });
     }

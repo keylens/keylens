@@ -244,7 +244,9 @@ fn parse_numsub(reply: &Value) -> Vec<PubSubChannel> {
         return Vec::new();
     };
     items
-        .chunks_exact(2)
+        .as_chunks::<2>()
+        .0
+        .iter()
         .map(|c| PubSubChannel {
             name: display_string(&c[0]),
             subscribers: c[1].as_u64().unwrap_or(0),

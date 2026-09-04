@@ -12,6 +12,9 @@
 //! This crate currently defines the detector registry and shared detection metadata. A
 //! domain model can live beside its detector, but v0.1 views are compiled into the keylens
 //! binary and still require host integration. See `docs/LENS.md` for the exact boundary.
+// `unwrap` in a test is a deliberate assertion, not a reachable panic: the lint that
+// guards the production paths would otherwise force `?` into every fixture.
+#![cfg_attr(test, allow(clippy::unwrap_used, clippy::expect_used, clippy::panic))]
 
 use std::sync::Arc;
 

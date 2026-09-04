@@ -39,6 +39,31 @@ pub fn ttl(ms: Option<i64>) -> String {
     }
 }
 
+/// Human duration from a whole number of seconds.
+///
+/// Separate from [`ttl`] because the seconds come off the wire — `uptime_in_seconds` from
+/// `INFO`, `age` and `idle` from `CLIENT LIST` — and the conversion to milliseconds is a
+/// multiply on a number this process did not choose. Unchecked, a server reporting a
+/// large enough value panics a debug build and wraps to a *negative* duration in release,
+/// which renders as a confident, wrong answer. Saturating is the honest failure: an
+/// implausible number reads as implausibly large rather than as slightly negative.
+///
+/// ```
+/// use keylens_ui::format::secs;
+///
+/// assert_eq!(secs(45), "45s");
+/// assert_eq!(secs(90), "1m30s");
+/// // Never renders a negative duration, whatever the server claims.
+/// assert!(!secs(u64::MAX).starts_with('-'));
+/// ```
+pub fn secs(n: u64) -> String {
+    let ms = i64::try_from(n)
+        .ok()
+        .and_then(|s| s.checked_mul(1000))
+        .unwrap_or(i64::MAX);
+    ttl(Some(ms))
+}
+
 /// Relative time between two millisecond timestamps.
 ///
 /// A raw epoch is unreadable and an absolute clock time makes you do the subtraction
@@ -161,6 +186,22 @@ mod tests {
         assert_eq!(ttl(Some(90_000)), "1m30s");
         assert_eq!(ttl(Some(3_600_000)), "1h");
         assert_eq!(ttl(Some(90_000_000)), "1d1h");
+    }
+
+    #[test]
+    fn seconds_from_the_wire_never_overflow_into_a_negative() {
+        assert_eq!(secs(45), "45s");
+        assert_eq!(secs(90), "1m30s");
+        // `INFO` is text; nothing stops a server reporting a value whose conversion to
+        // milliseconds leaves `i64`. It used to render as "-1000ms" — an uptime in the
+        // past, stated with total confidence.
+        for n in [u64::MAX, i64::MAX as u64, i64::MAX as u64 / 1000 + 1] {
+            let rendered = secs(n);
+            assert!(
+                !rendered.starts_with('-'),
+                "{n} rendered as a negative duration: {rendered}"
+            );
+        }
     }
 
     #[test]

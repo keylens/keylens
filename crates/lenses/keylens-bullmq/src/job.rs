@@ -7,6 +7,37 @@
 //! * `stacktrace` is a **JSON array of strings**, not a newline-joined blob. Rendering it
 //!   raw shows escaped `\n` sequences instead of a stack.
 
+/// Cap on a single job hash field kept in memory.
+///
+/// Sized like [`keylens_conn::value::MAX_STRING_BYTES`], and for the same reason: a job's `data`
+/// or `returnvalue` is caller-defined and can be megabytes, which is not something a
+/// viewport needs or a TUI should hold onto.
+///
+/// **This bounds what is retained and rendered, not what crosses the wire.** Redis has no
+/// ranged read for a hash field — there is no `HGETRANGE` — so `HMGET` returns the whole
+/// value and the cap is applied on arrival. Bounding the transfer too would take an
+/// `HSTRLEN` round trip whose answer is stale by the time the read follows it.
+const MAX_FIELD_BYTES: usize = 64 * 1024;
+
+/// Truncate a job field to [`MAX_FIELD_BYTES`], on a character boundary.
+///
+/// Byte-slicing a UTF-8 payload mid-codepoint panics, and job payloads are arbitrary
+/// caller data — so the cut is made by characters even though the budget is in bytes.
+fn cap_field(s: String) -> String {
+    if s.len() <= MAX_FIELD_BYTES {
+        return s;
+    }
+    let mut out: String = String::with_capacity(MAX_FIELD_BYTES + 32);
+    for c in s.chars() {
+        if out.len() + c.len_utf8() > MAX_FIELD_BYTES {
+            break;
+        }
+        out.push(c);
+    }
+    out.push_str("\n\n... truncated ...");
+    out
+}
+
 /// A job id plus the score it carried in its state's ZSET.
 ///
 /// For `completed`/`failed` the score is the finish timestamp; for `delayed` it packs the
@@ -43,9 +74,14 @@ pub struct Job {
 
 impl Job {
     /// Wall-clock processing time, when the job has both timestamps.
+    ///
+    /// `checked_sub` rather than `-`: both operands are hash fields written by whatever
+    /// produced the job, so `end >= start` bounds the *sign* of the result but not its
+    /// magnitude. A pair straddling the width of `i64` overflows, which panics a debug
+    /// build and wraps in release — and "no duration" is already a state this returns.
     pub fn duration_ms(&self) -> Option<i64> {
         match (self.processed_on, self.finished_on) {
-            (Some(start), Some(end)) if end >= start => Some(end - start),
+            (Some(start), Some(end)) if end >= start => end.checked_sub(start),
             _ => None,
         }
     }
@@ -53,7 +89,7 @@ impl Job {
     /// How long the job sat in the queue before a worker picked it up.
     pub fn wait_ms(&self) -> Option<i64> {
         match (self.timestamp, self.processed_on) {
-            (Some(added), Some(started)) if started >= added => Some(started - added),
+            (Some(added), Some(started)) if started >= added => started.checked_sub(added),
             _ => None,
         }
     }
@@ -94,12 +130,15 @@ pub const JOB_FIELDS: &[&str] = &[
 
 /// Build a [`Job`] from replies aligned to [`JOB_FIELDS`].
 pub fn from_fields(id: &str, values: &[Option<String>]) -> Job {
+    // Capped on the way in, so an oversized payload cannot reach the model or the
+    // renderer. See `MAX_FIELD_BYTES` for what this does and does not bound.
     let get = |name: &str| -> Option<String> {
         JOB_FIELDS
             .iter()
             .position(|f| *f == name)
             .and_then(|i| values.get(i).cloned().flatten())
             .filter(|s| !s.is_empty())
+            .map(cap_field)
     };
 
     let opts = get("opts").unwrap_or_default();
@@ -161,6 +200,26 @@ mod tests {
                     .map(|(_, v)| v.to_string())
             })
             .collect()
+    }
+
+    #[test]
+    fn an_oversized_payload_is_capped_on_a_char_boundary() {
+        // Job `data` is caller-defined and routinely large; a multi-megabyte payload has
+        // no business being held in a viewport. The cut is by characters because slicing
+        // arbitrary UTF-8 by byte index panics.
+        let huge = "é".repeat(MAX_FIELD_BYTES); // 2 bytes each, so ~2x over budget
+        let job = from_fields("1", &values(&[("data", &huge)]));
+
+        assert!(job.data.len() <= MAX_FIELD_BYTES + 32, "{}", job.data.len());
+        assert!(job.data.ends_with("... truncated ..."));
+        // Round-trips as valid UTF-8, which a byte-slice would not have.
+        assert!(job.data.chars().next().is_some());
+    }
+
+    #[test]
+    fn a_payload_within_budget_is_untouched() {
+        let job = from_fields("1", &values(&[("data", r#"{"to":"a@b.com"}"#)]));
+        assert_eq!(job.data, r#"{"to":"a@b.com"}"#);
     }
 
     #[test]

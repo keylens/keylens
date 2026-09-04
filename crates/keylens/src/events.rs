@@ -202,7 +202,9 @@ fn parse_xread(
             // Fields are a flat [name, value, ...] list; BullMQ puts the event name under
             // the `event` key.
             let kind = fields
-                .chunks_exact(2)
+                .as_chunks::<2>()
+                .0
+                .iter()
                 .find(|c| as_text(&c[0]) == "event")
                 .map(|c| EventKind::parse(&as_text(&c[1])));
 

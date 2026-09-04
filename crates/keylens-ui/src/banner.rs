@@ -109,7 +109,7 @@ pub fn splash(
 mod tests {
     use super::*;
 
-    fn text(lines: &[Line]) -> String {
+    fn text(lines: &[Line<'_>]) -> String {
         lines
             .iter()
             .map(|l| {

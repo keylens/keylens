@@ -59,8 +59,12 @@ fn layout(width: usize, name_w: usize) -> (Vec<State>, usize) {
     (shown, spark_w)
 }
 
-fn placeholder<T>(state: &PaneState<T>) -> Option<Vec<Line<'static>>> {
-    state.placeholder().map(|msg| {
+/// The pane's data, or the rows to draw instead of it.
+///
+/// Returning both halves from one call is what removes the `expect("checked above")` that
+/// used to follow every `placeholder()` test: there is no second lookup to get wrong.
+fn loaded<T>(state: &PaneState<T>) -> Result<&T, Vec<Line<'static>>> {
+    state.value_or_message().map_err(|msg| {
         let style = if state.is_error() {
             Theme::error()
         } else {
@@ -155,10 +159,10 @@ fn throughput_cells(app: &App, queue: &str, now: i64, spark_w: usize) -> Vec<Spa
 }
 
 fn queue_table(app: &App, width: u16) -> Vec<Line<'static>> {
-    if let Some(p) = placeholder(&app.queues) {
-        return p;
-    }
-    let queues = app.queues.ready().expect("checked above");
+    let queues = match loaded(&app.queues) {
+        Ok(v) => v,
+        Err(rows) => return rows,
+    };
     let now_secs = now_ms() / 1000;
 
     if queues.is_empty() {
@@ -273,11 +277,13 @@ fn queue_table(app: &App, width: u16) -> Vec<Line<'static>> {
 fn job_list(app: &App) -> Vec<Line<'static>> {
     let mut lines = vec![state_bar(app), Line::raw("")];
 
-    if let Some(p) = placeholder(&app.jobs) {
-        lines.extend(p);
-        return lines;
-    }
-    let jobs = app.jobs.ready().expect("checked above");
+    let jobs = match loaded(&app.jobs) {
+        Ok(v) => v,
+        Err(rows) => {
+            lines.extend(rows);
+            return lines;
+        }
+    };
 
     if jobs.is_empty() {
         lines.push(Line::from(Span::styled(
@@ -357,11 +363,12 @@ fn format_score(score: f64, now_ms: i64) -> String {
 }
 
 fn job_detail(app: &App) -> Vec<Line<'static>> {
-    if let Some(p) = placeholder(&app.job) {
-        return p;
-    }
+    let detail = match loaded(&app.job) {
+        Ok(v) => v,
+        Err(rows) => return rows,
+    };
 
-    let Some(detail) = app.job.ready().expect("checked above") else {
+    let Some(detail) = detail else {
         return vec![
             Line::raw(""),
             Line::from(Span::styled(

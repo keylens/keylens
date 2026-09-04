@@ -24,6 +24,16 @@ struct Node {
     subtree_keys: usize,
 }
 
+/// The node's only child, or `None` when it has none or more than one.
+///
+/// Exists so the compaction loop's condition and its payload come from the same lookup
+/// instead of a `len() == 1` test followed by an `expect` restating it.
+fn single_child(node: &Node) -> Option<(&String, &Node)> {
+    let mut it = node.children.iter();
+    let first = it.next()?;
+    it.next().is_none().then_some(first)
+}
+
 /// One rendered line.
 #[derive(Debug, Clone, PartialEq)]
 pub struct Row {
@@ -195,8 +205,11 @@ impl KeyTree {
             // pass-through. A node that is itself a key stops the fold: it has a value to
             // select, so it needs its own row.
             if self.compact {
-                while !target.is_key && target.children.len() == 1 {
-                    let (seg, only) = target.children.iter().next().expect("len == 1");
+                // The single child *is* the loop condition, so take it from the iterator
+                // rather than testing `len() == 1` and then asserting it again.
+                while !target.is_key
+                    && let Some((seg, only)) = single_child(target)
+                {
                     label.push(SEPARATOR);
                     label.push_str(seg);
                     path.push(SEPARATOR);

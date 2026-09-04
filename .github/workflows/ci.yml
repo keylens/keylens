@@ -5,6 +5,10 @@ on:
     branches: ["**"]
   pull_request:
     branches: ["**"]
+  # A new advisory lands against a lockfile that has not changed, so the supply-chain job
+  # needs a trigger that does not depend on anyone pushing.
+  schedule:
+    - cron: "0 7 * * 1"
 
 env:
   CARGO_TERM_COLOR: always
@@ -18,8 +22,8 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
-      - name: Install Rust (stable + rustfmt)
-        uses: dtolnay/rust-toolchain@stable
+      - name: Install Rust (pinned + rustfmt)
+        uses: dtolnay/rust-toolchain@1.98.0
         with:
           components: rustfmt
 
@@ -33,11 +37,20 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
+      # This job must NOT pick up the pinned toolchain from rust-toolchain.toml, or it
+      # would silently re-check the newest compiler and stop testing the floor entirely.
+      # It doesn't: the action exports RUSTUP_TOOLCHAIN, which outranks the toolchain file.
       - name: Install Rust 1.90
         uses: dtolnay/rust-toolchain@1.90.0
 
       - name: Cache
         uses: Swatinem/rust-cache@v2
+
+      - name: Confirm the MSRV toolchain is the one in use
+        run: |
+          cargo --version
+          cargo --version | grep -q 'cargo 1\.90\.' \
+            || { echo "::error::MSRV job is not running on 1.90 — rust-toolchain.toml won"; exit 1; }
 
       - name: cargo check on declared MSRV
         run: cargo check --workspace --all-targets
@@ -60,6 +73,29 @@ jobs:
       - name: actionlint
         run: ./actionlint -color
 
+  # ─── Supply chain ──────────────────────────────────────────────────────────
+  #
+  # Advisories, licences, banned crates and yanked versions. Added after a manual
+  # audit turned up an unsound `lru` (RUSTSEC-2026-0253, reached through ratatui)
+  # and a yanked `bytesize` that had both been sitting in Cargo.lock unnoticed.
+  # Runs on a schedule as well as on push: a new advisory lands against code that
+  # has not changed, so commit-triggered checks alone would never see it.
+  supply-chain:
+    name: Supply chain
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: dtolnay/rust-toolchain@1.98.0
+
+      - name: Install cargo-deny
+        uses: taiki-e/install-action@v2
+        with:
+          tool: cargo-deny
+
+      - name: cargo deny check
+        run: cargo deny check
+
   # ─── Clippy ────────────────────────────────────────────────────────────────
   clippy:
     name: Clippy
@@ -67,8 +103,8 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
-      - name: Install Rust (stable + clippy)
-        uses: dtolnay/rust-toolchain@stable
+      - name: Install Rust (pinned + clippy)
+        uses: dtolnay/rust-toolchain@1.98.0
         with:
           components: clippy
 
@@ -94,8 +130,8 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
-      - name: Install Rust (stable)
-        uses: dtolnay/rust-toolchain@stable
+      - name: Install Rust (pinned)
+        uses: dtolnay/rust-toolchain@1.98.0
 
       - name: Cache
         uses: Swatinem/rust-cache@v2
@@ -113,8 +149,8 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
-      - name: Install Rust (stable)
-        uses: dtolnay/rust-toolchain@stable
+      - name: Install Rust (pinned)
+        uses: dtolnay/rust-toolchain@1.98.0
 
       - name: Cache
         uses: Swatinem/rust-cache@v2
@@ -157,8 +193,8 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
-      - name: Install Rust (stable)
-        uses: dtolnay/rust-toolchain@stable
+      - name: Install Rust (pinned)
+        uses: dtolnay/rust-toolchain@1.98.0
         with:
           targets: ${{ matrix.target }}
 

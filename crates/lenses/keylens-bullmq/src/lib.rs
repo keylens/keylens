@@ -10,6 +10,9 @@
 //! Mutations are deliberately absent in v0.1. When they land, they must use BullMQ's own
 //! ported Lua scripts -- composing `ZREM` + `LPUSH` by hand corrupts queues under
 //! concurrent workers.
+// `unwrap` in a test is a deliberate assertion, not a reachable panic: the lint that
+// guards the production paths would otherwise force `?` into every fixture.
+#![cfg_attr(test, allow(clippy::unwrap_used, clippy::expect_used, clippy::panic))]
 
 pub mod events;
 pub mod job;
