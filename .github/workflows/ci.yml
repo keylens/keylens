@@ -37,9 +37,11 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
-      # This job must NOT pick up the pinned toolchain from rust-toolchain.toml, or it
-      # would silently re-check the newest compiler and stop testing the floor entirely.
-      # It doesn't: the action exports RUSTUP_TOOLCHAIN, which outranks the toolchain file.
+      # `rust-toolchain.toml` pins the *development* toolchain, and rustup ranks that file
+      # above the default this action sets — so installing 1.90 and stopping there gets you
+      # a job that quietly checks the newest compiler instead of the floor. `+1.90.0` on the
+      # command outranks the file; the env var below does too, and is here so any cargo
+      # call added to this job later inherits it rather than needing to remember the `+`.
       - name: Install Rust 1.90
         uses: dtolnay/rust-toolchain@1.90.0
 
@@ -47,13 +49,17 @@ jobs:
         uses: Swatinem/rust-cache@v2
 
       - name: Confirm the MSRV toolchain is the one in use
+        env:
+          RUSTUP_TOOLCHAIN: 1.90.0
         run: |
-          cargo --version
-          cargo --version | grep -q 'cargo 1\.90\.' \
+          cargo +1.90.0 --version
+          cargo +1.90.0 --version | grep -q 'cargo 1\.90\.' \
             || { echo "::error::MSRV job is not running on 1.90 — rust-toolchain.toml won"; exit 1; }
 
       - name: cargo check on declared MSRV
-        run: cargo check --workspace --all-targets
+        env:
+          RUSTUP_TOOLCHAIN: 1.90.0
+        run: cargo +1.90.0 check --workspace --all-targets
 
   # ─── Workflow lint ─────────────────────────────────────────────────────────
   #
