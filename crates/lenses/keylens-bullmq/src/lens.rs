@@ -237,7 +237,9 @@ impl BullMqLens {
                 .collect()
         } else {
             items
-                .chunks_exact(2)
+                .as_chunks::<2>()
+                .0
+                .iter()
                 .filter_map(|c| {
                     c[0].as_string().map(|id| JobRef {
                         id,
@@ -354,18 +356,29 @@ impl Lens for BullMqLens {
     }
 }
 
-/// Inclusive `[start, stop]` for a page, or `None` when nothing was asked for.
+/// Inclusive `[start, stop]` for a page, or `None` when the page cannot be expressed as a
+/// non-negative Redis range.
 ///
 /// The `None` is the whole reason this is a function. Redis range commands treat a
-/// negative `stop` as an offset from the end, so the naive `offset + limit - 1` turns a
+/// negative bound as an offset from the end, so the naive `offset + limit - 1` turns a
 /// zero limit into `LRANGE key 0 -1` — the entire list, which is precisely the unbounded
 /// read this crate exists to never issue. Asking for nothing gets nothing back.
+///
+/// A zero limit is not the only way to reach a negative bound, which is why every step
+/// below is checked rather than cast. `offset as i64` wraps to a negative for any offset
+/// past `i64::MAX`, and `start + limit` overflows before it — both land back on exactly
+/// the whole-collection read the zero guard was written to prevent.
 fn page_range(offset: usize, limit: usize) -> Option<(i64, i64)> {
     if limit == 0 {
         return None;
     }
-    let start = offset as i64;
-    Some((start, start + limit as i64 - 1))
+    let start = i64::try_from(offset).ok()?;
+    let limit = i64::try_from(limit).ok()?;
+    // `limit >= 1`, so `limit - 1` cannot underflow and cannot take `stop` below `start`.
+    // Subtracting before the add rather than after keeps the last expressible page —
+    // one element at `i64::MAX` — from being refused for an overflow that never happens.
+    let stop = start.checked_add(limit - 1)?;
+    Some((start, stop))
 }
 
 #[cfg(test)]
@@ -421,5 +434,24 @@ mod tests {
                 );
             }
         }
+    }
+
+    #[test]
+    fn an_out_of_range_page_is_refused_rather_than_wrapped() {
+        // `usize::MAX as i64` is -1, and the old arithmetic turned that into
+        // `LRANGE key 0 -2` — every element but the last, from a function whose entire
+        // job is to never issue an unbounded read. Refusing is the only safe answer.
+        assert_eq!(page_range(0, usize::MAX), None, "limit past i64::MAX");
+        assert_eq!(page_range(usize::MAX, 10), None, "offset past i64::MAX");
+        assert_eq!(page_range(1usize << 63, 1), None, "offset at the sign bit");
+
+        // The sum overflowing is the same failure one step later.
+        let huge = usize::try_from(i64::MAX).expect("64-bit target");
+        assert_eq!(page_range(huge, 2), None, "start + limit overflows i64");
+        assert_eq!(
+            page_range(huge, 1),
+            Some((i64::MAX, i64::MAX)),
+            "the largest expressible single-element page still works"
+        );
     }
 }

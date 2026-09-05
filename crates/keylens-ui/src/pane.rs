@@ -38,15 +38,26 @@ impl<T> PaneState<T> {
         }
     }
 
+    /// The loaded value, or the message to render in its place.
+    ///
+    /// **One exhaustive match, so the two cannot drift apart.** Every caller used to ask
+    /// `placeholder()` first and then `ready().expect("checked above")`, which is six
+    /// separate assertions that those two functions are exact complements — a relationship
+    /// nothing enforced. Adding a variant that rendered no placeholder would have turned
+    /// all six into panics, in the render path, on a server that merely answered oddly.
+    pub fn value_or_message(&self) -> std::result::Result<&T, String> {
+        match self {
+            PaneState::Ready(v) => Ok(v),
+            PaneState::Idle => Err("press r to load".into()),
+            PaneState::Loading => Err("loading...".into()),
+            PaneState::Unavailable(why) => Err(format!("unavailable on this server - {why}")),
+            PaneState::Failed(e) => Err(format!("failed: {e}")),
+        }
+    }
+
     /// Message to render when there is nothing to show, or `None` when there is.
     pub fn placeholder(&self) -> Option<String> {
-        match self {
-            PaneState::Idle => Some("press r to load".into()),
-            PaneState::Loading => Some("loading...".into()),
-            PaneState::Ready(_) => None,
-            PaneState::Unavailable(why) => Some(format!("unavailable on this server - {why}")),
-            PaneState::Failed(e) => Some(format!("failed: {e}")),
-        }
+        self.value_or_message().err()
     }
 
     pub fn is_error(&self) -> bool {

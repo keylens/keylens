@@ -17,7 +17,7 @@ use crate::{panes, queues};
 /// to be well past a normal processing window without waiting for a human to notice.
 const STUCK_IDLE_MS: i64 = 30_000;
 
-pub fn draw(frame: &mut Frame, app: &mut App) {
+pub fn draw(frame: &mut Frame<'_>, app: &mut App) {
     if app.splash {
         draw_splash(frame, app, frame.area());
         return;
@@ -56,7 +56,7 @@ pub fn draw(frame: &mut Frame, app: &mut App) {
 ///
 /// Deliberately available before an `App` exists: the terminal comes up before the
 /// connection does, so there is never a blank screen to interpret.
-pub fn draw_connecting(frame: &mut Frame, url: &str, status: &str, error: Option<&str>) {
+pub fn draw_connecting(frame: &mut Frame<'_>, url: &str, status: &str, error: Option<&str>) {
     let area = frame.area();
     let mut lines = banner::splash(area.width, url, None, status);
 
@@ -89,7 +89,7 @@ pub fn draw_connecting(frame: &mut Frame, url: &str, status: &str, error: Option
     );
 }
 
-fn draw_splash(frame: &mut Frame, app: &App, area: Rect) {
+fn draw_splash(frame: &mut Frame<'_>, app: &App, area: Rect) {
     let server = (!app.server.version.is_empty() && app.server.version != "unknown")
         .then(|| (app.server.vendor.label(), app.server.version.as_str()));
 
@@ -114,7 +114,7 @@ fn draw_splash(frame: &mut Frame, app: &App, area: Rect) {
     frame.render_widget(Paragraph::new(lines).alignment(Alignment::Center), inner);
 }
 
-fn draw_status(frame: &mut Frame, app: &App, area: Rect) {
+fn draw_status(frame: &mut Frame<'_>, app: &App, area: Rect) {
     let server = &app.server;
     let mut spans = vec![
         Span::styled(" KEYLENS ", Theme::brand()),
@@ -153,7 +153,7 @@ fn draw_status(frame: &mut Frame, app: &App, area: Rect) {
     frame.render_widget(Line::from(spans), area);
 }
 
-fn draw_tabs(frame: &mut Frame, app: &App, area: Rect) {
+fn draw_tabs(frame: &mut Frame<'_>, app: &App, area: Rect) {
     let mut spans = vec![Span::raw(" ")];
     // Tabs are whatever this keyspace earned: `queues` shows up only once a lens matched.
     for (i, view) in app.views().into_iter().enumerate() {
@@ -171,7 +171,7 @@ fn draw_tabs(frame: &mut Frame, app: &App, area: Rect) {
     frame.render_widget(Line::from(spans), area);
 }
 
-fn draw_server_pane(frame: &mut Frame, app: &App, area: Rect, view: View) {
+fn draw_server_pane(frame: &mut Frame<'_>, app: &App, area: Rect, view: View) {
     let (title, lines) = match view {
         View::Stats => (
             view.label().to_string(),
@@ -197,7 +197,7 @@ fn draw_server_pane(frame: &mut Frame, app: &App, area: Rect, view: View) {
     );
 }
 
-fn draw_tree(frame: &mut Frame, app: &mut App, area: Rect) {
+fn draw_tree(frame: &mut Frame<'_>, app: &mut App, area: Rect) {
     let title = if app.loading {
         "keys — scanning…".to_string()
     } else {
@@ -205,7 +205,7 @@ fn draw_tree(frame: &mut Frame, app: &mut App, area: Rect) {
     };
     let block = Theme::panel(&title, app.focus == Focus::Tree);
 
-    let items: Vec<ListItem> = app
+    let items: Vec<ListItem<'_>> = app
         .rows
         .iter()
         .map(|row| {
@@ -258,7 +258,7 @@ fn draw_tree(frame: &mut Frame, app: &mut App, area: Rect) {
     frame.render_stateful_widget(list, area, &mut app.list_state);
 }
 
-fn draw_value(frame: &mut Frame, app: &App, area: Rect) {
+fn draw_value(frame: &mut Frame<'_>, app: &App, area: Rect) {
     let focused = app.focus == Focus::Value;
 
     if let Some(err) = &app.error {
@@ -283,7 +283,7 @@ fn draw_value(frame: &mut Frame, app: &App, area: Rect) {
         return;
     };
 
-    let mut lines: Vec<Line> = Vec::new();
+    let mut lines: Vec<Line<'_>> = Vec::new();
 
     lines.push(Line::from(Span::styled(meta.key.clone(), Theme::title())));
     lines.push(Line::from(vec![
@@ -552,7 +552,7 @@ fn json_line(line: String) -> Line<'static> {
     }
 }
 
-fn draw_hint(frame: &mut Frame, app: &App, area: Rect) {
+fn draw_hint(frame: &mut Frame<'_>, app: &App, area: Rect) {
     // Derived, not written down. The tab count changes when a lens matches, and a hint
     // that says `1-6` next to seven tabs is a hint that has stopped being true.
     let views = format!("1-{}", app.views().len());
@@ -613,7 +613,7 @@ fn draw_hint(frame: &mut Frame, app: &App, area: Rect) {
     frame.render_widget(Line::from(spans), area);
 }
 
-fn draw_help(frame: &mut Frame, area: Rect) {
+fn draw_help(frame: &mut Frame<'_>, area: Rect) {
     let rows = [
         ("1 - 7", "switch view"),
         ("r", "reload the current view"),

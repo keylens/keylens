@@ -1,0 +1,46 @@
+# cargo-deny configuration.
+#
+# This exists because the audit that found RUSTSEC-2026-0253 (an unsound use-after-free in
+# `lru`, reached through ratatui) and a yanked `bytesize` was run by hand, months after
+# both landed. A check nobody runs is not a check.
+
+[graph]
+all-features = true
+
+[advisories]
+# Unmaintained and unsound are errors here, not warnings. keylens is pointed at production
+# databases; "no known exploit yet" is not a reason to ship a known-unsound dependency.
+version = 2
+yanked = "deny"
+ignore = []
+
+[licenses]
+version = 2
+# The workspace is MIT OR Apache-2.0. Permissive licences only -- a copyleft dependency
+# would change what downstream users may do with the binary.
+allow = [
+    "MIT",
+    "Apache-2.0",
+    "Apache-2.0 WITH LLVM-exception",
+    "BSD-2-Clause",
+    "BSD-3-Clause",
+    "ISC",
+    "Unicode-3.0",
+    "Zlib",
+    "MPL-2.0",
+    "CDLA-Permissive-2.0",
+]
+confidence-threshold = 0.8
+
+[bans]
+multiple-versions = "warn"
+wildcards = "deny"
+# Nothing in a read-only Redis browser should be reaching for these.
+deny = [
+    { name = "openssl-sys", reason = "TLS goes through rustls; a second TLS stack is a packaging and CVE surface we do not want" },
+]
+
+[sources]
+unknown-registry = "deny"
+unknown-git = "deny"
+allow-registry = ["https://github.com/rust-lang/crates.io-index"]

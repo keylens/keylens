@@ -4,6 +4,8 @@
 //! assumption that a pane is wide enough for its content. `TestBackend` renders into an
 //! in-memory buffer, so these run in CI with no terminal and no Redis.
 
+#![allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
+
 use crossterm::event::{KeyCode, KeyEvent};
 use keylens::app::{App, Mode, View};
 use keylens::events::StreamEvent;

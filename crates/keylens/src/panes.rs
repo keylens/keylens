@@ -56,8 +56,12 @@ fn heading(text: &str) -> Line<'static> {
 }
 
 /// Render a pane's placeholder, or `None` when it has data to show.
-fn placeholder<T>(state: &PaneState<T>) -> Option<Vec<Line<'static>>> {
-    state.placeholder().map(|msg| {
+/// The pane's data, or the rows to draw instead of it.
+///
+/// Returning both halves from one call is what removes the `expect("checked above")` that
+/// used to follow every `placeholder()` test: there is no second lookup to get wrong.
+fn loaded<T>(state: &PaneState<T>) -> Result<&T, Vec<Line<'static>>> {
+    state.value_or_message().map_err(|msg| {
         let style = if state.is_error() {
             Theme::error()
         } else {
@@ -101,7 +105,7 @@ pub fn stats(info: &ServerInfo, width: u16) -> Vec<Line<'static>> {
         field(
             "uptime",
             info.get_u64("uptime_in_seconds")
-                .map(|s| format::ttl(Some(s as i64 * 1000)))
+                .map(format::secs)
                 .unwrap_or_else(|| "-".into()),
         ),
         field("role", g("role")),
@@ -225,10 +229,10 @@ pub fn stats(info: &ServerInfo, width: u16) -> Vec<Line<'static>> {
 }
 
 pub fn slowlog(app: &App) -> Vec<Line<'static>> {
-    if let Some(p) = placeholder(&app.slowlog) {
-        return p;
-    }
-    let entries = app.slowlog.ready().expect("checked above");
+    let entries = match loaded(&app.slowlog) {
+        Ok(v) => v,
+        Err(rows) => return rows,
+    };
 
     if entries.is_empty() {
         return vec![
@@ -279,10 +283,10 @@ pub fn slowlog(app: &App) -> Vec<Line<'static>> {
 }
 
 pub fn clients(app: &App) -> Vec<Line<'static>> {
-    if let Some(p) = placeholder(&app.clients) {
-        return p;
-    }
-    let list = app.clients.ready().expect("checked above");
+    let list = match loaded(&app.clients) {
+        Ok(v) => v,
+        Err(rows) => return rows,
+    };
 
     let mut lines = vec![Line::from(vec![
         Span::styled(format!("  {:<8}", "id"), Theme::dim()),
@@ -309,11 +313,8 @@ pub fn clients(app: &App) -> Vec<Line<'static>> {
                 format!("{:<18}", format::truncate(&c.name, 17)),
                 Theme::accent(),
             ),
-            Span::raw(format!("{:>7}", format::ttl(Some(c.age as i64 * 1000)))),
-            Span::styled(
-                format!("{:>7}", format::ttl(Some(c.idle as i64 * 1000))),
-                idle_style,
-            ),
+            Span::raw(format!("{:>7}", format::secs(c.age))),
+            Span::styled(format!("{:>7}", format::secs(c.idle)), idle_style),
             Span::raw(format!("{:>4}", c.db)),
             Span::raw(format!("{:>5}", c.sub)),
             Span::raw(format!("  {}", format::truncate(&c.cmd, 24))),
@@ -330,10 +331,10 @@ pub fn clients(app: &App) -> Vec<Line<'static>> {
 }
 
 pub fn cluster(app: &App) -> Vec<Line<'static>> {
-    if let Some(p) = placeholder(&app.cluster) {
-        return p;
-    }
-    let t = app.cluster.ready().expect("checked above");
+    let t = match loaded(&app.cluster) {
+        Ok(v) => v,
+        Err(rows) => return rows,
+    };
 
     if !t.enabled {
         return vec![
@@ -388,10 +389,10 @@ pub fn cluster(app: &App) -> Vec<Line<'static>> {
 }
 
 pub fn pubsub(app: &App) -> Vec<Line<'static>> {
-    if let Some(p) = placeholder(&app.pubsub) {
-        return p;
-    }
-    let channels = app.pubsub.ready().expect("checked above");
+    let channels = match loaded(&app.pubsub) {
+        Ok(v) => v,
+        Err(rows) => return rows,
+    };
 
     if channels.is_empty() {
         return vec![

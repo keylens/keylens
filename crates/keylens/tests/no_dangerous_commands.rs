@@ -11,6 +11,8 @@
 //!
 //! This walks the workspace source rather than trusting review.
 
+#![allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
+
 use std::fs;
 use std::path::{Path, PathBuf};
 

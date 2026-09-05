@@ -9,13 +9,48 @@ members = [
 ]
 
 [workspace.package]
-version = "0.1.6"
+version = "0.1.7"
 edition = "2024"
 rust-version = "1.90"
 license = "MIT OR Apache-2.0"
 repository = "https://github.com/keylens/keylens"
 homepage = "https://github.com/keylens/keylens"
 authors = ["Dennis Paler"]
+
+# Lint policy lives here so it applies to every crate and every target, rather than in a
+# CI command line that only CI runs.
+#
+# The rule for this table: a lint is only listed if it is currently at zero. A lint set to
+# `warn` is set to `deny` in practice, because CI gates on `-D warnings` — so adding a
+# noisy one here does not start a cleanup, it just breaks the build. The deferred set is
+# named at the bottom rather than silently omitted.
+[workspace.lints.rust]
+# There is no `unsafe` anywhere in this workspace and no reason for a Redis browser to
+# grow any. `forbid` means a module cannot quietly opt back in with an `allow`.
+unsafe_code = "forbid"
+unused_must_use = "deny"
+rust_2018_idioms = { level = "warn", priority = -1 }
+
+[workspace.lints.clippy]
+# Panics in the render path or the worker take out the whole TUI, and every one of these
+# is reachable from a reply written by a server we do not control.
+unwrap_used = "deny"
+expect_used = "deny"
+panic = "deny"
+todo = "deny"
+dbg_macro = "deny"
+mem_forget = "deny"
+
+# Deferred, deliberately — these are real and currently non-zero, so enabling them would
+# fail CI rather than fix anything:
+#
+#   indexing_slicing        (34) mostly `chunks_exact` pairs and post-`len()` indexing
+#   arithmetic_side_effects (57) mostly viewport/layout maths on terminal dimensions
+#   cast_possible_truncation, cast_sign_loss, cast_possible_wrap (~34 between them)
+#
+# The input-derived arithmetic among them has been fixed; what remains is provably bounded
+# but not provable *to clippy*. `overflow-checks` is on in release, so a mistake in that
+# set surfaces as a panic rather than a wrong number on screen.
 
 [workspace.dependencies]
 # Internal
@@ -83,3 +118,10 @@ opt-level = 3
 lto = "thin"
 codegen-units = 1
 strip = true
+# Every number on screen came off the wire from a server we do not control. Without this,
+# debug and release disagree: an overflow that panics under `cargo test` silently wraps in
+# the shipped binary and renders a confident, negative, wrong answer instead. keylens is
+# pointed at production and read for operational decisions, so a visible failure beats a
+# plausible lie — and `ratatui::init` installs a panic hook that restores the terminal, so
+# the failure is legible rather than a wrecked shell.
+overflow-checks = true

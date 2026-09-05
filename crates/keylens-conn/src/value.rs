@@ -17,6 +17,18 @@ pub const PAGE: usize = 200;
 /// Cap on a single string value. Longer strings are truncated with a marker.
 pub const MAX_STRING_BYTES: usize = 64 * 1024;
 
+/// The same two bounds as Redis range arguments.
+///
+/// Redis reads a negative bound as an offset from the end, so a page size that wrapped
+/// on the way to `i64` would ask for the whole collection. These are const-evaluated and
+/// checked below, so the cast happens once at compile time and never at runtime.
+const PAGE_BOUND: i64 = PAGE as i64;
+const MAX_STRING_BOUND: i64 = MAX_STRING_BYTES as i64;
+const _: () = assert!(
+    PAGE_BOUND > 0 && MAX_STRING_BOUND > 0,
+    "page constants must stay positive as Redis range bounds"
+);
+
 /// The types [`Conn::read_key`] speculates over, in the order its pipeline sends them.
 ///
 /// Both the size block and the value block follow this order and [`Kind::slot`] indexes
@@ -387,8 +399,9 @@ impl Conn {
     /// carry that cursor back in. Until this signature does, claiming otherwise here would
     /// describe an API that does not exist.
     pub async fn read_value(&self, key: &str, kind: Kind, offset: usize) -> Result<KeyValue> {
-        let start = offset as i64;
-        let stop = start + PAGE as i64 - 1;
+        // Checked, not cast: an offset past `i64::MAX` wraps to a negative, which Redis
+        // reads as "from the end" and turns a bounded page into the whole collection.
+        let (start, stop) = page_bounds(offset, kind)?;
 
         let value = match kind {
             Kind::None => KeyValue::Missing,
@@ -399,7 +412,7 @@ impl Conn {
                     let reply = self
                         .cmd(
                             "GETRANGE",
-                            vec![key.into(), 0.into(), (MAX_STRING_BYTES as i64 - 1).into()],
+                            vec![key.into(), 0.into(), (MAX_STRING_BOUND - 1).into()],
                         )
                         .await?;
                     decode_string(&reply)
@@ -435,7 +448,7 @@ impl Conn {
                     let reply = self
                         .cmd(
                             "HSCAN",
-                            vec![key.into(), "0".into(), "COUNT".into(), (PAGE as i64).into()],
+                            vec![key.into(), "0".into(), "COUNT".into(), PAGE_BOUND.into()],
                         )
                         .await?;
                     decode_hash(&reply)?
@@ -449,7 +462,7 @@ impl Conn {
                     let reply = self
                         .cmd(
                             "SSCAN",
-                            vec![key.into(), "0".into(), "COUNT".into(), (PAGE as i64).into()],
+                            vec![key.into(), "0".into(), "COUNT".into(), PAGE_BOUND.into()],
                         )
                         .await?;
                     decode_set(&reply)?
@@ -467,7 +480,7 @@ impl Conn {
                             "-".into(),
                             "+".into(),
                             "COUNT".into(),
-                            (PAGE as i64).into(),
+                            PAGE_BOUND.into(),
                         ],
                     )
                     .await?;
@@ -479,6 +492,25 @@ impl Conn {
 
         Ok(value)
     }
+}
+
+/// Inclusive `[start, stop]` bounds for one [`PAGE`] starting at `offset`.
+///
+/// `kind` only names the command in the error; the bounds themselves are the same for
+/// every ranged type.
+fn page_bounds(offset: usize, kind: Kind) -> Result<(i64, i64)> {
+    let cmd = kind.size_cmd().unwrap_or("RANGE");
+    let range_err = |detail: &'static str| ConnError::Range {
+        cmd,
+        offset,
+        detail,
+    };
+
+    let start = i64::try_from(offset).map_err(|_| range_err("offset exceeds i64::MAX"))?;
+    let stop = start
+        .checked_add(PAGE_BOUND - 1)
+        .ok_or_else(|| range_err("offset + page size overflows i64"))?;
+    Ok((start, stop))
 }
 
 /// The size command for a type that [`Conn::read_key`] speculates over.
@@ -494,13 +526,13 @@ fn size_cmd_or_filler(kind: Kind) -> &'static str {
 /// The bounded first-page read for one type. Same slot-holding rule as
 /// [`size_cmd_or_filler`].
 fn value_cmd(kind: Kind, key: &str) -> (&'static str, Vec<Value>) {
-    let stop = PAGE as i64 - 1;
-    let count = PAGE as i64;
+    let stop = PAGE_BOUND - 1;
+    let count = PAGE_BOUND;
     match kind {
         // GETRANGE, not GET: a 500MB string must not be pulled into the TUI.
         Kind::String => (
             "GETRANGE",
-            vec![key.into(), 0.into(), (MAX_STRING_BYTES as i64 - 1).into()],
+            vec![key.into(), 0.into(), (MAX_STRING_BOUND - 1).into()],
         ),
         Kind::Hash => (
             "HSCAN",
@@ -608,7 +640,9 @@ fn as_string_vec(v: &Value) -> Vec<String> {
 
 fn as_field_pairs(items: &[Value]) -> Vec<(String, String)> {
     items
-        .chunks_exact(2)
+        .as_chunks::<2>()
+        .0
+        .iter()
         .map(|c| (display_string(&c[0]), display_string(&c[1])))
         .collect()
 }
@@ -618,7 +652,9 @@ fn as_scored_pairs(v: &Value) -> Vec<(String, f64)> {
         return Vec::new();
     };
     items
-        .chunks_exact(2)
+        .as_chunks::<2>()
+        .0
+        .iter()
         .map(|c| {
             let member = display_string(&c[0]);
             // Scores come back as bulk strings in RESP2 and doubles in RESP3.

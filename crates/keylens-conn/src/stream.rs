@@ -174,7 +174,9 @@ fn parse_consumers(reply: &Value) -> Vec<ConsumerInfo> {
 fn fields(v: &Value) -> Vec<(String, Value)> {
     match v {
         Value::Array(items) => items
-            .chunks_exact(2)
+            .as_chunks::<2>()
+            .0
+            .iter()
             .map(|c| (display_string(&c[0]), c[1].clone()))
             .collect(),
         Value::Map(map) => map

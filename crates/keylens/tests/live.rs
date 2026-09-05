@@ -10,6 +10,8 @@
 //! These are the tests that catch upstream drift and wrong assumptions about replies --
 //! the things a mock would happily confirm for you.
 
+#![allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
+
 use std::time::Duration;
 
 use keylens_conn::{Conn, KeyValue, Kind};

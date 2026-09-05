@@ -278,14 +278,17 @@ impl Worker {
         let mut pages = 0usize;
 
         while keys.len() < BATCH_TARGET && pages < MAX_PAGES_PER_BATCH && !self.complete {
-            let page = match self
-                .scanner
-                .as_mut()
-                .expect("scanner created by Rescan")
-                .get_mut()
-                .next_page()
-                .await
-            {
+            // No scanner means no `Rescan` has been handled yet. In the app that cannot
+            // happen — `browse` queues `Rescan` before the event loop starts, and the
+            // worker drains the channel in order — but `Worker` is public API, and a
+            // `More` that arrives first should end the batch rather than panic the task
+            // that owns the only connection.
+            let Some(scanner) = self.scanner.as_mut() else {
+                self.complete = true;
+                break;
+            };
+
+            let page = match scanner.get_mut().next_page().await {
                 Ok(Some(p)) => p,
                 Ok(None) => {
                     self.complete = true;

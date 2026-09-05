@@ -41,3 +41,6 @@ bytesize.workspace = true
 
 [dev-dependencies]
 keylens-conn = { workspace = true, features = ["dangerous-test-commands"] }
+
+[lints]
+workspace = true

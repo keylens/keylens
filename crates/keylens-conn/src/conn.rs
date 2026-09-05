@@ -470,9 +470,32 @@ impl Conn {
     }
 }
 
-/// The public connection surface is intentionally an allowlist. A lens is loaded into a
-/// process that users are encouraged to point at production; letting it spell arbitrary
-/// Redis commands would make the read-only promise a convention rather than a boundary.
+/// `CONFIG GET` parameters a lens may ask for.
+///
+/// An allowlist rather than "any `GET`", because `CONFIG GET` is read-only in the sense
+/// that matters to the *server* and not in the sense that matters here: `CONFIG GET
+/// requirepass` reads the server's password, and `CONFIG GET *` reads it along with
+/// everything else. Exact names only, so a glob matches nothing.
+///
+/// Only `maxmemory` is used today — by the capability probe. The rest are here because
+/// they are the obvious next asks for a stats pane and none of them is a credential.
+const CONFIG_PARAMS: &[&str] = &[
+    "maxmemory",
+    "maxmemory-policy",
+    "appendonly",
+    "save",
+    "databases",
+    "timeout",
+];
+
+/// The public connection surface is intentionally an allowlist.
+///
+/// **This is a discipline boundary, not a sandbox.** v0.1 lenses are compiled into the
+/// binary, so a lens that wanted to issue `FLUSHALL` could reach past this and call the
+/// client directly — nothing here prevents that, and nothing could. What it does prevent
+/// is the accident: a lens author reaching for `HGETALL` because paging is tedious, or
+/// widening `CONFIG GET` to a glob, and no reviewer noticing that the read-only promise
+/// on the tin quietly stopped being true.
 fn read_only_command(name: &str, args: &[Value]) -> bool {
     let subcommand = || {
         args.first()
@@ -480,11 +503,16 @@ fn read_only_command(name: &str, args: &[Value]) -> bool {
             .unwrap_or_default()
             .to_ascii_uppercase()
     };
+    let arg_at = |i: usize| args.get(i).and_then(Value::as_string).unwrap_or_default();
 
     match name {
         "CLIENT" => matches!(subcommand().as_str(), "INFO" | "LIST"),
         "CLUSTER" => matches!(subcommand().as_str(), "INFO" | "NODES" | "SHARDS" | "SLOTS"),
-        "CONFIG" => subcommand() == "GET",
+        "CONFIG" => {
+            subcommand() == "GET"
+                && args.len() == 2
+                && CONFIG_PARAMS.contains(&arg_at(1).to_ascii_lowercase().as_str())
+        }
         "MEMORY" => subcommand() == "USAGE",
         "MODULE" => subcommand() == "LIST",
         "PUBSUB" => matches!(subcommand().as_str(), "CHANNELS" | "NUMPAT" | "NUMSUB"),
@@ -851,8 +879,20 @@ mod tests {
         assert!(read_only_command("TYPE", &[Value::from("k")]));
         assert!(read_only_command(
             "CONFIG",
-            &[Value::from("GET"), Value::from("*")]
+            &[Value::from("GET"), Value::from("maxmemory")]
         ));
+        // `CONFIG GET` is read-only to the server and not to us: a glob returns
+        // `requirepass` and `masterauth` along with everything else.
+        assert!(
+            !read_only_command("CONFIG", &[Value::from("GET"), Value::from("*")]),
+            "a glob must not be a way to read every config value"
+        );
+        for secret in ["requirepass", "masterauth", "masteruser", "REQUIREPASS"] {
+            assert!(
+                !read_only_command("CONFIG", &[Value::from("GET"), Value::from(secret)]),
+                "{secret} is a credential, not a statistic"
+            );
+        }
         assert!(!read_only_command(
             "CONFIG",
             &[

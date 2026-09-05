@@ -2,6 +2,9 @@
 //!
 //! The tree model here is pure -- keys in, rows out, no I/O -- so the trickiest logic in
 //! the browser is testable without a terminal or a Redis.
+// `unwrap` in a test is a deliberate assertion, not a reachable panic: the lint that
+// guards the production paths would otherwise force `?` into every fixture.
+#![cfg_attr(test, allow(clippy::unwrap_used, clippy::expect_used, clippy::panic))]
 
 pub mod banner;
 pub mod format;

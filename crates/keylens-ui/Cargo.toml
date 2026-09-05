@@ -17,3 +17,6 @@ keylens-conn.workspace = true
 ratatui.workspace = true
 serde_json.workspace = true
 bytesize.workspace = true
+
+[lints]
+workspace = true

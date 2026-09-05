@@ -9,12 +9,20 @@ use std::path::{Path, PathBuf};
 use serde::{Deserialize, Serialize};
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct Config {
     #[serde(default)]
     pub connections: Vec<Connection>,
 }
 
+/// Unknown keys are rejected rather than ignored.
+///
+/// The failure mode this prevents is specific: a misspelled `prefix` leaves detection
+/// scanning `bull:*:meta`, which finds nothing, and "no queues here" is a perfectly
+/// normal answer — so the typo produces a working tool that is quietly looking in the
+/// wrong place. There is no symptom to notice.
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct Connection {
     pub name: String,
     pub url: String,
@@ -67,10 +75,18 @@ impl Config {
 
     /// Load from the default path, tolerating absence. A missing config is the normal
     /// first-run state, not an error.
-    pub fn load_default() -> Self {
-        Self::default_path()
-            .and_then(|p| Self::load(&p).ok())
-            .unwrap_or_default()
+    ///
+    /// # Errors
+    ///
+    /// A config file that exists but does not parse. **Absence and malformed are not the
+    /// same answer** — swallowing the parse error left the caller holding an empty config
+    /// and reporting "no config file found", naming a path where the user's file was
+    /// sitting the whole time, with their connection in it.
+    pub fn load_default() -> color_eyre::Result<Self> {
+        match Self::default_path() {
+            Some(path) => Self::load(&path),
+            None => Ok(Self::default()),
+        }
     }
 
     pub fn get(&self, name: &str) -> Option<&Connection> {
@@ -137,5 +153,22 @@ mod tests {
     fn empty_config_is_valid() {
         let cfg: Config = toml::from_str("").unwrap();
         assert!(cfg.connections.is_empty());
+    }
+
+    #[test]
+    fn a_misspelled_key_is_an_error_rather_than_a_silent_default() {
+        // `prefx` used to parse cleanly and do nothing. Detection then scanned the
+        // default `bull:*:meta`, found nothing, and reported no queues -- which is also
+        // what a server with no queues looks like, so there was nothing to notice.
+        let err = toml::from_str::<Config>(
+            r#"
+            [[connections]]
+            name = "queues"
+            url = "redis://jobs.internal:6379"
+            prefx = "myapp"
+            "#,
+        )
+        .expect_err("an unknown key must not be accepted");
+        assert!(err.to_string().contains("prefx"), "{err}");
     }
 }

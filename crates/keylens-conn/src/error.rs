@@ -45,6 +45,19 @@ pub enum ConnError {
     #[error("unexpected reply shape for `{cmd}`: {detail}")]
     Reply { cmd: &'static str, detail: String },
 
+    /// A requested page cannot be expressed as a non-negative Redis range.
+    ///
+    /// Its own variant because the alternative is worse than an error: Redis reads a
+    /// negative bound as an offset from the end, so an offset that wrapped on the way to
+    /// `i64` would quietly become a read of the entire collection — the one thing this
+    /// crate promises never to issue.
+    #[error("cannot page `{cmd}` from offset {offset}: {detail}")]
+    Range {
+        cmd: &'static str,
+        offset: usize,
+        detail: &'static str,
+    },
+
     #[error("command `{0}` is not allowed through the read-only connection API")]
     UnsafeCommand(&'static str),
 }

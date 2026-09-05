@@ -225,9 +225,9 @@ dependencies = [
 
 [[package]]
 name = "bytesize"
-version = "2.5.0"
+version = "2.7.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "0b9f0be079ca33e06fd1cb493fffc0d2b4e2dbc4c5559a7ab6d4fda76e3eabd5"
+checksum = "7354288c522e7e980fafd2075d63d1285794c3a6a16cdd492f189ea406e5f18b"
 
 [[package]]
 name = "castaway"
@@ -1086,7 +1086,7 @@ dependencies = [
 
 [[package]]
 name = "keylens"
-version = "0.1.6"
+version = "0.1.7"
 dependencies = [
  "bytesize",
  "clap",
@@ -1108,7 +1108,7 @@ dependencies = [
 
 [[package]]
 name = "keylens-bullmq"
-version = "0.1.6"
+version = "0.1.7"
 dependencies = [
  "async-trait",
  "fred",
@@ -1120,7 +1120,7 @@ dependencies = [
 
 [[package]]
 name = "keylens-conn"
-version = "0.1.6"
+version = "0.1.7"
 dependencies = [
  "fred",
  "futures",
@@ -1132,7 +1132,7 @@ dependencies = [
 
 [[package]]
 name = "keylens-lens"
-version = "0.1.6"
+version = "0.1.7"
 dependencies = [
  "async-trait",
  "futures",
@@ -1143,7 +1143,7 @@ dependencies = [
 
 [[package]]
 name = "keylens-ui"
-version = "0.1.6"
+version = "0.1.7"
 dependencies = [
  "bytesize",
  "keylens-conn",
@@ -1228,9 +1228,9 @@ checksum = "0ceec5bc11778974d1bcb055b18002eba7f4b3518b6a0081b3af5f21666da9ad"
 
 [[package]]
 name = "lru"
-version = "0.18.1"
+version = "0.18.4"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "0b6180140927ee907000b0aa540091f6ea512ead4447c92b8fc35bc72788a5a6"
+checksum = "ff9840bcc50b71349309900da0ce7279aa336ae71d73250b07998932c7d97c25"
 dependencies = [
  "hashbrown 0.17.1",
 ]
