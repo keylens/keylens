@@ -130,7 +130,7 @@ fn throughput_cells(app: &App, queue: &str, now: i64, spark_w: usize) -> Vec<Spa
         // server that will never deliver an event is a lie the user can act on.
         let msg = match &app.throughput.status {
             EventsStatus::Live => "idle",
-            EventsStatus::Attaching => "…",
+            EventsStatus::Attaching | EventsStatus::Reconnecting { .. } => "…",
             EventsStatus::Unavailable(_) => "n/a",
         };
         return vec![
@@ -144,6 +144,9 @@ fn throughput_cells(app: &App, queue: &str, now: i64, spark_w: usize) -> Vec<Spa
     let totals = series.window(now, spark_w, |b| b.total);
     let failed: u64 = series.window(now, spark_w, |b| b.failed).iter().sum();
     let rate = series.rate(now, 10);
+    // While the reader is down the window keeps scrolling over seconds it never saw, so
+    // the rate falls to 0.0 -- which reads as "idle". It is unknown, and says so.
+    let live = app.throughput.is_live();
 
     let spark_style = if failed > 0 {
         Theme::error()
@@ -158,7 +161,11 @@ fn throughput_cells(app: &App, queue: &str, now: i64, spark_w: usize) -> Vec<Spa
 
     vec![
         Span::styled(format!("  {}", format::sparkline(&totals)), spark_style),
-        Span::styled(format!("{rate:>RATE_W$.1}"), rate_style),
+        if live {
+            Span::styled(format!("{rate:>RATE_W$.1}"), rate_style)
+        } else {
+            Span::styled(format!("{:>RATE_W$}", "-"), Theme::dim())
+        },
     ]
 }
 
@@ -255,6 +262,14 @@ fn queue_table(app: &App, width: u16) -> Vec<Line<'static>> {
             Theme::ok(),
         ),
         EventsStatus::Attaching => ("   ○ attaching to event streams…".to_string(), Theme::dim()),
+        // The counts above are still fresh; only the graph is frozen.
+        EventsStatus::Reconnecting { attempt, error } => (
+            format!(
+                "   ↻ live throughput reconnecting (attempt {attempt}) — {}",
+                format::truncate(error, 50)
+            ),
+            Theme::warn(),
+        ),
         // Naming the reason is the whole point: the counts above are still real, it is
         // only the live graph that this server cannot feed.
         EventsStatus::Unavailable(why) => (

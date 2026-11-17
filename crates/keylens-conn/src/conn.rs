@@ -35,6 +35,13 @@ pub struct ScanPage {
 /// state and exposes one page at a time without buffering the whole keyspace.
 pub struct KeyScanner {
     pages: Pin<Box<dyn Stream<Item = std::result::Result<Vec<String>, fred::error::Error>> + Send>>,
+    /// Deadline for one page.
+    ///
+    /// fred sends scan pages without a response timeout -- `default_command_timeout` does
+    /// not cover them. Measured on a half-open link: an ordinary command failed at 20s, a
+    /// scan page was still waiting at 60s. The worker handles requests in order, so one
+    /// stuck page wedged every queue, pane and `m` request behind it, indefinitely.
+    page_timeout: std::time::Duration,
     /// Set by the first error, and permanent.
     ///
     /// fred's scan stream *ends* after an error -- the cursor that failed is gone. Without
@@ -49,9 +56,11 @@ impl KeyScanner {
         pages: Pin<
             Box<dyn Stream<Item = std::result::Result<Vec<String>, fred::error::Error>> + Send>,
         >,
+        page_timeout: std::time::Duration,
     ) -> Self {
         Self {
             pages,
+            page_timeout,
             failed: None,
         }
     }
@@ -69,7 +78,17 @@ impl KeyScanner {
                 detail: format!("scan stopped by an earlier error ({why}); rescan to start over"),
             });
         }
-        match self.pages.next().await {
+        let next = match tokio::time::timeout(self.page_timeout, self.pages.next()).await {
+            Ok(next) => next,
+            Err(_) => Some(Err(fred::error::Error::new(
+                fred::error::ErrorKind::Timeout,
+                format!(
+                    "no SCAN reply within {}s; the connection may be half-open",
+                    self.page_timeout.as_secs()
+                ),
+            ))),
+        };
+        match next {
             Some(Ok(keys)) => Ok(Some(keys)),
             Some(Err(source)) => {
                 self.failed = Some(source.details().to_string());
@@ -143,8 +162,39 @@ const UNRESPONSIVE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs
 /// discovered by the kernel rather than by the user's next keypress.
 const KEEPALIVE_IDLE: std::time::Duration = std::time::Duration::from_secs(30);
 
+/// Timeouts for one connection.
+///
+/// The defaults suit a TUI on any link from localhost to another continent. Shorter ones
+/// are for tests that need a dead link to be declared dead in seconds, not minutes.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ConnOptions {
+    /// Bound on the whole handshake.
+    pub connect_timeout: std::time::Duration,
+    /// Bound on any single command, and on any single scan page.
+    pub command_timeout: std::time::Duration,
+}
+
+impl Default for ConnOptions {
+    fn default() -> Self {
+        Self {
+            connect_timeout: DEFAULT_CONNECT_TIMEOUT,
+            command_timeout: COMMAND_TIMEOUT,
+        }
+    }
+}
+
 pub struct Conn {
     client: Client,
+    command_timeout: std::time::Duration,
+    /// Set once if the server rejects our credentials on a reconnect.
+    ///
+    /// fred reconnects forever by default, and a reconnect that fails authentication is
+    /// invisible to callers: every command just times out. Measured after a password
+    /// rotation: "Request timed out" on every command, while the client kept retrying the
+    /// stale password in the background -- a retry storm a managed host may lock out.
+    auth_lost: std::sync::Arc<std::sync::OnceLock<String>>,
+    /// Watches fred's connection-error stream for that rejection. Aborted on drop.
+    watcher: tokio::task::JoinHandle<()>,
     server: ServerInfo,
     caps: Capabilities,
     label: String,
@@ -168,11 +218,32 @@ impl Conn {
         label: impl Into<String>,
         timeout: std::time::Duration,
     ) -> Result<Self> {
+        Self::connect_with(
+            url,
+            label,
+            ConnOptions {
+                connect_timeout: timeout,
+                ..ConnOptions::default()
+            },
+        )
+        .await
+    }
+
+    /// Connect with explicit [`ConnOptions`].
+    pub async fn connect_with(
+        url: &str,
+        label: impl Into<String>,
+        options: ConnOptions,
+    ) -> Result<Self> {
+        let ConnOptions {
+            connect_timeout: timeout,
+            command_timeout,
+        } = options;
         let config = Config::from_url(url).map_err(|e| ConnError::Url(e.to_string()))?;
         let client = Builder::from_config(config)
             .with_performance_config(|c| {
                 // See COMMAND_TIMEOUT: fred's default here is "wait forever".
-                c.default_command_timeout = COMMAND_TIMEOUT;
+                c.default_command_timeout = command_timeout;
             })
             .with_connection_config(|c| {
                 // Generous, because these are *per-step* limits and the client's own
@@ -263,8 +334,14 @@ impl Conn {
             }
         };
 
+        let auth_lost = std::sync::Arc::new(std::sync::OnceLock::new());
+        let watcher = watch_for_auth_loss(&client, auth_lost.clone());
+
         Ok(Self {
             client,
+            command_timeout,
+            auth_lost,
+            watcher,
             server,
             caps,
             label: label.into(),
@@ -334,7 +411,7 @@ impl Conn {
                     .map(|page| page.map(page_keys)),
             )
         };
-        Ok(KeyScanner::new(pages))
+        Ok(KeyScanner::new(pages, self.command_timeout))
     }
 
     /// Re-read `INFO`. Cheap enough for the stats pane's refresh tick.
@@ -403,14 +480,27 @@ impl Conn {
         self.execute(name, args).await
     }
 
+    /// The terminal error once credentials were rejected on reconnect, else `None`.
+    fn auth_failure(&self) -> Option<ConnError> {
+        self.auth_lost
+            .get()
+            .map(|why| ConnError::AuthLost(why.clone()))
+    }
+
     async fn execute(&self, name: &'static str, args: Vec<Value>) -> Result<Value> {
+        if let Some(e) = self.auth_failure() {
+            return Err(e);
+        }
         self.client
             .custom(
                 CustomCommand::new_static(name, ClusterHash::FirstKey, false),
                 args,
             )
             .await
-            .map_err(|source| ConnError::Command { cmd: name, source })
+            .map_err(|source| {
+                self.auth_failure()
+                    .unwrap_or(ConnError::Command { cmd: name, source })
+            })
     }
 
     /// Raw command access for live-test fixture setup only.
@@ -435,12 +525,17 @@ impl Conn {
         block_ms: u64,
     ) -> Result<Value> {
         check_xread(keys.len(), ids.len(), count, block_ms)?;
+        if let Some(e) = self.auth_failure() {
+            return Err(e);
+        }
         self.client
             .xread(Some(count), Some(block_ms), keys.to_vec(), ids.to_vec())
             .await
-            .map_err(|source| ConnError::Command {
-                cmd: "XREAD",
-                source,
+            .map_err(|source| {
+                self.auth_failure().unwrap_or(ConnError::Command {
+                    cmd: "XREAD",
+                    source,
+                })
             })
     }
 
@@ -486,6 +581,9 @@ impl Conn {
         &self,
         cmds: &[(&'static str, Vec<Value>)],
     ) -> Result<Vec<Result<Value>>> {
+        if let Some(e) = self.auth_failure() {
+            return Err(e);
+        }
         if self.client.is_clustered() {
             // A regular Redis pipeline is tied to one connection, while arbitrary keys in
             // a cluster can live on different primaries. Preserve correctness by letting
@@ -535,6 +633,54 @@ impl Conn {
             .map(|(reply, (cmd, _))| reply.map_err(|source| ConnError::Command { cmd, source }))
             .collect())
     }
+}
+
+impl Drop for Conn {
+    fn drop(&mut self) {
+        self.watcher.abort();
+    }
+}
+
+/// Whether a connection-level error means our credentials no longer work.
+fn is_auth_failure(e: &Error) -> bool {
+    *e.kind() == fred::error::ErrorKind::Auth
+        || ["WRONGPASS", "NOAUTH", "NOPERM"]
+            .iter()
+            .any(|code| e.details().starts_with(code))
+}
+
+/// Watch `client`'s connection errors; on the first authentication failure, record it
+/// and stop the reconnect loop.
+///
+/// Stopping is the point. The rejection will repeat identically on every attempt, and
+/// each attempt is an authentication failure in the server's (or the host's) logs.
+fn watch_for_auth_loss(
+    client: &Client,
+    lost: std::sync::Arc<std::sync::OnceLock<String>>,
+) -> tokio::task::JoinHandle<()> {
+    let mut errors = client.error_rx();
+    let client = client.clone();
+    tokio::spawn(async move {
+        loop {
+            match errors.recv().await {
+                Ok((e, _)) if is_auth_failure(&e) => {
+                    let why = e
+                        .details()
+                        .lines()
+                        .next()
+                        .unwrap_or_default()
+                        .trim()
+                        .to_string();
+                    let _ = lost.set(why);
+                    debug!(error = %e, "credentials rejected on reconnect; stopping");
+                    let _ = client.quit().await;
+                    return;
+                }
+                Ok(_) | Err(tokio::sync::broadcast::error::RecvError::Lagged(_)) => {}
+                Err(tokio::sync::broadcast::error::RecvError::Closed) => return,
+            }
+        }
+    })
 }
 
 fn parse_scan_type(raw: &str) -> Option<ScanType> {
@@ -863,7 +1009,7 @@ mod tests {
                 "Request timed out.",
             )),
         ]);
-        let mut scanner = KeyScanner::new(Box::pin(pages));
+        let mut scanner = KeyScanner::new(Box::pin(pages), COMMAND_TIMEOUT);
 
         assert_eq!(
             scanner.next_page().await.unwrap(),
@@ -883,11 +1029,25 @@ mod tests {
     #[tokio::test]
     async fn a_clean_scan_still_completes() {
         let pages = futures::stream::iter(vec![Ok(vec!["a".to_string()]), Ok(vec![])]);
-        let mut scanner = KeyScanner::new(Box::pin(pages));
+        let mut scanner = KeyScanner::new(Box::pin(pages), COMMAND_TIMEOUT);
         assert!(scanner.next_page().await.unwrap().is_some());
         assert!(scanner.next_page().await.unwrap().is_some());
         assert_eq!(scanner.next_page().await.unwrap(), None);
         assert!(!scanner.has_failed());
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn a_scan_page_that_never_arrives_times_out_and_fails_the_scan() {
+        // fred applies no response timeout to scan pages; a half-open link held one for
+        // longer than a minute in a measured run. The page deadline is ours.
+        let pages = futures::stream::pending();
+        let mut scanner = KeyScanner::new(Box::pin(pages), std::time::Duration::from_secs(5));
+        let err = scanner.next_page().await.expect_err("must time out");
+        assert!(err.to_string().contains("no SCAN reply"), "{err}");
+        assert!(
+            scanner.has_failed(),
+            "a timed-out scan cannot continue its cursor"
+        );
     }
 
     #[test]

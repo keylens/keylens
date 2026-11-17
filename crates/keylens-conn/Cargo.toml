@@ -25,5 +25,9 @@ serde.workspace = true
 thiserror.workspace = true
 tracing.workspace = true
 
+[dev-dependencies]
+# Paused time, so timeout tests run instantly instead of waiting the timeout out.
+tokio = { workspace = true, features = ["test-util"] }
+
 [lints]
 workspace = true

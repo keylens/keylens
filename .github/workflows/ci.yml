@@ -173,6 +173,11 @@ jobs:
       - name: cargo test --test live
         run: cargo test --test live -- --ignored
 
+      # Real servers behind a proxy that blackholes, refuses and severs on demand, plus
+      # ACL users created and deleted by the tests. Serial: the ACL tests share counters.
+      - name: cargo test --test faults
+        run: cargo test --test faults -- --ignored --test-threads 1
+
       - name: Fixture logs on failure
         if: failure()
         run: docker compose logs --tail 100

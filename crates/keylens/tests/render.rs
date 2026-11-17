@@ -1173,3 +1173,33 @@ fn a_capped_pane_says_how_many_rows_it_did_not_keep() {
         "says why the wire was not bounded:\n{out}"
     );
 }
+
+#[test]
+fn an_outage_reads_as_reconnecting_not_as_idle_queues() {
+    // While the reader is down the sparkline window keeps scrolling over seconds it never
+    // saw, so the rate decayed to 0.0 -- which reads as "this queue is idle".
+    let (mut app, _rx) = with_bullmq(&[]);
+    apply_queues(&mut app, vec![queue("emails", false, 0)]);
+    app.apply(Update::EventsStatus(EventsStatus::Live));
+    let now_ms = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap()
+        .as_millis() as i64;
+    app.apply(Update::Events(vec![StreamEvent {
+        queue: "emails".into(),
+        kind: EventKind::Completed,
+        at_ms: now_ms,
+    }]));
+    app.apply(Update::EventsStatus(EventsStatus::Reconnecting {
+        attempt: 3,
+        error: "Request timed out.".into(),
+    }));
+
+    let out = render(&mut app, 140, 24);
+    assert!(out.contains("reconnecting (attempt 3)"), "{out}");
+    let row = out.lines().find(|l| l.contains("emails")).unwrap();
+    assert!(
+        !row.contains("0.0"),
+        "a rate claimed while not watching: {row}"
+    );
+}
