@@ -7,10 +7,10 @@
 
 use std::sync::Arc;
 
-use keylens_bullmq::{BullMqLens, EventsStatus, Job, JobRef, QueueSummary, State};
+use keylens_bullmq::{BullMqLens, EventsStatus, Job, JobRef, QueueList, State};
 use keylens_conn::{
-    ClientInfo, ClusterTopology, Conn, Feature, KeyMeta, KeyScanner, KeyValue, Kind, PubSubChannel,
-    ServerInfo, SlowEntry, StreamInfo, Value,
+    ClientInfo, ClusterTopology, Conn, Coverage, Feature, KeyMeta, KeyScanner, KeyValue, Kind,
+    PubSubChannel, ServerInfo, SlowEntry, StreamInfo, Value,
 };
 use keylens_lens::{Detection, Lens};
 use keylens_ui::PaneState;
@@ -29,7 +29,7 @@ const MAX_TYPED: usize = 1_000;
 const SLOWLOG_ENTRIES: u32 = 128;
 const PUBSUB_CHANNELS: usize = 200;
 /// Job ids fetched per state page.
-const JOB_PAGE: usize = 200;
+pub const JOB_PAGE: usize = 200;
 const JOB_LOG_LINES: usize = 200;
 
 /// Names one request, so its reply can be matched against what the UI still wants.
@@ -110,6 +110,18 @@ pub enum Request {
     },
 }
 
+/// Where a scan stands after a batch.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ScanProgress {
+    /// More of the keyspace is left; `More` continues it.
+    Partial,
+    /// The cursor came back to 0: every key was visited.
+    Complete,
+    /// The scan failed and cannot continue. The batch still carries every key gathered
+    /// before the failure -- they are real keys -- but the tree is not the whole keyspace.
+    Failed(String),
+}
+
 /// A worker reply. Every variant that answers a request carries that request's id, and
 /// that includes the failures: an error is a reply like any other and is just as capable
 /// of being stale.
@@ -121,19 +133,15 @@ pub enum Update {
         keys: Vec<(String, Option<Kind>)>,
         /// True when this batch starts a new scan, so the UI clears first.
         reset: bool,
-        /// True when the cursor came back to 0 -- the keyspace is fully walked.
-        complete: bool,
+        progress: ScanProgress,
         scanned_pages: usize,
-    },
-    /// The scan generation `scan` failed.
-    ScanFailed {
-        scan: RequestId,
-        error: String,
     },
     Detail {
         id: RequestId,
         meta: Box<KeyMeta>,
         value: Box<KeyValue>,
+        /// Whether `value` is all of it, or the first bounded page.
+        coverage: Coverage,
         /// Groups, consumers and pending state — only for stream keys.
         stream: Option<Box<StreamInfo>>,
     },
@@ -178,7 +186,7 @@ pub enum Update {
     Events(Vec<crate::events::StreamEvent>),
     Queues {
         id: RequestId,
-        data: PaneState<Vec<QueueSummary>>,
+        data: PaneState<QueueList>,
     },
     Jobs {
         id: RequestId,
@@ -286,7 +294,7 @@ impl Worker {
                     scan,
                     keys: Vec::new(),
                     reset: false,
-                    complete: false,
+                    progress: ScanProgress::Partial,
                     scanned_pages: 0,
                 },
                 Request::More { .. } => self.scan_batch(false).await,
@@ -394,6 +402,7 @@ impl Worker {
     async fn scan_batch(&mut self, reset: bool) -> Update {
         let mut keys: Vec<String> = Vec::new();
         let mut pages = 0usize;
+        let mut failure: Option<String> = None;
 
         while keys.len() < BATCH_TARGET && pages < MAX_PAGES_PER_BATCH && !self.complete {
             // No scanner means no `Rescan` has been handled yet. In the app that cannot
@@ -406,22 +415,23 @@ impl Worker {
                 break;
             };
 
-            let page = match scanner.get_mut().next_page().await {
-                Ok(Some(p)) => p,
+            match scanner.get_mut().next_page().await {
+                Ok(Some(page)) => {
+                    pages += 1;
+                    keys.extend(page);
+                }
                 Ok(None) => {
                     self.complete = true;
                     break;
                 }
+                // Keep what was gathered: those keys are real. 0.1.7 returned the error
+                // alone, dropping up to 40 pages of keys, and the *next* `More` then saw
+                // the end of fred's stream and reported the keyspace fully walked.
                 Err(e) => {
-                    return Update::ScanFailed {
-                        scan: self.scan,
-                        error: e.to_string(),
-                    };
+                    failure = Some(e.to_string());
+                    break;
                 }
-            };
-
-            pages += 1;
-            keys.extend(page);
+            }
         }
 
         let typed = self.type_keys(keys).await;
@@ -429,7 +439,11 @@ impl Worker {
             scan: self.scan,
             keys: typed,
             reset,
-            complete: self.complete,
+            progress: match failure {
+                Some(why) => ScanProgress::Failed(why),
+                None if self.complete => ScanProgress::Complete,
+                None => ScanProgress::Partial,
+            },
             scanned_pages: pages,
         }
     }
@@ -476,23 +490,7 @@ impl Worker {
             }
         }
 
-        let requested = self.kind;
-        keys.into_iter()
-            .enumerate()
-            .filter_map(|(i, key)| {
-                // One key failing to type -- deleted mid-batch, say -- costs that key its
-                // tag and nothing else. It used to cost the whole batch its types.
-                let kind = kinds
-                    .get(i)
-                    .and_then(|r| r.as_ref().ok())
-                    .map(|v| Kind::parse(&keylens_conn::value::display_string(v)));
-                if requested.is_some_and(|wanted| kind != Some(wanted)) {
-                    None
-                } else {
-                    Some((key, kind))
-                }
-            })
-            .collect()
+        keep_typed(keys, &kinds, self.kind)
     }
 
     /// Turn a capability + a fallible load into a [`PaneState`].
@@ -606,6 +604,35 @@ impl Worker {
     }
 }
 
+/// Pair each key with its `TYPE` reply, dropping the keys that should not be listed.
+///
+/// One key failing to type -- an ACL on `TYPE`, say -- costs that key its tag and nothing
+/// else. A key whose type came back `none` was deleted between the `SCAN` that listed it
+/// and the `TYPE`, and is dropped: listing it puts a key in the tree the server no longer
+/// holds. With a type filter active, anything not provably of that type is excluded.
+fn keep_typed(
+    keys: Vec<String>,
+    kinds: &[keylens_conn::Result<Value>],
+    requested: Option<Kind>,
+) -> Vec<(String, Option<Kind>)> {
+    keys.into_iter()
+        .enumerate()
+        .filter_map(|(i, key)| {
+            let kind = kinds
+                .get(i)
+                .and_then(|r| r.as_ref().ok())
+                .map(|v| Kind::parse(&keylens_conn::value::display_string(v)));
+            if kind == Some(Kind::None) {
+                return None;
+            }
+            if requested.is_some_and(|wanted| kind != Some(wanted)) {
+                return None;
+            }
+            Some((key, kind))
+        })
+        .collect()
+}
+
 /// One round trip, not five.
 ///
 /// Type, TTL, memory, size and the first page of the value all arrive together -- see
@@ -613,8 +640,8 @@ impl Worker {
 /// Sequentially this was five round trips per keypress, over a second each against a
 /// managed host on another continent, which is what made scrolling the tree feel broken.
 async fn detail(conn: &Conn, id: RequestId, key: &str) -> Update {
-    let (meta, value) = match conn.read_key(key).await {
-        Ok(pair) => pair,
+    let read = match conn.read_key(key).await {
+        Ok(read) => read,
         Err(e) => {
             return Update::DetailFailed {
                 id,
@@ -627,6 +654,11 @@ async fn detail(conn: &Conn, id: RequestId, key: &str) -> Update {
     // Consumer-group state is the reason to open a stream at all, but it's several extra
     // round trips, so it's fetched only for streams. A failure here degrades to "entries
     // only" rather than failing the whole key.
+    let keylens_conn::KeyRead {
+        meta,
+        value,
+        coverage,
+    } = read;
     let stream = if meta.kind == Kind::Stream {
         conn.stream_info(key).await.ok().map(Box::new)
     } else {
@@ -637,6 +669,47 @@ async fn detail(conn: &Conn, id: RequestId, key: &str) -> Update {
         id,
         meta: Box::new(meta),
         value: Box::new(value),
+        coverage,
         stream,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn err() -> keylens_conn::Result<Value> {
+        Err(keylens_conn::ConnError::Reply {
+            cmd: "TYPE",
+            detail: "denied".into(),
+        })
+    }
+
+    #[test]
+    fn keys_deleted_between_scan_and_type_are_not_listed() {
+        // 0.1.7 inserted them with a `-` tag: a key in the tree the server no longer had.
+        let keys = vec![
+            "live".to_string(),
+            "gone".to_string(),
+            "untyped".to_string(),
+        ];
+        let kinds = vec![Ok(Value::from("hash")), Ok(Value::from("none")), err()];
+        let kept = keep_typed(keys, &kinds, None);
+        assert_eq!(
+            kept,
+            vec![
+                ("live".to_string(), Some(Kind::Hash)),
+                ("untyped".to_string(), None),
+            ],
+            "a failed TYPE keeps the key untagged; a `none` drops it"
+        );
+    }
+
+    #[test]
+    fn a_type_filter_excludes_what_it_cannot_prove() {
+        let keys = vec!["h".to_string(), "s".to_string(), "unknown".to_string()];
+        let kinds = vec![Ok(Value::from("hash")), Ok(Value::from("string")), err()];
+        let kept = keep_typed(keys, &kinds, Some(Kind::Hash));
+        assert_eq!(kept, vec![("h".to_string(), Some(Kind::Hash))]);
     }
 }

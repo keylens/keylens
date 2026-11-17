@@ -78,7 +78,11 @@ fn loaded<T>(state: &PaneState<T>) -> Result<&T, Vec<Line<'static>>> {
 }
 
 /// Colour a state's count: zero is noise, failed is red, the rest are informational.
-fn count_style(state: State, n: u64) -> ratatui::style::Style {
+/// An unknown count is flagged, not dimmed -- dim is how zero looks.
+fn count_style(state: State, n: Option<u64>) -> ratatui::style::Style {
+    let Some(n) = n else {
+        return Theme::warn();
+    };
     if n == 0 {
         return Theme::dim();
     }
@@ -220,8 +224,11 @@ fn queue_table(app: &App, width: u16) -> Vec<Line<'static>> {
         ];
 
         // Paused comes from `meta.paused`, never from the legacy `paused` list.
-        spans.push(if q.paused {
+        spans.push(if q.paused == Some(true) {
             Span::styled(format!("{:<9}", "paused"), Theme::chip(Color::Yellow))
+        } else if q.paused.is_none() {
+            // The meta hash could not be read. "running" would be a guess.
+            Span::styled(format!("{:<9}", "?"), Theme::warn())
         } else {
             Span::styled(format!("{:<9}", "running"), Theme::ok())
         });
@@ -229,7 +236,7 @@ fn queue_table(app: &App, width: u16) -> Vec<Line<'static>> {
         for s in &columns {
             let n = q.count(*s);
             spans.push(Span::styled(
-                format!("{:>COL$}", format::count(n)),
+                format!("{:>COL$}", format::count_or_unknown(n)),
                 count_style(*s, n),
             ));
         }
@@ -264,12 +271,21 @@ fn queue_table(app: &App, width: u16) -> Vec<Line<'static>> {
             format!(
                 "  {} queues, {} paused",
                 queues.len(),
-                queues.iter().filter(|q| q.paused).count()
+                queues.iter().filter(|q| q.paused == Some(true)).count()
             ),
             Theme::dim(),
         ),
         Span::styled(events_text, events_style),
     ]));
+    if !queues.complete {
+        // Detection is bounded. Without this line a large keyspace showed "N queues" as
+        // though N were the total, with no hint that more had not been looked for.
+        lines.push(Line::from(Span::styled(
+            "  ! detection stopped early on a large keyspace -- more queues may exist; \
+             set `prefix` in your config to narrow the scan",
+            Theme::warn(),
+        )));
+    }
 
     lines
 }
@@ -318,6 +334,29 @@ fn job_list(app: &App) -> Vec<Line<'static>> {
         ]));
     }
 
+    // The list is one bounded page. Say so when the state holds more than it shows, or
+    // when its size is unknown and the page came back full.
+    let total = app.selected_queue().and_then(|q| q.count(app.job_state));
+    let shown = jobs.len() as u64;
+    let note = match total {
+        Some(n) if n > shown => Some(format!(
+            "  showing the first {} of {} {} jobs",
+            format::count(shown),
+            format::count(n),
+            app.job_state.label()
+        )),
+        None if jobs.len() >= crate::worker::JOB_PAGE => Some(format!(
+            "  showing the first {} {} jobs; the total could not be read",
+            format::count(shown),
+            app.job_state.label()
+        )),
+        _ => None,
+    };
+    if let Some(note) = note {
+        lines.push(Line::raw(""));
+        lines.push(Line::from(Span::styled(note, Theme::dim())));
+    }
+
     lines
 }
 
@@ -333,10 +372,10 @@ fn state_bar(app: &App) -> Line<'static> {
     let mut spans = vec![Span::styled("  ", Theme::base())];
     for s in State::ALL {
         let active = s == app.job_state;
-        let count = app.selected_queue().map(|q| q.count(s)).unwrap_or(0);
+        let count = app.selected_queue().and_then(|q| q.count(s));
         // Short labels here too: seven chips at full length overflow an 80-column pane.
         spans.push(Span::styled(
-            format!(" {} {} ", s.short_label(), format::count(count)),
+            format!(" {} {} ", s.short_label(), format::count_or_unknown(count)),
             if active {
                 Theme::tab_active()
             } else {

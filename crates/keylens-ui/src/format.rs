@@ -99,6 +99,14 @@ pub fn count(n: u64) -> String {
     out
 }
 
+/// A count that may not be known. Unknown renders as `?`, never as `0`.
+///
+/// A count the server would not give us and a count of zero mean opposite things to
+/// someone deciding whether a queue is healthy, so they must not look alike.
+pub fn count_or_unknown(n: Option<u64>) -> String {
+    n.map_or_else(|| "?".to_string(), count)
+}
+
 /// Pretty-print a JSON payload, or return `None` when it isn't JSON.
 ///
 /// Job payloads are JSON far more often than not, and reading a minified blob in a pane

@@ -10,9 +10,9 @@ use crossterm::event::{KeyCode, KeyEvent};
 use keylens::app::{App, Mode, View};
 use keylens::events::StreamEvent;
 use keylens::ui;
-use keylens::worker::{JobDetail, Request, RequestId, Update};
+use keylens::worker::{JobDetail, Request, RequestId, ScanProgress, Update};
 use keylens_bullmq::{EventKind, EventsStatus, JobRef, QueueSummary, State};
-use keylens_conn::{KeyMeta, KeyValue, Kind, ServerInfo, StreamEntry};
+use keylens_conn::{Coverage, KeyMeta, KeyValue, Kind, ServerInfo, StreamEntry};
 use keylens_lens::{Confidence, Detection};
 use keylens_ui::PaneState;
 use ratatui::Terminal;
@@ -35,7 +35,7 @@ fn app_with(keys: &[&str]) -> (App, Receiver<Request>) {
             .map(|k| (k.to_string(), Some(Kind::Hash)))
             .collect(),
         reset: true,
-        complete: true,
+        progress: ScanProgress::Complete,
         scanned_pages: 1,
     });
     (app, rx)
@@ -46,7 +46,7 @@ fn meta(key: &str, kind: Kind) -> Box<KeyMeta> {
         key: key.into(),
         kind,
         ttl_ms: Some(90_000),
-        size: 2,
+        size: Some(2),
         memory: Some(1024),
     })
 }
@@ -55,7 +55,7 @@ fn apply_queues(app: &mut App, list: Vec<QueueSummary>) {
     let id = app.expect_queues();
     app.apply(Update::Queues {
         id,
-        data: PaneState::Ready(list),
+        data: PaneState::Ready(list.into()),
     });
 }
 
@@ -126,6 +126,7 @@ fn renders_every_value_type_without_panicking() {
             id,
             meta: meta("k", Kind::String),
             value: Box::new(value),
+            coverage: Coverage::Complete,
             stream: None,
         });
         assert!(app.detail.is_some(), "detail should have been accepted");
@@ -141,6 +142,7 @@ fn json_payloads_render_pretty_printed() {
         id,
         meta: meta("job", Kind::String),
         value: Box::new(KeyValue::String(r#"{"to":"a@b.c","attempts":3}"#.into())),
+        coverage: Coverage::Complete,
         stream: None,
     });
 
@@ -160,6 +162,7 @@ fn ttl_and_memory_appear_in_the_detail_header() {
         id,
         meta: meta("k", Kind::Hash),
         value: Box::new(KeyValue::Hash(vec![("f".into(), "v".into())])),
+        coverage: Coverage::Complete,
         stream: None,
     });
 
@@ -178,6 +181,7 @@ fn survives_a_terminal_too_narrow_to_be_reasonable() {
         id,
         meta: meta("bull:emails:1", Kind::Hash),
         value: Box::new(KeyValue::Hash(vec![("field".into(), "value".into())])),
+        coverage: Coverage::Complete,
         stream: None,
     });
 
@@ -307,10 +311,10 @@ fn with_bullmq(keys: &[&str]) -> (App, Receiver<Request>) {
 fn queue(name: &str, paused: bool, failed: u64) -> QueueSummary {
     QueueSummary {
         name: name.into(),
-        paused,
+        paused: Some(paused),
         counts: State::ALL
             .iter()
-            .map(|s| (*s, if *s == State::Failed { failed } else { 0 }))
+            .map(|s| (*s, Some(if *s == State::Failed { failed } else { 0 })))
             .collect(),
     }
 }
@@ -574,13 +578,13 @@ fn field_values(pairs: &[(&str, &str)]) -> Vec<Option<String>> {
 fn stream_with_groups() -> Box<keylens_conn::StreamInfo> {
     use keylens_conn::{ConsumerInfo, GroupInfo, StreamInfo};
     Box::new(StreamInfo {
-        length: 1154,
+        length: Some(1154),
         entries_added: Some(1154),
         last_generated_id: "1785518057220-0".into(),
         groups: vec![GroupInfo {
             name: "processors".into(),
-            consumer_count: 2,
-            pending: 27,
+            consumer_count: Some(2),
+            pending: Some(27),
             last_delivered_id: "1785517628634-0".into(),
             entries_read: Some(95),
             lag: Some(0),
@@ -589,14 +593,14 @@ fn stream_with_groups() -> Box<keylens_conn::StreamInfo> {
             consumers: vec![
                 ConsumerInfo {
                     name: "worker-healthy".into(),
-                    pending: 0,
-                    idle_ms: 232,
+                    pending: Some(0),
+                    idle_ms: Some(232),
                     inactive_ms: Some(240),
                 },
                 ConsumerInfo {
                     name: "worker-stuck".into(),
-                    pending: 27,
-                    idle_ms: 441_000,
+                    pending: Some(27),
+                    idle_ms: Some(441_000),
                     inactive_ms: Some(441_000),
                 },
             ],
@@ -614,6 +618,7 @@ fn render_stream(app: &mut App, stream: Box<keylens_conn::StreamInfo>, width: u1
             id: "1785517610835-0".into(),
             fields: vec![("actor".into(), "admin".into())],
         }])),
+        coverage: Coverage::Complete,
         stream: Some(stream),
     });
     render(app, width, 40)
@@ -695,7 +700,7 @@ fn a_stream_without_groups_says_so() {
     use keylens_conn::StreamInfo;
     let (mut app, _rx) = app_with(&["bull:emails:events"]);
     let stream = Box::new(StreamInfo {
-        length: 10_044,
+        length: Some(10_044),
         entries_added: Some(63_914),
         last_generated_id: "1785517561250-1".into(),
         ..Default::default()
@@ -741,7 +746,7 @@ fn splash_shows_the_wordmark_until_the_first_batch_lands() {
         scan: RequestId::default(),
         keys: vec![("k".into(), None)],
         reset: true,
-        complete: true,
+        progress: ScanProgress::Complete,
         scanned_pages: 1,
     });
     assert!(!app.splash);
@@ -787,6 +792,7 @@ fn a_failed_key_does_not_hide_the_next_key_that_loads() {
         id,
         meta: meta("k2", Kind::String),
         value: Box::new(KeyValue::String("fresh-value".into())),
+        coverage: Coverage::Complete,
         stream: None,
     });
 
@@ -806,8 +812,10 @@ async fn moving_the_cursor_clears_the_previous_key_s_error() {
     // Not just on arrival of the next value -- while it loads, too. Otherwise the old
     // error sits under the new selection and reads as though *that* key failed.
     let (mut app, _rx) = app_with(&["k1", "k2"]);
-    app.apply(Update::ScanFailed {
-        scan: app.scan_generation(),
+    let id = app.expect_detail("k1");
+    app.apply(Update::DetailFailed {
+        id,
+        key: "k1".into(),
         error: "boom".into(),
     });
 
@@ -834,6 +842,7 @@ fn an_unsupported_bounded_read_explains_the_missing_capability() {
         value: Box::new(KeyValue::Unsupported(
             "this server has no bounded string read (GETRANGE)".into(),
         )),
+        coverage: Coverage::Complete,
         stream: None,
     });
 
@@ -968,7 +977,7 @@ async fn a_saturated_worker_never_blocks_the_ui() {
         scan: RequestId::default(),
         keys: vec![("k1".into(), None), ("k2".into(), None)],
         reset: true,
-        complete: true,
+        progress: ScanProgress::Complete,
         scanned_pages: 1,
     });
 
@@ -1006,7 +1015,7 @@ async fn a_dropped_fetch_does_not_leave_the_pane_claiming_to_load_forever() {
         scan: RequestId::default(),
         keys: vec![("k1".into(), None), ("k2".into(), None)],
         reset: true,
-        complete: true,
+        progress: ScanProgress::Complete,
         scanned_pages: 1,
     });
 
@@ -1039,6 +1048,7 @@ fn a_failed_stats_refresh_shows_on_the_stats_pane_and_nowhere_else() {
         id,
         meta: meta("k", Kind::String),
         value: Box::new(KeyValue::String("still-here".into())),
+        coverage: Coverage::Complete,
         stream: None,
     });
     app.apply(Update::InfoFailed {
@@ -1058,4 +1068,87 @@ fn a_failed_stats_refresh_shows_on_the_stats_pane_and_nowhere_else() {
         stats.contains("8.1.0"),
         "last good reading still shown:\n{stats}"
     );
+}
+
+#[test]
+fn a_partial_page_says_how_much_of_the_value_is_shown() {
+    // 0.1.7 showed the first 200 rows under `size 5,000` and nothing else.
+    let (mut app, _rx) = app_with(&["big"]);
+    let id = app.expect_detail("big");
+    let mut m = meta("big", Kind::List);
+    m.size = Some(5_000);
+    app.apply(Update::Detail {
+        id,
+        meta: m,
+        value: Box::new(KeyValue::List((0..200).map(|i| i.to_string()).collect())),
+        coverage: Coverage::Partial { shown: 200 },
+        stream: None,
+    });
+    let out = render(&mut app, 120, 260);
+    assert!(out.contains("showing 200 of 5,000"), "{out}");
+
+    // Complete reads carry no note.
+    let id = app.expect_detail("big");
+    app.apply(Update::Detail {
+        id,
+        meta: meta("big", Kind::List),
+        value: Box::new(KeyValue::List(vec!["a".into(), "b".into()])),
+        coverage: Coverage::Complete,
+        stream: None,
+    });
+    assert!(!render(&mut app, 120, 40).contains("showing"));
+}
+
+#[test]
+fn an_unknown_size_and_a_changed_key_are_not_rendered_as_facts() {
+    let (mut app, _rx) = app_with(&["k"]);
+    let id = app.expect_detail("k");
+    let mut m = meta("k", Kind::Hash);
+    m.size = None;
+    app.apply(Update::Detail {
+        id,
+        meta: m,
+        value: Box::new(KeyValue::Changed),
+        coverage: Coverage::Complete,
+        stream: None,
+    });
+    let out = render(&mut app, 120, 24);
+    assert!(
+        out.contains("size ?"),
+        "an unread size rendered as a number:\n{out}"
+    );
+    assert!(out.contains("changed type"), "{out}");
+    assert!(!out.contains("no longer exists"), "{out}");
+}
+
+#[test]
+fn unknown_queue_counts_and_state_render_as_unknown_not_zero() {
+    let (mut app, _rx) = with_bullmq(&[]);
+    let id = app.expect_queues();
+    app.apply(Update::Queues {
+        id,
+        data: PaneState::Ready(keylens_bullmq::QueueList {
+            queues: vec![QueueSummary {
+                name: "emails".into(),
+                paused: None,
+                counts: State::ALL.iter().map(|s| (*s, None)).collect(),
+            }],
+            complete: false,
+        }),
+    });
+    let out = render(&mut app, 140, 24);
+    let row = out
+        .lines()
+        .find(|l| l.contains("emails"))
+        .expect("queue row");
+    assert!(
+        !row.contains(" 0 "),
+        "an unknown count rendered as 0: {row}"
+    );
+    assert!(
+        !row.contains("running"),
+        "an unread meta hash rendered as running: {row}"
+    );
+    assert!(row.matches('?').count() >= 2, "{row}");
+    assert!(out.contains("more queues may exist"), "{out}");
 }

@@ -1,10 +1,10 @@
 //! Application state and input handling.
 
 use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
-use keylens_bullmq::{JobRef, QueueSummary, State, Throughput};
+use keylens_bullmq::{JobRef, QueueList, QueueSummary, State, Throughput};
 use keylens_conn::{
-    ClientInfo, ClusterTopology, KeyMeta, KeyValue, Kind, PubSubChannel, ServerInfo, SlowEntry,
-    StreamInfo, redact_url,
+    ClientInfo, ClusterTopology, Coverage, KeyMeta, KeyValue, Kind, PubSubChannel, ServerInfo,
+    SlowEntry, StreamInfo, redact_url,
 };
 use keylens_lens::Detection;
 use keylens_ui::KeyTree;
@@ -13,7 +13,7 @@ use keylens_ui::tree::Row;
 use ratatui::widgets::ListState;
 use tokio::sync::mpsc::Sender;
 
-use crate::worker::{JobDetail, Request, RequestId, Update};
+use crate::worker::{JobDetail, Request, RequestId, ScanProgress, Update};
 
 /// The top-level tabs.
 ///
@@ -131,6 +131,8 @@ pub struct App {
     pub list_state: ListState,
 
     pub detail: Option<(KeyMeta, KeyValue)>,
+    /// Whether `detail`'s value is the whole value or its first bounded page.
+    pub coverage: Coverage,
     /// Consumer-group state for the selected key, when it's a stream.
     pub stream: Option<Box<StreamInfo>>,
     pub detail_scroll: u16,
@@ -164,7 +166,7 @@ pub struct App {
     /// Lenses that matched this keyspace. Non-empty is what makes the queues tab appear.
     pub detections: Vec<Detection>,
     pub level: QueueLevel,
-    pub queues: PaneState<Vec<QueueSummary>>,
+    pub queues: PaneState<QueueList>,
     pub queue_selected: usize,
     pub job_state: State,
     pub jobs: PaneState<Vec<JobRef>>,
@@ -200,6 +202,7 @@ impl App {
             selected: 0,
             list_state: ListState::default(),
             detail: None,
+            coverage: Coverage::Complete,
             stream: None,
             detail_scroll: 0,
             pending: Pending::default(),
@@ -315,7 +318,7 @@ impl App {
                 scan,
                 keys,
                 reset,
-                complete,
+                progress,
                 scanned_pages,
             } => {
                 // A batch from a superseded scan describes a filter that is no longer
@@ -337,34 +340,32 @@ impl App {
                 for (key, kind) in keys {
                     self.tree.insert_with_kind(&key, kind);
                 }
-                self.scan_complete = complete;
+                self.scan_complete = progress == ScanProgress::Complete;
                 self.loading = false;
-                self.error = None;
                 // The first batch is the signal that there's something worth showing.
                 self.splash = false;
-                self.status = if complete {
-                    format!("{} keys", keylens_ui::format::count(self.tree.len() as u64))
-                } else {
-                    format!(
-                        "{} keys so far ({scanned_pages} page{}) - `m` for more",
-                        keylens_ui::format::count(self.tree.len() as u64),
+                let n = keylens_ui::format::count(self.tree.len() as u64);
+                self.status = match progress {
+                    ScanProgress::Complete => format!("{n} keys"),
+                    ScanProgress::Partial => format!(
+                        "{n} keys so far ({scanned_pages} page{}) - `m` for more",
                         if scanned_pages == 1 { "" } else { "s" }
-                    )
+                    ),
+                    // The status bar, not the value pane: the keys listed are real, the
+                    // selected key's value is unaffected, and the honest summary is "this
+                    // is not the whole keyspace".
+                    ScanProgress::Failed(why) => {
+                        format!("scan failed after {n} keys (incomplete) - r to rescan: {why}")
+                    }
                 };
                 self.rebuild();
-            }
-
-            Update::ScanFailed { scan, error } => {
-                if scan == self.pending.scan {
-                    self.loading = false;
-                    self.error = Some(error);
-                }
             }
 
             Update::Detail {
                 id,
                 meta,
                 value,
+                coverage,
                 stream,
             } => {
                 // Drop replies for a key the user has already scrolled past -- and for an
@@ -374,6 +375,7 @@ impl App {
                     self.detail_scroll = 0;
                     self.stream = stream;
                     self.detail = Some((*meta, *value));
+                    self.coverage = coverage;
                     // A key that loaded is proof the last failure is over. The value pane
                     // renders `error` in place of the value, so leaving a stale one set
                     // meant one bad key hid every key selected after it until a rescan.
@@ -1067,7 +1069,7 @@ mod tests {
             scan: RequestId::default(),
             keys: keys.iter().map(|k| (k.to_string(), None)).collect(),
             reset: false,
-            complete: true,
+            progress: ScanProgress::Complete,
             scanned_pages: 1,
         }
     }
@@ -1123,7 +1125,7 @@ mod tests {
             key: key.into(),
             kind: Kind::String,
             ttl_ms: None,
-            size: 1,
+            size: Some(1),
             memory: None,
         })
     }
@@ -1133,6 +1135,7 @@ mod tests {
             id,
             meta: meta(key),
             value: Box::new(KeyValue::String(text.into())),
+            coverage: Coverage::Complete,
             stream: None,
         }
     }
@@ -1236,7 +1239,7 @@ mod tests {
             scan: old,
             keys: vec![("old:1".into(), None)],
             reset: true,
-            complete: false,
+            progress: ScanProgress::Partial,
             scanned_pages: 1,
         });
 
@@ -1248,7 +1251,7 @@ mod tests {
             scan: old,
             keys: vec![("old:2".into(), None)],
             reset: false,
-            complete: true,
+            progress: ScanProgress::Complete,
             scanned_pages: 1,
         });
         assert!(
@@ -1261,11 +1264,17 @@ mod tests {
         );
         assert!(a.rows.iter().all(|r| r.path != "old:2"));
 
-        a.apply(Update::ScanFailed {
+        a.apply(Update::Batch {
             scan: old,
-            error: "stale".into(),
+            keys: vec![],
+            reset: false,
+            progress: ScanProgress::Failed("stale".into()),
+            scanned_pages: 0,
         });
-        assert!(a.error.is_none(), "an old scan's failure was shown");
+        assert!(
+            !a.status.contains("stale"),
+            "an old scan's failure was shown"
+        );
 
         // Both rescans went out with the generation the app recorded.
         let gens: Vec<RequestId> = std::iter::from_fn(|| rx.try_recv().ok())
@@ -1285,6 +1294,7 @@ mod tests {
             id,
             meta: meta("s"),
             value: Box::new(KeyValue::Stream(vec![])),
+            coverage: Coverage::Complete,
             stream: Some(Box::default()),
         });
         assert!(a.stream.is_some());
@@ -1292,7 +1302,7 @@ mod tests {
             scan: RequestId::default(),
             keys: vec![],
             reset: true,
-            complete: true,
+            progress: ScanProgress::Complete,
             scanned_pages: 1,
         });
         assert!(a.stream.is_none(), "consumer groups outlived their key");
@@ -1307,7 +1317,7 @@ mod tests {
             scan: RequestId::default(),
             keys: vec![("new:1".into(), None)],
             reset: true,
-            complete: true,
+            progress: ScanProgress::Complete,
             scanned_pages: 1,
         });
         assert_eq!(a.rows.len(), 1);
@@ -1316,14 +1326,30 @@ mod tests {
     }
 
     #[test]
-    fn error_clears_loading_state() {
+    fn a_failed_scan_keeps_its_keys_and_says_it_is_incomplete() {
+        // 0.1.7 replaced the batch with a bare error -- dropping every key gathered before
+        // the failure -- and the next `m` then reported the keyspace complete.
         let mut a = app();
-        a.apply(Update::ScanFailed {
+        a.apply(Update::Batch {
             scan: RequestId::default(),
-            error: "boom".into(),
+            keys: vec![("k:1".into(), None), ("k:2".into(), None)],
+            reset: true,
+            progress: ScanProgress::Failed("Request timed out.".into()),
+            scanned_pages: 3,
         });
         assert!(!a.loading);
-        assert_eq!(a.error.as_deref(), Some("boom"));
+        assert!(!a.scan_complete, "a failed scan claimed to be complete");
+        assert_eq!(
+            a.tree.len(),
+            2,
+            "keys gathered before the failure were dropped"
+        );
+        assert!(a.status.contains("incomplete"), "{}", a.status);
+        assert!(a.status.contains("Request timed out."), "{}", a.status);
+        assert!(
+            a.error.is_none(),
+            "a scan failure must not blank the value pane"
+        );
     }
 
     #[tokio::test]
@@ -1454,15 +1480,15 @@ mod tests {
         let id = a.expect_queues();
         a.apply(Update::Queues {
             id,
-            data: PaneState::Ready(list),
+            data: PaneState::Ready(list.into()),
         });
     }
 
     fn summary(name: &str, paused: bool) -> QueueSummary {
         QueueSummary {
             name: name.into(),
-            paused,
-            counts: State::ALL.iter().map(|s| (*s, 3)).collect(),
+            paused: Some(paused),
+            counts: State::ALL.iter().map(|s| (*s, Some(3))).collect(),
         }
     }
 

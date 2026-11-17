@@ -32,7 +32,7 @@ pub use server::{ClientInfo, ClusterNode, ClusterTopology, PubSubChannel, SlowEn
 pub use server_info::{ServerInfo, Vendor};
 pub use stream::{ConsumerInfo, GroupInfo, StreamInfo};
 pub use url::redact_url;
-pub use value::{KeyMeta, KeyValue, Kind, StreamEntry};
+pub use value::{Coverage, KeyMeta, KeyRead, KeyValue, Kind, MAX_STRING_BYTES, PAGE, StreamEntry};
 
 /// Compute the Redis Cluster hash slot for a key, including `{hash-tag}` semantics.
 pub fn key_slot(key: &str) -> u16 {

@@ -24,23 +24,65 @@ const MAX_QUEUES: usize = 500;
 #[derive(Debug, Clone)]
 pub struct QueueSummary {
     pub name: String,
-    pub paused: bool,
-    /// Counts per state, in [`State::ALL`] order.
-    pub counts: Vec<(State, u64)>,
+    /// `None` when the meta hash could not be read. Not `false`: "running" is a claim.
+    pub paused: Option<bool>,
+    /// Counts per state, in [`State::ALL`] order. `None` for a count that failed.
+    pub counts: Vec<(State, Option<u64>)>,
 }
 
 impl QueueSummary {
-    pub fn count(&self, s: State) -> u64 {
+    /// The count for one state, or `None` when it could not be read.
+    ///
+    /// 0.1.7 returned `0` for a failed count -- a `WRONGTYPE` on `wait`, an ACL denying
+    /// `LLEN` -- which reads as "nothing waiting" on exactly the queue that needs a look.
+    pub fn count(&self, s: State) -> Option<u64> {
         self.counts
             .iter()
             .find(|(k, _)| *k == s)
-            .map(|(_, v)| *v)
-            .unwrap_or(0)
+            .and_then(|(_, v)| *v)
     }
 
-    pub fn total(&self) -> u64 {
-        self.counts.iter().map(|(_, v)| v).sum()
+    /// Sum over every state, or `None` if any one of them is unknown.
+    pub fn total(&self) -> Option<u64> {
+        self.counts
+            .iter()
+            .try_fold(0u64, |acc, (_, v)| acc.checked_add((*v)?))
     }
+}
+
+/// The queues found by one detection scan, and whether that scan saw the whole keyspace.
+///
+/// Detection is bounded -- [`MAX_DETECT_PAGES`] pages, [`MAX_QUEUES`] queues -- so on a
+/// large keyspace it can stop before it has seen every `meta` key. `complete == false`
+/// means "these queues exist", not "these are all the queues".
+#[derive(Debug, Clone, Default)]
+pub struct QueueList {
+    pub queues: Vec<QueueSummary>,
+    pub complete: bool,
+}
+
+impl From<Vec<QueueSummary>> for QueueList {
+    /// A list built by hand is taken to be the whole story.
+    fn from(queues: Vec<QueueSummary>) -> Self {
+        Self {
+            queues,
+            complete: true,
+        }
+    }
+}
+
+impl std::ops::Deref for QueueList {
+    type Target = [QueueSummary];
+    fn deref(&self) -> &[QueueSummary] {
+        &self.queues
+    }
+}
+
+/// Queue names found by detection's bounded scan.
+struct MetaScan {
+    names: Vec<String>,
+    /// The scan reached the end of the keyspace and kept every queue it found.
+    complete: bool,
 }
 
 pub struct BullMqLens {
@@ -68,7 +110,7 @@ impl BullMqLens {
     ///
     /// `TYPE hash` is passed when the server supports it; [`Conn::scan_page`] drops the
     /// option otherwise, so we re-validate below rather than trusting the filter.
-    async fn scan_meta_keys(&self, conn: &Conn) -> Result<Vec<String>> {
+    async fn scan_meta_keys(&self, conn: &Conn) -> Result<MetaScan> {
         let pattern = format!("{}:*:meta", self.prefix);
         let mut names = Vec::new();
         let type_filter = conn
@@ -76,9 +118,11 @@ impl BullMqLens {
             .has(keylens_conn::Feature::ScanTypeFilter)
             .then_some("hash");
         let mut scanner = conn.key_scanner(Some(&pattern), SCAN_COUNT, type_filter);
+        let mut reached_end = false;
 
         for _ in 0..MAX_DETECT_PAGES {
             let Some(keys) = scanner.next_page().await? else {
+                reached_end = true;
                 break;
             };
 
@@ -95,8 +139,12 @@ impl BullMqLens {
 
         names.sort();
         names.dedup();
+        let capped = names.len() > MAX_QUEUES;
         names.truncate(MAX_QUEUES);
-        Ok(names)
+        Ok(MetaScan {
+            names,
+            complete: reached_end && !capped,
+        })
     }
 
     /// Read `version` and `paused` from a queue's meta hash in one round trip.
@@ -164,19 +212,16 @@ impl BullMqLens {
                 let base = i * PER_QUEUE;
 
                 let paused = match reply(base) {
-                    Some(Value::Array(fields)) => {
-                        is_paused(fields.get(1).and_then(|v| v.as_string()).as_deref())
-                    }
-                    _ => false,
+                    Some(Value::Array(fields)) => Some(is_paused(
+                        fields.get(1).and_then(|v| v.as_string()).as_deref(),
+                    )),
+                    _ => None,
                 };
 
                 let counts = State::ALL
                     .iter()
                     .enumerate()
-                    .map(|(j, state)| {
-                        let n = reply(base + 1 + j).and_then(|v| v.as_u64()).unwrap_or(0);
-                        (*state, n)
-                    })
+                    .map(|(j, state)| (*state, reply(base + 1 + j).and_then(|v| v.as_u64())))
                     .collect();
 
                 QueueSummary {
@@ -188,9 +233,13 @@ impl BullMqLens {
             .collect())
     }
 
-    pub async fn all_queues(&self, conn: &Conn) -> Result<Vec<QueueSummary>> {
-        let names = self.scan_meta_keys(conn).await?;
-        self.summaries(conn, &names).await
+    /// Every queue detection can find, with counts.
+    pub async fn all_queues(&self, conn: &Conn) -> Result<QueueList> {
+        let scan = self.scan_meta_keys(conn).await?;
+        Ok(QueueList {
+            queues: self.summaries(conn, &scan.names).await?,
+            complete: scan.complete,
+        })
     }
 
     /// A page of job ids from one state.
@@ -307,10 +356,16 @@ impl Lens for BullMqLens {
     }
 
     async fn detect(&self, conn: &Conn) -> Result<Option<Detection>> {
-        let names = self.scan_meta_keys(conn).await?;
+        let MetaScan { names, complete } = self.scan_meta_keys(conn).await?;
         if names.is_empty() {
             return Ok(None);
         }
+        // "500 queues" from a scan that stopped early claims a total it never counted.
+        let n_queues = if complete {
+            format!("{} queues", names.len())
+        } else {
+            format!("{}+ queues (detection stopped early)", names.len())
+        };
 
         // Sample meta from the first few queues to pin the version and confidence,
         // instead of paying for every queue during detection.
@@ -341,8 +396,8 @@ impl Lens for BullMqLens {
         };
 
         let summary = match (&lib, &version) {
-            (Some(l), Some(v)) => format!("{} {} - {} queues", l, v, names.len()),
-            _ => format!("{} queues (version not advertised)", names.len()),
+            (Some(l), Some(v)) => format!("{l} {v} - {n_queues}"),
+            _ => format!("{n_queues} (version not advertised)"),
         };
 
         Ok(Some(Detection {
@@ -385,7 +440,7 @@ fn page_range(offset: usize, limit: usize) -> Option<(i64, i64)> {
 mod tests {
     use super::*;
 
-    fn summary(counts: Vec<(State, u64)>, paused: bool) -> QueueSummary {
+    fn summary(counts: Vec<(State, Option<u64>)>, paused: Option<bool>) -> QueueSummary {
         QueueSummary {
             name: "emails".into(),
             paused,
@@ -394,11 +449,36 @@ mod tests {
     }
 
     #[test]
-    fn missing_states_count_as_zero() {
-        let s = summary(vec![(State::Failed, 3)], false);
-        assert_eq!(s.count(State::Failed), 3);
-        assert_eq!(s.count(State::Waiting), 0);
-        assert_eq!(s.total(), 3);
+    fn an_unread_count_is_unknown_not_zero() {
+        let s = summary(
+            vec![(State::Failed, Some(3)), (State::Waiting, None)],
+            Some(false),
+        );
+        assert_eq!(s.count(State::Failed), Some(3));
+        assert_eq!(
+            s.count(State::Waiting),
+            None,
+            "a failed LLEN read as 0 jobs"
+        );
+        assert_eq!(
+            s.count(State::Active),
+            None,
+            "an absent state read as 0 jobs"
+        );
+        assert_eq!(s.total(), None, "a total over an unknown is unknown");
+
+        let all = summary(
+            vec![(State::Failed, Some(3)), (State::Waiting, Some(4))],
+            None,
+        );
+        assert_eq!(all.total(), Some(7));
+    }
+
+    #[test]
+    fn a_hand_built_queue_list_is_complete() {
+        let list = QueueList::from(vec![summary(vec![], Some(true))]);
+        assert!(list.complete);
+        assert_eq!(list.len(), 1, "derefs to the queues");
     }
 
     #[test]

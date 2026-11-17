@@ -87,7 +87,8 @@ pub async fn run(target: &Target, show_queues: bool) -> Result<()> {
 }
 
 async fn print_queue_table(lens: &BullMqLens, conn: &Conn) -> Result<()> {
-    let queues = lens.all_queues(conn).await?;
+    let list = lens.all_queues(conn).await?;
+    let queues = &list.queues;
     if queues.is_empty() {
         println!("  (no queues)");
         return Ok(());
@@ -106,13 +107,21 @@ async fn print_queue_table(lens: &BullMqLens, conn: &Conn) -> Result<()> {
     }
     println!();
 
-    for q in &queues {
-        let status = if q.paused { "paused" } else { "running" };
+    for q in queues {
+        let status = match q.paused {
+            Some(true) => "paused",
+            Some(false) => "running",
+            None => "?",
+        };
         print!("  {:<name_w$}  {:>7}", q.name, status);
         for s in State::ALL {
-            print!("  {:>9}", q.count(s));
+            // `?` for a count the server would not give; never a made-up 0.
+            print!("  {:>9}", keylens_ui::format::count_or_unknown(q.count(s)));
         }
         println!();
+    }
+    if !list.complete {
+        println!("  (detection stopped early on a large keyspace; more queues may exist)");
     }
 
     Ok(())
