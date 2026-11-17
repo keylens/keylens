@@ -1023,7 +1023,7 @@ async fn every_request_is_answered_even_when_the_scan_is_already_complete() {
     // The UI sets `loading` when it asks for more keys and clears it when a batch arrives.
     // The worker used to `continue` past a `More` on a finished scan, replying with
     // nothing at all -- leaving the status bar spinning on a scan that had ended.
-    use keylens::worker::{Request, Update, Worker};
+    use keylens::worker::{Request, RequestId, Update, Worker};
     use std::time::Duration;
     use tokio::sync::mpsc;
 
@@ -1031,10 +1031,12 @@ async fn every_request_is_answered_even_when_the_scan_is_already_complete() {
     let (req_tx, req_rx) = mpsc::channel(8);
     let (up_tx, mut up_rx) = mpsc::channel(8);
     tokio::spawn(Worker::new(conn).run(req_rx, up_tx));
+    let scan = RequestId::new(1);
 
     // A pattern that matches nothing, so the scan reaches the end of the keyspace.
     req_tx
         .send(Request::Rescan {
+            scan,
             pattern: Some("keylens:no-such-prefix:*".into()),
             kind: None,
         })
@@ -1052,7 +1054,7 @@ async fn every_request_is_answered_even_when_the_scan_is_already_complete() {
                     complete = true;
                     break;
                 }
-                req_tx.send(Request::More).await.unwrap();
+                req_tx.send(Request::More { scan }).await.unwrap();
             }
             other => panic!("unexpected update: {other:?}"),
         }
@@ -1060,7 +1062,7 @@ async fn every_request_is_answered_even_when_the_scan_is_already_complete() {
     assert!(complete, "the scan should reach the end of the keyspace");
 
     // Now ask for more past the end. This must still produce a reply.
-    req_tx.send(Request::More).await.unwrap();
+    req_tx.send(Request::More { scan }).await.unwrap();
     let reply = tokio::time::timeout(Duration::from_secs(5), up_rx.recv())
         .await
         .expect("`More` past the end must be answered, not silently dropped")
@@ -1237,5 +1239,75 @@ async fn a_one_round_trip_read_agrees_with_the_sequential_one() {
 
     for (key, _, _) in &seed {
         conn.test_cmd("UNLINK", vec![(*key).into()]).await.ok();
+    }
+}
+
+#[tokio::test]
+#[ignore = "requires docker compose fixtures"]
+async fn every_worker_reply_names_the_request_it_answers() {
+    // The app decides what is stale by id, so the worker must echo the id of the request
+    // each reply answers -- for a detail that was superseded mid-flight as much as for the
+    // one that won, and for a scan whose generation has been replaced.
+    use keylens::worker::{Request, RequestId, Update, Worker};
+    use tokio::sync::mpsc;
+
+    let probe = conn().await;
+    let keys = scan_all(&probe, Some("bull:*:meta"), None).await;
+    let (req_tx, req_rx) = mpsc::channel(16);
+    let (up_tx, mut up_rx) = mpsc::channel(16);
+    tokio::spawn(Worker::new(conn().await).run(req_rx, up_tx));
+    assert!(keys.len() >= 2, "need two keys to switch between: {keys:?}");
+    let (a, b) = (keys[0].clone(), keys[1].clone());
+
+    // Two selections back to back: the first is aborted, but may already have answered.
+    req_tx
+        .send(Request::Select {
+            id: RequestId::new(10),
+            key: a.clone(),
+        })
+        .await
+        .unwrap();
+    req_tx
+        .send(Request::Select {
+            id: RequestId::new(11),
+            key: b.clone(),
+        })
+        .await
+        .unwrap();
+
+    // A `More` for a generation the worker never started must not continue anything.
+    req_tx
+        .send(Request::More {
+            scan: RequestId::new(99),
+        })
+        .await
+        .unwrap();
+
+    let mut saw_b = false;
+    let mut saw_stale_more = false;
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(10);
+    while !(saw_b && saw_stale_more) {
+        let update = tokio::time::timeout_at(deadline, up_rx.recv())
+            .await
+            .expect("worker answered")
+            .expect("worker alive");
+        match update {
+            Update::Detail { id, meta, .. } => {
+                let want = if id == RequestId::new(10) { &a } else { &b };
+                assert_eq!(
+                    &meta.key, want,
+                    "reply {id:?} carried another request's key"
+                );
+                saw_b |= id == RequestId::new(11);
+            }
+            Update::Batch {
+                scan, keys, reset, ..
+            } => {
+                assert_eq!(scan, RequestId::new(99));
+                assert!(keys.is_empty() && !reset, "a stale `More` produced keys");
+                saw_stale_more = true;
+            }
+            other => panic!("unexpected update: {other:?}"),
+        }
     }
 }

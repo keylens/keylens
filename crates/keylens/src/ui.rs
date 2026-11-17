@@ -173,10 +173,21 @@ fn draw_tabs(frame: &mut Frame<'_>, app: &App, area: Rect) {
 
 fn draw_server_pane(frame: &mut Frame<'_>, app: &App, area: Rect, view: View) {
     let (title, lines) = match view {
-        View::Stats => (
-            view.label().to_string(),
-            panes::stats(&app.server, area.width),
-        ),
+        View::Stats => {
+            let mut lines = Vec::new();
+            // The last refresh failing does not make the numbers below wrong, only old.
+            // Say so above them rather than replacing them -- or, as before, replacing
+            // the value of whichever key happened to be selected in the keys view.
+            if let Some(err) = &app.info_error {
+                lines.push(Line::from(Span::styled(
+                    format!("  refresh failed: {err} — showing the last good reading"),
+                    Theme::error(),
+                )));
+                lines.push(Line::raw(""));
+            }
+            lines.extend(panes::stats(&app.server, area.width));
+            (view.label().to_string(), lines)
+        }
         View::Slowlog => (view.label().to_string(), panes::slowlog(app)),
         View::Clients => (view.label().to_string(), panes::clients(app)),
         View::Cluster => (view.label().to_string(), panes::cluster(app)),

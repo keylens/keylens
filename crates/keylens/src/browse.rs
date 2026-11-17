@@ -106,13 +106,9 @@ pub async fn run(target: &Target) -> Result<()> {
     // Detection first: it's cheap, and its result decides whether a queues tab exists and
     // which streams the event reader follows.
     req_tx.send(Request::Detect).await.ok();
-    req_tx
-        .send(Request::Rescan {
-            pattern: None,
-            kind: None,
-        })
-        .await
-        .ok();
+    // Through the app, not the raw sender: the scan generation is issued there, and a
+    // batch whose generation the app never recorded would be dropped as stale.
+    app.rescan().await;
 
     let streamer = StreamerHandle {
         url: url.to_string(),
@@ -120,7 +116,7 @@ pub async fn run(target: &Target) -> Result<()> {
         task: None,
     };
 
-    let result = event_loop(&mut terminal, &mut app, &mut up_rx, &req_tx, streamer, rtt).await;
+    let result = event_loop(&mut terminal, &mut app, &mut up_rx, streamer, rtt).await;
     ratatui::restore();
 
     // `app` owns a clone of the request sender and outlives this scope, so dropping this
@@ -278,7 +274,6 @@ async fn event_loop(
     terminal: &mut ratatui::DefaultTerminal,
     app: &mut App,
     updates: &mut mpsc::Receiver<Update>,
-    requests: &mpsc::Sender<Request>,
     mut streamer: StreamerHandle,
     rtt: Duration,
 ) -> Result<()> {
@@ -345,7 +340,7 @@ async fn event_loop(
 
             _ = info_tick.tick() => {
                 // Stats go stale while you browse; refreshing them is cheap.
-                requests.try_send(Request::RefreshInfo).ok();
+                app.refresh_info().await;
             }
         }
 

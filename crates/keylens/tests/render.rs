@@ -10,7 +10,7 @@ use crossterm::event::{KeyCode, KeyEvent};
 use keylens::app::{App, Mode, View};
 use keylens::events::StreamEvent;
 use keylens::ui;
-use keylens::worker::{JobDetail, Request, Update};
+use keylens::worker::{JobDetail, Request, RequestId, Update};
 use keylens_bullmq::{EventKind, EventsStatus, JobRef, QueueSummary, State};
 use keylens_conn::{KeyMeta, KeyValue, Kind, ServerInfo, StreamEntry};
 use keylens_lens::{Confidence, Detection};
@@ -29,6 +29,7 @@ fn app_with(keys: &[&str]) -> (App, Receiver<Request>) {
         tx,
     );
     app.apply(Update::Batch {
+        scan: RequestId::default(),
         keys: keys
             .iter()
             .map(|k| (k.to_string(), Some(Kind::Hash)))
@@ -48,6 +49,14 @@ fn meta(key: &str, kind: Kind) -> Box<KeyMeta> {
         size: 2,
         memory: Some(1024),
     })
+}
+
+fn apply_queues(app: &mut App, list: Vec<QueueSummary>) {
+    let id = app.expect_queues();
+    app.apply(Update::Queues {
+        id,
+        data: PaneState::Ready(list),
+    });
 }
 
 fn render(app: &mut App, width: u16, height: u16) -> String {
@@ -112,8 +121,9 @@ fn renders_every_value_type_without_panicking() {
 
     for value in values {
         let (mut app, _rx) = app_with(&["k"]);
-        app.set_pending_key(Some("k".into()));
+        let id = app.expect_detail("k");
         app.apply(Update::Detail {
+            id,
             meta: meta("k", Kind::String),
             value: Box::new(value),
             stream: None,
@@ -126,8 +136,9 @@ fn renders_every_value_type_without_panicking() {
 #[test]
 fn json_payloads_render_pretty_printed() {
     let (mut app, _rx) = app_with(&["job"]);
-    app.set_pending_key(Some("job".into()));
+    let id = app.expect_detail("job");
     app.apply(Update::Detail {
+        id,
         meta: meta("job", Kind::String),
         value: Box::new(KeyValue::String(r#"{"to":"a@b.c","attempts":3}"#.into())),
         stream: None,
@@ -144,8 +155,9 @@ fn json_payloads_render_pretty_printed() {
 #[test]
 fn ttl_and_memory_appear_in_the_detail_header() {
     let (mut app, _rx) = app_with(&["k"]);
-    app.set_pending_key(Some("k".into()));
+    let id = app.expect_detail("k");
     app.apply(Update::Detail {
+        id,
         meta: meta("k", Kind::Hash),
         value: Box::new(KeyValue::Hash(vec![("f".into(), "v".into())])),
         stream: None,
@@ -161,8 +173,9 @@ fn survives_a_terminal_too_narrow_to_be_reasonable() {
     // Layout arithmetic that subtracts a border width panics on tiny terminals, and users
     // really do drag windows to absurd sizes.
     let (mut app, _rx) = app_with(&["bull:emails:1"]);
-    app.set_pending_key(Some("bull:emails:1".into()));
+    let id = app.expect_detail("bull:emails:1");
     app.apply(Update::Detail {
+        id,
         meta: meta("bull:emails:1", Kind::Hash),
         value: Box::new(KeyValue::Hash(vec![("field".into(), "value".into())])),
         stream: None,
@@ -305,10 +318,10 @@ fn queue(name: &str, paused: bool, failed: u64) -> QueueSummary {
 #[test]
 fn queue_table_shows_counts_and_true_paused_state() {
     let (mut app, _rx) = with_bullmq(&[]);
-    app.apply(Update::Queues(PaneState::Ready(vec![
-        queue("emails", false, 18),
-        queue("reports", true, 0),
-    ])));
+    apply_queues(
+        &mut app,
+        vec![queue("emails", false, 18), queue("reports", true, 0)],
+    );
 
     let out = render(&mut app, 120, 24);
     assert!(
@@ -329,11 +342,7 @@ fn queue_table_shows_counts_and_true_paused_state() {
 fn queue_columns_do_not_run_into_each_other() {
     // `prioritized` and `waiting-children` at full length overflowed their columns.
     let (mut app, _rx) = with_bullmq(&[]);
-    app.apply(Update::Queues(PaneState::Ready(vec![queue(
-        "image-processing",
-        false,
-        500,
-    )])));
+    apply_queues(&mut app, vec![queue("image-processing", false, 500)]);
 
     let out = render(&mut app, 120, 24);
     let header = out
@@ -359,9 +368,7 @@ fn queue_columns_do_not_run_into_each_other() {
 #[test]
 fn throughput_column_distinguishes_idle_from_not_yet_watching() {
     let (mut app, _rx) = with_bullmq(&[]);
-    app.apply(Update::Queues(PaneState::Ready(vec![queue(
-        "emails", false, 0,
-    )])));
+    apply_queues(&mut app, vec![queue("emails", false, 0)]);
 
     // Before the reader attaches, the graph is unknown -- not idle.
     let out = render(&mut app, 130, 24);
@@ -379,9 +386,7 @@ fn throughput_column_distinguishes_idle_from_not_yet_watching() {
 #[test]
 fn throughput_column_draws_a_sparkline_from_stream_events() {
     let (mut app, _rx) = with_bullmq(&[]);
-    app.apply(Update::Queues(PaneState::Ready(vec![queue(
-        "emails", false, 0,
-    )])));
+    apply_queues(&mut app, vec![queue("emails", false, 0)]);
     app.apply(Update::EventsStatus(EventsStatus::Live));
 
     // Events timestamped "now" so they land inside the rendered window.
@@ -423,11 +428,7 @@ fn the_queue_table_fits_its_pane() {
     // The sparkline is sized from the remaining width; getting that budget wrong clipped
     // the ev/s column off the right-hand edge.
     let (mut app, _rx) = with_bullmq(&[]);
-    app.apply(Update::Queues(PaneState::Ready(vec![queue(
-        "image-processing",
-        false,
-        500,
-    )])));
+    apply_queues(&mut app, vec![queue("image-processing", false, 500)]);
     app.apply(Update::EventsStatus(EventsStatus::Live));
 
     for width in [80u16, 100, 120, 160, 200] {
@@ -466,9 +467,7 @@ fn the_queue_table_fits_its_pane() {
 #[test]
 fn a_narrow_pane_drops_columns_instead_of_clipping_them() {
     let (mut app, _rx) = with_bullmq(&[]);
-    app.apply(Update::Queues(PaneState::Ready(vec![queue(
-        "emails", false, 7,
-    )])));
+    apply_queues(&mut app, vec![queue("emails", false, 7)]);
 
     let narrow = render(&mut app, 80, 20);
     let wide = render(&mut app, 200, 20);
@@ -489,13 +488,10 @@ fn a_narrow_pane_drops_columns_instead_of_clipping_them() {
 #[test]
 fn job_detail_renders_a_stack_trace_per_attempt() {
     let (mut app, _rx) = with_bullmq(&[]);
-    app.apply(Update::Queues(PaneState::Ready(vec![queue(
-        "image-processing",
-        false,
-        1,
-    )])));
+    apply_queues(&mut app, vec![queue("image-processing", false, 1)]);
+    let id = app.expect_jobs();
     app.apply(Update::Jobs {
-        state: State::Failed,
+        id,
         data: PaneState::Ready(vec![JobRef {
             id: "7012".into(),
             score: Some(1.0),
@@ -519,10 +515,11 @@ fn job_detail_renders_a_stack_trace_per_attempt() {
             ("finishedOn", "2200"),
         ]),
     );
-    app.apply(Update::Job(PaneState::Ready(Some(Box::new(JobDetail {
-        job,
-        logs: vec![],
-    })))));
+    let id = app.expect_job();
+    app.apply(Update::Job {
+        id,
+        data: PaneState::Ready(Some(Box::new(JobDetail { job, logs: vec![] }))),
+    });
     app.level = keylens::app::QueueLevel::Job;
 
     let out = render(&mut app, 120, 40);
@@ -551,7 +548,11 @@ fn job_detail_renders_a_stack_trace_per_attempt() {
 #[test]
 fn a_job_removed_by_retention_explains_itself() {
     let (mut app, _rx) = with_bullmq(&[]);
-    app.apply(Update::Job(PaneState::Ready(None)));
+    let id = app.expect_job();
+    app.apply(Update::Job {
+        id,
+        data: PaneState::Ready(None),
+    });
     app.level = keylens::app::QueueLevel::Job;
 
     let out = render(&mut app, 120, 24);
@@ -605,8 +606,9 @@ fn stream_with_groups() -> Box<keylens_conn::StreamInfo> {
 }
 
 fn render_stream(app: &mut App, stream: Box<keylens_conn::StreamInfo>, width: u16) -> String {
-    app.set_pending_key(Some("keylens:audit".into()));
+    let id = app.expect_detail("keylens:audit");
     app.apply(Update::Detail {
+        id,
         meta: meta("keylens:audit", Kind::Stream),
         value: Box::new(KeyValue::Stream(vec![StreamEntry {
             id: "1785517610835-0".into(),
@@ -736,6 +738,7 @@ fn splash_shows_the_wordmark_until_the_first_batch_lands() {
 
     // The first batch is the signal there's something worth showing.
     app.apply(Update::Batch {
+        scan: RequestId::default(),
         keys: vec![("k".into(), None)],
         reset: true,
         complete: true,
@@ -768,15 +771,20 @@ fn a_failed_key_does_not_hide_the_next_key_that_loads() {
     // the next full rescan: one bad key made the pane look permanently broken.
     let (mut app, _rx) = app_with(&["k1", "k2"]);
 
-    app.set_pending_key(Some("k1".into()));
-    app.apply(Update::Error("command `TYPE` failed: boom".into()));
+    let id = app.expect_detail("k1");
+    app.apply(Update::DetailFailed {
+        id,
+        key: "k1".into(),
+        error: "command `TYPE` failed: boom".into(),
+    });
     assert!(
         render(&mut app, 100, 24).contains("boom"),
         "error should show"
     );
 
-    app.set_pending_key(Some("k2".into()));
+    let id = app.expect_detail("k2");
     app.apply(Update::Detail {
+        id,
         meta: meta("k2", Kind::String),
         value: Box::new(KeyValue::String("fresh-value".into())),
         stream: None,
@@ -798,7 +806,10 @@ async fn moving_the_cursor_clears_the_previous_key_s_error() {
     // Not just on arrival of the next value -- while it loads, too. Otherwise the old
     // error sits under the new selection and reads as though *that* key failed.
     let (mut app, _rx) = app_with(&["k1", "k2"]);
-    app.apply(Update::Error("boom".into()));
+    app.apply(Update::ScanFailed {
+        scan: app.scan_generation(),
+        error: "boom".into(),
+    });
 
     app.handle_key(KeyEvent::from(KeyCode::Char('j'))).await;
 
@@ -816,8 +827,9 @@ async fn moving_the_cursor_clears_the_previous_key_s_error() {
 #[test]
 fn an_unsupported_bounded_read_explains_the_missing_capability() {
     let (mut app, _rx) = app_with(&["big"]);
-    app.set_pending_key(Some("big".into()));
+    let id = app.expect_detail("big");
     app.apply(Update::Detail {
+        id,
         meta: meta("big", Kind::String),
         value: Box::new(KeyValue::Unsupported(
             "this server has no bounded string read (GETRANGE)".into(),
@@ -850,9 +862,7 @@ fn a_server_without_streams_says_so_instead_of_attaching_forever() {
     // `attached: bool` collapsed "connected and quiet" into "not connected yet", so a
     // server that can never deliver an event sat on "attaching…" for the whole session.
     let (mut app, _rx) = with_bullmq(&[]);
-    app.apply(Update::Queues(PaneState::Ready(vec![queue(
-        "emails", false, 0,
-    )])));
+    apply_queues(&mut app, vec![queue("emails", false, 0)]);
     app.apply(Update::EventsStatus(EventsStatus::Unavailable(
         "NOPERM cannot run 'xread'".into(),
     )));
@@ -880,7 +890,7 @@ fn drained(rx: &mut Receiver<Request>) -> Vec<Request> {
 fn selects(reqs: &[Request]) -> Vec<String> {
     reqs.iter()
         .filter_map(|r| match r {
-            Request::Select { key } => Some(key.clone()),
+            Request::Select { key, .. } => Some(key.clone()),
             _ => None,
         })
         .collect()
@@ -955,6 +965,7 @@ async fn a_saturated_worker_never_blocks_the_ui() {
         tx,
     );
     app.apply(Update::Batch {
+        scan: RequestId::default(),
         keys: vec![("k1".into(), None), ("k2".into(), None)],
         reset: true,
         complete: true,
@@ -992,6 +1003,7 @@ async fn a_dropped_fetch_does_not_leave_the_pane_claiming_to_load_forever() {
         tx,
     );
     app.apply(Update::Batch {
+        scan: RequestId::default(),
         keys: vec![("k1".into(), None), ("k2".into(), None)],
         reset: true,
         complete: true,
@@ -1015,4 +1027,35 @@ async fn a_dropped_fetch_does_not_leave_the_pane_claiming_to_load_forever() {
     let _ = drained(&mut rx);
     app.flush_selection().await;
     assert_eq!(selects(&drained(&mut rx)), vec!["k2"]);
+}
+
+#[test]
+fn a_failed_stats_refresh_shows_on_the_stats_pane_and_nowhere_else() {
+    // Every refresh failure used to be an unattributed `Error`, which the value pane
+    // renders in place of the value: a slow `INFO` blanked whatever key was selected.
+    let (mut app, _rx) = app_with(&["k"]);
+    let id = app.expect_detail("k");
+    app.apply(Update::Detail {
+        id,
+        meta: meta("k", Kind::String),
+        value: Box::new(KeyValue::String("still-here".into())),
+        stream: None,
+    });
+    app.apply(Update::InfoFailed {
+        id: RequestId::new(500),
+        error: "command `INFO` failed: timed out".into(),
+    });
+
+    let keys = render(&mut app, 100, 24);
+    assert!(keys.contains("still-here"), "{keys}");
+    assert!(!keys.contains("timed out"), "{keys}");
+
+    app.view = View::Stats;
+    let stats = render(&mut app, 100, 30);
+    assert!(stats.contains("refresh failed"), "{stats}");
+    assert!(stats.contains("timed out"), "{stats}");
+    assert!(
+        stats.contains("8.1.0"),
+        "last good reading still shown:\n{stats}"
+    );
 }

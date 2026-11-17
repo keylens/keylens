@@ -32,42 +32,92 @@ const PUBSUB_CHANNELS: usize = 200;
 const JOB_PAGE: usize = 200;
 const JOB_LOG_LINES: usize = 200;
 
+/// Names one request, so its reply can be matched against what the UI still wants.
+///
+/// Replies arrive out of order and after the user has moved on: a key read is cancelled
+/// but may already have sent, a job opened a moment ago answers after the next one was
+/// opened, and a refresh started before a reconnect answers after it. Matching a reply by
+/// its *content* — the key name, the job state — cannot tell those apart, because the
+/// stale reply and the wanted one can name the same thing. An id issued per request can.
+///
+/// Ids are issued by [`crate::app::App`] and are strictly increasing within one session.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Default)]
+pub struct RequestId(u64);
+
+impl RequestId {
+    /// Wrap a raw id. Public so tests and embedders can stage a reply.
+    pub const fn new(raw: u64) -> Self {
+        Self(raw)
+    }
+
+    /// The id after this one. Saturates rather than wrapping: `u64::MAX` requests is
+    /// unreachable, and a wrapped id would match a reply from the very first request.
+    #[must_use]
+    pub const fn next(self) -> Self {
+        Self(self.0.saturating_add(1))
+    }
+}
+
 #[derive(Debug)]
 pub enum Request {
-    /// Start over with a new filter.
+    /// Start over with a new filter. `scan` names the new scan generation; every batch
+    /// produced by it, including the ones `More` asks for, carries it back.
     Rescan {
+        scan: RequestId,
         pattern: Option<String>,
         kind: Option<Kind>,
     },
-    /// Continue the current scan.
-    More,
+    /// Continue the scan generation `scan`.
+    More {
+        scan: RequestId,
+    },
     /// Load metadata and the first value page for one key.
     Select {
+        id: RequestId,
         key: String,
     },
-    RefreshInfo,
+    RefreshInfo {
+        id: RequestId,
+    },
 
-    LoadSlowlog,
-    LoadClients,
-    LoadCluster,
-    LoadPubSub,
+    LoadSlowlog {
+        id: RequestId,
+    },
+    LoadClients {
+        id: RequestId,
+    },
+    LoadCluster {
+        id: RequestId,
+    },
+    LoadPubSub {
+        id: RequestId,
+    },
 
     /// Run every lens detector. Cheap, and it decides whether the queues tab exists.
     Detect,
-    LoadQueues,
+    LoadQueues {
+        id: RequestId,
+    },
     LoadJobs {
+        id: RequestId,
         queue: String,
         state: State,
     },
     LoadJob {
+        id: RequestId,
         queue: String,
-        id: String,
+        job: String,
     },
 }
 
+/// A worker reply. Every variant that answers a request carries that request's id, and
+/// that includes the failures: an error is a reply like any other and is just as capable
+/// of being stale.
 #[derive(Debug)]
 pub enum Update {
     Batch {
+        /// The scan generation this batch belongs to (the id of its `Rescan`).
+        scan: RequestId,
         keys: Vec<(String, Option<Kind>)>,
         /// True when this batch starts a new scan, so the UI clears first.
         reset: bool,
@@ -75,33 +125,71 @@ pub enum Update {
         complete: bool,
         scanned_pages: usize,
     },
+    /// The scan generation `scan` failed.
+    ScanFailed {
+        scan: RequestId,
+        error: String,
+    },
     Detail {
+        id: RequestId,
         meta: Box<KeyMeta>,
         value: Box<KeyValue>,
         /// Groups, consumers and pending state — only for stream keys.
         stream: Option<Box<StreamInfo>>,
     },
-    Info(Box<ServerInfo>),
-    Error(String),
+    /// Reading the key requested by `id` failed.
+    DetailFailed {
+        id: RequestId,
+        key: String,
+        error: String,
+    },
+    Info {
+        id: RequestId,
+        info: Box<ServerInfo>,
+    },
+    /// The stats refresh `id` failed. Reported against the stats pane, never the value
+    /// pane: a failed `INFO` says nothing about the key someone is looking at.
+    InfoFailed {
+        id: RequestId,
+        error: String,
+    },
 
-    Slowlog(PaneState<Vec<SlowEntry>>),
-    Clients(PaneState<Vec<ClientInfo>>),
-    Cluster(PaneState<Box<ClusterTopology>>),
-    PubSub(PaneState<Vec<PubSubChannel>>),
+    Slowlog {
+        id: RequestId,
+        data: PaneState<Vec<SlowEntry>>,
+    },
+    Clients {
+        id: RequestId,
+        data: PaneState<Vec<ClientInfo>>,
+    },
+    Cluster {
+        id: RequestId,
+        data: PaneState<Box<ClusterTopology>>,
+    },
+    PubSub {
+        id: RequestId,
+        data: PaneState<Vec<PubSubChannel>>,
+    },
 
     Detected(Vec<Detection>),
     /// How the live events reader is getting on -- attaching, live, or never going to
     /// work here. The graph reads very differently depending on which.
     EventsStatus(EventsStatus),
     Events(Vec<crate::events::StreamEvent>),
-    Queues(PaneState<Vec<QueueSummary>>),
+    Queues {
+        id: RequestId,
+        data: PaneState<Vec<QueueSummary>>,
+    },
     Jobs {
-        state: State,
+        id: RequestId,
         data: PaneState<Vec<JobRef>>,
     },
     /// `None` inside `Ready` means the job was removed between listing and reading, which
     /// happens constantly on a live queue with retention configured.
-    Job(PaneState<Option<Box<JobDetail>>>),
+    Job {
+        id: RequestId,
+        data: PaneState<Option<Box<JobDetail>>>,
+    },
 }
 
 /// A job plus its logs, which are a separate key.
@@ -114,6 +202,8 @@ pub struct JobDetail {
 pub struct Worker {
     conn: Arc<Conn>,
     scanner: Option<tokio::sync::Mutex<KeyScanner>>,
+    /// Generation of `scanner`: the id of the `Rescan` that created it.
+    scan: RequestId,
     pattern: Option<String>,
     kind: Option<Kind>,
     complete: bool,
@@ -152,6 +242,7 @@ impl Worker {
         Self {
             conn: Arc::new(conn),
             scanner: None,
+            scan: RequestId::default(),
             pattern: None,
             kind: None,
             complete: false,
@@ -167,7 +258,12 @@ impl Worker {
     pub async fn run(mut self, mut rx: Receiver<Request>, tx: Sender<Update>) {
         while let Some(req) = rx.recv().await {
             let update = match req {
-                Request::Rescan { pattern, kind } => {
+                Request::Rescan {
+                    scan,
+                    pattern,
+                    kind,
+                } => {
+                    self.scan = scan;
                     self.pattern = pattern;
                     self.kind = kind;
                     self.complete = false;
@@ -181,7 +277,19 @@ impl Worker {
                 // A request always gets a reply, including this one. The UI sets `loading`
                 // when it asks for more; answering an already-finished scan with silence
                 // would leave the status bar spinning with nothing on the way.
-                Request::More => self.scan_batch(false).await,
+                //
+                // A `More` for a generation this worker has already replaced cannot
+                // continue the scan it meant. Answering it from the current scanner would
+                // splice the new filter's keys into a tree the UI is about to discard, so
+                // it gets an empty batch under its own generation, which the UI drops.
+                Request::More { scan } if scan != self.scan => Update::Batch {
+                    scan,
+                    keys: Vec::new(),
+                    reset: false,
+                    complete: false,
+                    scanned_pages: 0,
+                },
+                Request::More { .. } => self.scan_batch(false).await,
 
                 // Reading a key runs on its own task, sharing the connection -- fred
                 // multiplexes, so this costs no second handshake.
@@ -190,43 +298,49 @@ impl Worker {
                 // `Detect`, each of which walks up to 40 sequential `SCAN` pages. Against
                 // a server measured at 390ms that queue was sixteen seconds long, and
                 // every keypress made during it looked like a hang.
-                Request::Select { key } => {
-                    self.spawn_detail(key, &tx);
+                Request::Select { id, key } => {
+                    self.spawn_detail(id, key, &tx);
                     continue;
                 }
 
-                Request::RefreshInfo => {
+                Request::RefreshInfo { id } => {
                     // Servers that don't implement `INFO` would otherwise fail this on
                     // every tick and paint the error over whatever pane is open.
                     if !self.conn.has_server_info() {
                         continue;
                     }
-                    self.spawn_info(&tx);
+                    self.spawn_info(id, &tx);
                     continue;
                 }
 
-                Request::LoadSlowlog => Update::Slowlog(
-                    Self::pane(
+                Request::LoadSlowlog { id } => Update::Slowlog {
+                    id,
+                    data: Self::pane(
                         self.conn.capabilities().get(Feature::Slowlog),
                         self.conn.slowlog(SLOWLOG_ENTRIES),
                     )
                     .await,
-                ),
-                Request::LoadClients => Update::Clients(
-                    Self::pane(
+                },
+                Request::LoadClients { id } => Update::Clients {
+                    id,
+                    data: Self::pane(
                         self.conn.capabilities().get(Feature::ClientList),
                         self.conn.client_list(),
                     )
                     .await,
-                ),
-                Request::LoadCluster => Update::Cluster(Self::cluster(self.conn.clone()).await),
-                Request::LoadPubSub => Update::PubSub(
-                    Self::pane(
+                },
+                Request::LoadCluster { id } => Update::Cluster {
+                    id,
+                    data: Self::cluster(self.conn.clone()).await,
+                },
+                Request::LoadPubSub { id } => Update::PubSub {
+                    id,
+                    data: Self::pane(
                         self.conn.capabilities().get(Feature::PubSub),
                         self.conn.pubsub_channels(PUBSUB_CHANNELS),
                     )
                     .await,
-                ),
+                },
 
                 Request::Detect => {
                     let detections = match self.bullmq.detect(&self.conn).await {
@@ -244,15 +358,16 @@ impl Worker {
                     Update::Detected(detections)
                 }
 
-                Request::LoadQueues => {
-                    Update::Queues(match self.bullmq.all_queues(&self.conn).await {
+                Request::LoadQueues { id } => Update::Queues {
+                    id,
+                    data: match self.bullmq.all_queues(&self.conn).await {
                         Ok(q) => PaneState::Ready(q),
                         Err(e) => PaneState::Failed(e.to_string()),
-                    })
-                }
+                    },
+                },
 
-                Request::LoadJobs { queue, state } => Update::Jobs {
-                    state,
+                Request::LoadJobs { id, queue, state } => Update::Jobs {
+                    id,
                     data: match self
                         .bullmq
                         .jobs(&self.conn, &queue, state, 0, JOB_PAGE)
@@ -263,7 +378,10 @@ impl Worker {
                     },
                 },
 
-                Request::LoadJob { queue, id } => Update::Job(self.job(&queue, &id).await),
+                Request::LoadJob { id, queue, job } => Update::Job {
+                    id,
+                    data: self.job(&queue, &job).await,
+                },
             };
 
             // A closed channel means the UI is gone; stop rather than spin.
@@ -294,7 +412,12 @@ impl Worker {
                     self.complete = true;
                     break;
                 }
-                Err(e) => return Update::Error(e.to_string()),
+                Err(e) => {
+                    return Update::ScanFailed {
+                        scan: self.scan,
+                        error: e.to_string(),
+                    };
+                }
             };
 
             pages += 1;
@@ -303,6 +426,7 @@ impl Worker {
 
         let typed = self.type_keys(keys).await;
         Update::Batch {
+            scan: self.scan,
             keys: typed,
             reset,
             complete: self.complete,
@@ -438,7 +562,10 @@ impl Worker {
     /// Cancelling is not just tidiness. The UI already discards a reply whose key is no
     /// longer selected, so a superseded read was pure waste -- and on the link this exists
     /// for, waste is measured in whole seconds of the only round trips available.
-    fn spawn_detail(&mut self, key: String, tx: &Sender<Update>) {
+    ///
+    /// Aborting is best effort: the task may already have sent its reply, which is why the
+    /// reply carries `id` and the UI, not this function, decides whether it is current.
+    fn spawn_detail(&mut self, id: RequestId, key: String, tx: &Sender<Update>) {
         if let Some(task) = self.detail_task.take() {
             task.abort();
         }
@@ -446,7 +573,7 @@ impl Worker {
         let conn = self.conn.clone();
         let tx = tx.clone();
         self.detail_task = Some(tokio::spawn(async move {
-            let update = detail(&conn, &key).await;
+            let update = detail(&conn, id, &key).await;
             tx.send(update).await.ok();
         }));
     }
@@ -456,7 +583,7 @@ impl Worker {
     /// Skipping rather than queueing matters once `INFO` takes longer than the tick: the
     /// requests would otherwise stack up, each one spending a round trip the key browser
     /// wanted.
-    fn spawn_info(&mut self, tx: &Sender<Update>) {
+    fn spawn_info(&mut self, id: RequestId, tx: &Sender<Update>) {
         if self.info_task.as_ref().is_some_and(|t| !t.is_finished()) {
             return;
         }
@@ -465,8 +592,14 @@ impl Worker {
         let tx = tx.clone();
         self.info_task = Some(tokio::spawn(async move {
             let update = match conn.refresh_info().await {
-                Ok(info) => Update::Info(Box::new(info)),
-                Err(e) => Update::Error(e.to_string()),
+                Ok(info) => Update::Info {
+                    id,
+                    info: Box::new(info),
+                },
+                Err(e) => Update::InfoFailed {
+                    id,
+                    error: e.to_string(),
+                },
             };
             tx.send(update).await.ok();
         }));
@@ -479,10 +612,16 @@ impl Worker {
 /// [`Conn::read_key`] for how, and why it is worth speculating over six types to get it.
 /// Sequentially this was five round trips per keypress, over a second each against a
 /// managed host on another continent, which is what made scrolling the tree feel broken.
-async fn detail(conn: &Conn, key: &str) -> Update {
+async fn detail(conn: &Conn, id: RequestId, key: &str) -> Update {
     let (meta, value) = match conn.read_key(key).await {
         Ok(pair) => pair,
-        Err(e) => return Update::Error(e.to_string()),
+        Err(e) => {
+            return Update::DetailFailed {
+                id,
+                key: key.to_string(),
+                error: e.to_string(),
+            };
+        }
     };
 
     // Consumer-group state is the reason to open a stream at all, but it's several extra
@@ -495,6 +634,7 @@ async fn detail(conn: &Conn, key: &str) -> Update {
     };
 
     Update::Detail {
+        id,
         meta: Box::new(meta),
         value: Box::new(value),
         stream,
