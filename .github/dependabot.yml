@@ -1,0 +1,17 @@
+# Keeps the SHA-pinned actions current (a pin nobody updates is a pin to an old bug)
+# and surfaces semver-compatible Cargo updates. Advisories are gated separately by the
+# scheduled `cargo deny` job.
+version: 2
+updates:
+  - package-ecosystem: github-actions
+    directory: /
+    schedule:
+      interval: weekly
+    groups:
+      actions:
+        patterns: ["*"]
+  - package-ecosystem: cargo
+    directory: /
+    schedule:
+      interval: weekly
+    open-pull-requests-limit: 5
