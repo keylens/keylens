@@ -604,6 +604,7 @@ fn stream_with_groups() -> Box<keylens_conn::StreamInfo> {
                     inactive_ms: Some(441_000),
                 },
             ],
+            consumers_total: 2,
         }],
         ..Default::default()
     })
@@ -1151,4 +1152,24 @@ fn unknown_queue_counts_and_state_render_as_unknown_not_zero() {
     );
     assert!(row.matches('?').count() >= 2, "{row}");
     assert!(out.contains("more queues may exist"), "{out}");
+}
+
+#[test]
+fn a_capped_pane_says_how_many_rows_it_did_not_keep() {
+    // PUBSUB CHANNELS has no COUNT. 0.1.7 kept the first 200 silently.
+    let (mut app, _rx) = app_with(&[]);
+    app.view = View::PubSub;
+    app.pubsub = PaneState::Ready(keylens_conn::Capped {
+        items: vec![keylens_conn::PubSubChannel {
+            name: "orders".into(),
+            subscribers: 3,
+        }],
+        total: 48_213,
+    });
+    let out = render(&mut app, 120, 24);
+    assert!(out.contains("showing 1 of 48,213 channels"), "{out}");
+    assert!(
+        out.contains("no count"),
+        "says why the wire was not bounded:\n{out}"
+    );
 }

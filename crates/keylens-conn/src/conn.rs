@@ -16,6 +16,7 @@ use futures::{Stream, StreamExt, future::join_all};
 use std::pin::Pin;
 use tracing::debug;
 
+use crate::bounds::{check_command, check_scan_count, check_xread};
 use crate::capability::{Availability, Capabilities, Feature, classify};
 use crate::error::{ConnError, Result, classify_connect, connect_timeout};
 use crate::server_info::ServerInfo;
@@ -303,12 +304,19 @@ impl Conn {
 
     /// Start a throttled scan. Cluster connections scan every primary; standalone and
     /// sentinel connections scan their selected server.
+    ///
+    /// # Errors
+    ///
+    /// [`ConnError::Unbounded`] when `count` is zero or above
+    /// [`MAX_SCAN_COUNT`](crate::bounds::MAX_SCAN_COUNT). It is a hint to the server, not a
+    /// bound on the reply -- see [`crate::bounds`].
     pub fn key_scanner(
         &self,
         pattern: Option<&str>,
         count: u32,
         type_filter: Option<&str>,
-    ) -> KeyScanner {
+    ) -> Result<KeyScanner> {
+        check_scan_count(count)?;
         let pattern = pattern.unwrap_or("*").to_string();
         let scan_type = type_filter.and_then(parse_scan_type);
         let pages: Pin<
@@ -326,7 +334,7 @@ impl Conn {
                     .map(|page| page.map(page_keys)),
             )
         };
-        KeyScanner::new(pages)
+        Ok(KeyScanner::new(pages))
     }
 
     /// Re-read `INFO`. Cheap enough for the stats pane's refresh tick.
@@ -351,6 +359,7 @@ impl Conn {
                 detail: "a single cursor cannot scan Redis Cluster; use Conn::key_scanner".into(),
             });
         }
+        check_scan_count(count)?;
         let mut args: Vec<Value> = vec![cursor.into()];
         if let Some(p) = pattern {
             args.push("MATCH".into());
@@ -383,10 +392,14 @@ impl Conn {
 
     /// Run a command through the read-only allowlist used by built-in and third-party
     /// lenses. Capability checks remain the caller's job.
+    ///
+    /// # Errors
+    ///
+    /// [`ConnError::UnsafeCommand`] for a command that is not read-only, and
+    /// [`ConnError::Unbounded`] for one whose arguments ask for an unbounded read. See
+    /// [`crate::bounds`] for exactly what is and is not bounded on the wire.
     pub async fn cmd(&self, name: &'static str, args: Vec<Value>) -> Result<Value> {
-        if !read_only_command(name, &args) {
-            return Err(ConnError::UnsafeCommand(name));
-        }
+        check_command(name, &args)?;
         self.execute(name, args).await
     }
 
@@ -408,6 +421,12 @@ impl Conn {
     }
 
     /// Blocking stream read with the client library's correct routing and connection flags.
+    ///
+    /// # Errors
+    ///
+    /// [`ConnError::Unbounded`] for a zero or oversized `count`, `BLOCK 0` (wait forever),
+    /// a block longer than [`MAX_BLOCK_MS`](crate::bounds::MAX_BLOCK_MS), or `keys` and
+    /// `ids` of different lengths.
     pub async fn xread(
         &self,
         keys: &[String],
@@ -415,6 +434,7 @@ impl Conn {
         count: u64,
         block_ms: u64,
     ) -> Result<Value> {
+        check_xread(keys.len(), ids.len(), count, block_ms)?;
         self.client
             .xread(Some(count), Some(block_ms), keys.to_vec(), ids.to_vec())
             .await
@@ -445,11 +465,10 @@ impl Conn {
         &self,
         cmds: &[(&'static str, Vec<Value>)],
     ) -> Result<Vec<Result<Value>>> {
-        if let Some((name, _)) = cmds
-            .iter()
-            .find(|(name, args)| !read_only_command(name, args))
-        {
-            return Err(ConnError::UnsafeCommand(name));
+        // All or nothing: one bad command refuses the batch before anything is sent, so a
+        // caller never gets a partly-executed pipeline it has to reason about.
+        for (name, args) in cmds {
+            check_command(name, args)?;
         }
         self.pipeline_unchecked(cmds).await
     }
@@ -515,61 +534,6 @@ impl Conn {
             .zip(cmds.iter())
             .map(|(reply, (cmd, _))| reply.map_err(|source| ConnError::Command { cmd, source }))
             .collect())
-    }
-}
-
-/// `CONFIG GET` parameters a lens may ask for.
-///
-/// An allowlist rather than "any `GET`", because `CONFIG GET` is read-only in the sense
-/// that matters to the *server* and not in the sense that matters here: `CONFIG GET
-/// requirepass` reads the server's password, and `CONFIG GET *` reads it along with
-/// everything else. Exact names only, so a glob matches nothing.
-///
-/// Only `maxmemory` is used today — by the capability probe. The rest are here because
-/// they are the obvious next asks for a stats pane and none of them is a credential.
-const CONFIG_PARAMS: &[&str] = &[
-    "maxmemory",
-    "maxmemory-policy",
-    "appendonly",
-    "save",
-    "databases",
-    "timeout",
-];
-
-/// The public connection surface is intentionally an allowlist.
-///
-/// **This is a discipline boundary, not a sandbox.** v0.1 lenses are compiled into the
-/// binary, so a lens that wanted to issue `FLUSHALL` could reach past this and call the
-/// client directly — nothing here prevents that, and nothing could. What it does prevent
-/// is the accident: a lens author reaching for `HGETALL` because paging is tedious, or
-/// widening `CONFIG GET` to a glob, and no reviewer noticing that the read-only promise
-/// on the tin quietly stopped being true.
-fn read_only_command(name: &str, args: &[Value]) -> bool {
-    let subcommand = || {
-        args.first()
-            .and_then(Value::as_string)
-            .unwrap_or_default()
-            .to_ascii_uppercase()
-    };
-    let arg_at = |i: usize| args.get(i).and_then(Value::as_string).unwrap_or_default();
-
-    match name {
-        "CLIENT" => matches!(subcommand().as_str(), "INFO" | "LIST"),
-        "CLUSTER" => matches!(subcommand().as_str(), "INFO" | "NODES" | "SHARDS" | "SLOTS"),
-        "CONFIG" => {
-            subcommand() == "GET"
-                && args.len() == 2
-                && CONFIG_PARAMS.contains(&arg_at(1).to_ascii_lowercase().as_str())
-        }
-        "MEMORY" => subcommand() == "USAGE",
-        "MODULE" => subcommand() == "LIST",
-        "PUBSUB" => matches!(subcommand().as_str(), "CHANNELS" | "NUMPAT" | "NUMSUB"),
-        "SLOWLOG" => matches!(subcommand().as_str(), "GET" | "LEN"),
-        "XINFO" => matches!(subcommand().as_str(), "STREAM" | "GROUPS" | "CONSUMERS"),
-        "GETRANGE" | "HGET" | "HMGET" | "HSCAN" | "HLEN" | "LLEN" | "LRANGE" | "PTTL" | "SCAN"
-        | "SCARD" | "SSCAN" | "STRLEN" | "TYPE" | "XLEN" | "XPENDING" | "XRANGE" | "ZCARD"
-        | "ZRANGE" | "ZREVRANGE" => true,
-        _ => false,
     }
 }
 
@@ -958,42 +922,5 @@ mod tests {
     #[test]
     fn rejects_malformed_scan_reply() {
         assert!(parse_scan_reply(Value::from("nope")).is_err());
-    }
-
-    #[test]
-    fn public_command_surface_rejects_writes_and_unsafe_subcommands() {
-        assert!(read_only_command("TYPE", &[Value::from("k")]));
-        assert!(read_only_command(
-            "CONFIG",
-            &[Value::from("GET"), Value::from("maxmemory")]
-        ));
-        // `CONFIG GET` is read-only to the server and not to us: a glob returns
-        // `requirepass` and `masterauth` along with everything else.
-        assert!(
-            !read_only_command("CONFIG", &[Value::from("GET"), Value::from("*")]),
-            "a glob must not be a way to read every config value"
-        );
-        for secret in ["requirepass", "masterauth", "masteruser", "REQUIREPASS"] {
-            assert!(
-                !read_only_command("CONFIG", &[Value::from("GET"), Value::from(secret)]),
-                "{secret} is a credential, not a statistic"
-            );
-        }
-        assert!(!read_only_command(
-            "CONFIG",
-            &[
-                Value::from("SET"),
-                Value::from("maxmemory"),
-                Value::from("1")
-            ]
-        ));
-        assert!(!read_only_command(
-            "CLIENT",
-            &[Value::from("KILL"), Value::from("ID"), Value::from("1")]
-        ));
-        assert!(!read_only_command(
-            "SET",
-            &[Value::from("k"), Value::from("v")]
-        ));
     }
 }

@@ -79,7 +79,7 @@ async fn await_failed_jobs(conn: &Conn) -> (String, Vec<(String, f64)>) {
 /// Walk the keyspace the way the browser does, with a bound.
 async fn scan_all(conn: &Conn, pattern: Option<&str>, kind: Option<&str>) -> Vec<String> {
     let mut keys = Vec::new();
-    let mut scanner = conn.key_scanner(pattern, 500, kind);
+    let mut scanner = conn.key_scanner(pattern, 500, kind).unwrap();
     for _ in 0..200 {
         let Some(page) = scanner.next_page().await.unwrap() else {
             break;
@@ -1484,4 +1484,113 @@ async fn a_read_denied_by_acl_is_an_error_not_a_missing_key() {
             "a denied read claimed the key no longer exists: {read:?}"
         ),
     }
+}
+
+#[tokio::test]
+#[ignore = "requires docker compose fixtures"]
+async fn unbounded_reads_are_refused_before_reaching_the_server() {
+    // Measured with the server's own counter: a refused command must cost nothing.
+    let conn = conn().await;
+    let calls = |info: &str, cmd: &str| -> u64 {
+        info.lines()
+            .find(|l| l.starts_with(&format!("cmdstat_{cmd}:")))
+            .and_then(|l| l.split("calls=").nth(1))
+            .and_then(|r| r.split(',').next())
+            .and_then(|n| n.parse().ok())
+            .unwrap_or(0)
+    };
+    let stats = || async {
+        keylens_conn::value::display_string(
+            &conn
+                .test_cmd("INFO", vec!["commandstats".into()])
+                .await
+                .unwrap(),
+        )
+    };
+    let before = stats().await;
+
+    for (cmd, args) in [
+        ("LRANGE", vec!["k".into(), 0.into(), (-1).into()]),
+        ("XRANGE", vec!["k".into(), "-".into(), "+".into()]),
+        ("SLOWLOG", vec!["GET".into(), (-1).into()]),
+    ] {
+        let err = conn.cmd(cmd, args).await.expect_err("must be refused");
+        assert!(
+            matches!(err, keylens_conn::ConnError::Unbounded { .. }),
+            "{cmd}: {err}"
+        );
+    }
+    assert!(conn.key_scanner(None, 1_000_000, None).is_err());
+
+    let after = stats().await;
+    for cmd in ["lrange", "xrange", "slowlog|get", "slowlog"] {
+        assert_eq!(
+            calls(&before, cmd),
+            calls(&after, cmd),
+            "a refused {cmd} still reached the server"
+        );
+    }
+}
+
+#[tokio::test]
+#[ignore = "requires docker compose fixtures"]
+async fn stream_group_detail_is_one_round_trip_for_any_number_of_groups() {
+    // 0.1.7 issued XINFO CONSUMERS + XPENDING per group, one after another: up to 64
+    // sequential round trips to open one stream key.
+    let conn = conn().await;
+    let key = "keylens:groups:many";
+    conn.test_cmd("UNLINK", vec![key.into()]).await.ok();
+    conn.test_cmd("XADD", vec![key.into(), "*".into(), "f".into(), "v".into()])
+        .await
+        .unwrap();
+    for g in 0..20 {
+        conn.test_cmd(
+            "XGROUP",
+            vec![
+                "CREATE".into(),
+                key.into(),
+                format!("g{g}").into(),
+                "0".into(),
+            ],
+        )
+        .await
+        .unwrap();
+        conn.test_cmd(
+            "XREADGROUP",
+            vec![
+                "GROUP".into(),
+                format!("g{g}").into(),
+                "c".into(),
+                "COUNT".into(),
+                1.into(),
+                "STREAMS".into(),
+                key.into(),
+                ">".into(),
+            ],
+        )
+        .await
+        .unwrap();
+    }
+
+    let started = std::time::Instant::now();
+    let info = conn.stream_info(key).await.unwrap();
+    let elapsed = started.elapsed();
+    conn.test_cmd("UNLINK", vec![key.into()]).await.ok();
+
+    assert_eq!(info.groups.len(), 20);
+    for g in &info.groups {
+        assert_eq!(
+            g.consumers.len(),
+            1,
+            "{}: consumers lost in the pipeline",
+            g.name
+        );
+        assert_eq!(g.pending, Some(1));
+        assert!(
+            !g.pending_min_id.is_empty(),
+            "{}: XPENDING slot misaligned",
+            g.name
+        );
+    }
+    eprintln!("stream_info with 20 groups: {elapsed:?}");
 }

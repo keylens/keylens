@@ -7,6 +7,7 @@
 
 use fred::prelude::Value;
 
+use crate::bounds::MAX_LISTED;
 use crate::capability::Feature;
 use crate::conn::Conn;
 use crate::error::Result;
@@ -43,7 +44,11 @@ pub struct GroupInfo {
     /// `None` is a real answer, not a failure: Redis cannot compute lag after entries are
     /// trimmed or the id is set manually, and reporting 0 there would be a lie.
     pub lag: Option<i64>,
+    /// At most [`MAX_LISTED`] consumers. `XINFO CONSUMERS` has no count, so all of them
+    /// crossed the wire; [`consumers_total`](Self::consumers_total) says how many.
     pub consumers: Vec<ConsumerInfo>,
+    /// How many consumers `XINFO CONSUMERS` returned.
+    pub consumers_total: usize,
     pub pending_min_id: String,
     pub pending_max_id: String,
 }
@@ -109,48 +114,57 @@ impl Conn {
 
         info.groups_truncated = groups.len() > MAX_GROUPS;
 
-        for g in groups.iter().take(MAX_GROUPS) {
-            let gf = fields(g);
-            let name = text(&gf, "name");
-            if name.is_empty() {
-                continue;
-            }
+        let mut groups: Vec<GroupInfo> = groups
+            .iter()
+            .take(MAX_GROUPS)
+            .filter_map(|g| {
+                let gf = fields(g);
+                let name = text(&gf, "name");
+                (!name.is_empty()).then(|| GroupInfo {
+                    consumer_count: count(&gf, "consumers"),
+                    pending: count(&gf, "pending"),
+                    last_delivered_id: text(&gf, "last-delivered-id"),
+                    entries_read: num(&gf, "entries-read"),
+                    lag: num(&gf, "lag"),
+                    name,
+                    ..Default::default()
+                })
+            })
+            .collect();
 
-            let mut group = GroupInfo {
-                consumer_count: count(&gf, "consumers"),
-                pending: count(&gf, "pending"),
-                last_delivered_id: text(&gf, "last-delivered-id"),
-                entries_read: num(&gf, "entries-read"),
-                lag: num(&gf, "lag"),
-                name: name.clone(),
-                ..Default::default()
-            };
-
-            if let Ok(c) = self
-                .cmd(
-                    "XINFO",
-                    vec!["CONSUMERS".into(), key.into(), name.as_str().into()],
-                )
-                .await
-            {
-                group.consumers = parse_consumers(&c);
-            }
-
-            // XPENDING's summary form gives the id range still outstanding, which is what
-            // tells you *how far back* the stall goes.
-            if group.pending.is_some_and(|p| p > 0)
-                && let Ok(p) = self
-                    .cmd("XPENDING", vec![key.into(), name.as_str().into()])
-                    .await
-                && let Value::Array(summary) = p
-                && summary.len() >= 3
-            {
-                group.pending_min_id = display_string(&summary[1]);
-                group.pending_max_id = display_string(&summary[2]);
-            }
-
-            info.groups.push(group);
+        // Every group's consumers and pending summary in ONE round trip. 0.1.7 issued them
+        // one after another: up to 64 sequential round trips to open one stream key,
+        // which at 390ms is twenty-five seconds of `loading…`.
+        let mut cmds: Vec<(&'static str, Vec<Value>)> = Vec::with_capacity(groups.len() * 2);
+        for g in &groups {
+            cmds.push((
+                "XINFO",
+                vec!["CONSUMERS".into(), key.into(), g.name.as_str().into()],
+            ));
+            cmds.push(("XPENDING", vec![key.into(), g.name.as_str().into()]));
         }
+        if !cmds.is_empty() {
+            // A failure degrades the per-group detail, not the stream.
+            if let Ok(replies) = self.pipeline(&cmds).await {
+                for (g, pair) in groups.iter_mut().zip(replies.chunks(2)) {
+                    if let Some(Ok(c)) = pair.first() {
+                        let all = parse_consumers(c);
+                        g.consumers_total = all.len();
+                        g.consumers = all.into_iter().take(MAX_LISTED).collect();
+                    }
+                    // XPENDING's summary form gives the id range still outstanding, which
+                    // is what tells you *how far back* the stall goes.
+                    if g.pending.is_some_and(|p| p > 0)
+                        && let Some(Ok(Value::Array(summary))) = pair.get(1)
+                        && summary.len() >= 3
+                    {
+                        g.pending_min_id = display_string(&summary[1]);
+                        g.pending_max_id = display_string(&summary[2]);
+                    }
+                }
+            }
+        }
+        info.groups.append(&mut groups);
 
         Ok(info)
     }
