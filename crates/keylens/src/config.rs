@@ -6,6 +6,7 @@
 
 use std::path::{Path, PathBuf};
 
+use keylens_conn::redact_url;
 use serde::{Deserialize, Serialize};
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
@@ -21,7 +22,7 @@ pub struct Config {
 /// scanning `bull:*:meta`, which finds nothing, and "no queues here" is a perfectly
 /// normal answer — so the typo produces a working tool that is quietly looking in the
 /// wrong place. There is no symptom to notice.
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Clone, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct Connection {
     pub name: String,
@@ -40,13 +41,35 @@ pub struct Connection {
     pub prefix: Option<String>,
 }
 
+/// Debug output redacts the url. A derived `Debug` printed the password into any log
+/// line, panic message or `{:?}` that ever touched a connection.
+impl std::fmt::Debug for Connection {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("Connection")
+            .field("name", &self.name)
+            .field("url", &redact_url(&self.url))
+            .field("readonly", &self.readonly)
+            .field("prefix", &self.prefix)
+            .finish()
+    }
+}
+
 /// A connection resolved from flags, environment and config, with everything downstream
 /// needs to open it.
-#[derive(Debug, Clone, PartialEq)]
+#[derive(Clone, PartialEq)]
 pub struct Target {
     pub url: String,
     /// Lens prefix override, if the config named one.
     pub prefix: Option<String>,
+}
+
+impl std::fmt::Debug for Target {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("Target")
+            .field("url", &redact_url(&self.url))
+            .field("prefix", &self.prefix)
+            .finish()
+    }
 }
 
 impl Target {
@@ -92,6 +115,44 @@ impl Config {
     pub fn get(&self, name: &str) -> Option<&Connection> {
         self.connections.iter().find(|c| c.name == name)
     }
+
+    /// Whether any connection url carries a credential.
+    pub fn has_credentials(&self) -> bool {
+        self.connections.iter().any(|c| redact_url(&c.url) != c.url)
+    }
+}
+
+/// A warning when a config file holding credentials can be read by other local users.
+///
+/// The file is where people are told to put production urls, passwords included. Like
+/// `ssh`, keylens does not refuse -- the user may have reasons -- but it says so, once,
+/// before the TUI takes the terminal. `None` when the file holds no credentials, is
+/// private, or the platform has no unix permission bits.
+pub fn permission_warning(path: &Path, cfg: &Config) -> Option<String> {
+    if !cfg.has_credentials() {
+        return None;
+    }
+    let mode = file_mode(path)?;
+    (mode & 0o077 != 0).then(|| {
+        format!(
+            "warning: {} contains passwords and is readable by other users (mode {:o}). \
+             Run: chmod 600 '{}'",
+            path.display(),
+            mode & 0o777,
+            path.display()
+        )
+    })
+}
+
+#[cfg(unix)]
+fn file_mode(path: &Path) -> Option<u32> {
+    use std::os::unix::fs::PermissionsExt;
+    std::fs::metadata(path).ok().map(|m| m.permissions().mode())
+}
+
+#[cfg(not(unix))]
+fn file_mode(_path: &Path) -> Option<u32> {
+    None
 }
 
 #[cfg(test)]
@@ -147,6 +208,58 @@ mod tests {
         .unwrap();
         assert_eq!(cfg.get("local").unwrap().prefix, None);
         assert_eq!(Target::new("redis://x").prefix, None);
+    }
+
+    #[test]
+    fn debug_output_never_carries_a_password() {
+        let cfg: Config = toml::from_str(
+            r#"
+            [[connections]]
+            name = "prod"
+            url = "rediss://admin:hunter2@prod.example.com:6379"
+            "#,
+        )
+        .unwrap();
+        let c = cfg.get("prod").unwrap();
+        let target = Target::new(c.url.clone());
+        for rendered in [format!("{c:?}"), format!("{target:?}"), format!("{cfg:?}")] {
+            assert!(!rendered.contains("hunter2"), "{rendered}");
+            assert!(rendered.contains("prod.example.com"), "{rendered}");
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_readable_config_with_passwords_is_flagged_and_a_private_one_is_not() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = std::env::temp_dir().join(format!("keylens-perm-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("config.toml");
+        let secret = "[[connections]]\nname = \"p\"\nurl = \"redis://u:pw@h:6379\"\n";
+        std::fs::write(&path, secret).unwrap();
+        let cfg = Config::load(&path).unwrap();
+
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o644)).unwrap();
+        let warning = permission_warning(&path, &cfg).expect("0644 with a password");
+        assert!(warning.contains("chmod 600"), "{warning}");
+        assert!(
+            !warning.contains(":pw@"),
+            "the warning must not echo the secret"
+        );
+
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600)).unwrap();
+        assert_eq!(permission_warning(&path, &cfg), None);
+
+        // No credentials, no warning, whatever the mode.
+        std::fs::write(
+            &path,
+            "[[connections]]\nname = \"l\"\nurl = \"redis://h:6379\"\n",
+        )
+        .unwrap();
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o644)).unwrap();
+        let cfg = Config::load(&path).unwrap();
+        assert_eq!(permission_warning(&path, &cfg), None);
+        std::fs::remove_dir_all(&dir).ok();
     }
 
     #[test]

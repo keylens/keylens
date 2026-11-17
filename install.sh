@@ -6,6 +6,13 @@
 # Options (env vars):
 #   VERSION     — pin a specific release tag, e.g. VERSION=v0.1.0
 #   INSTALL_DIR — override install location (default: /usr/local/bin)
+#
+# The archive is verified against the release's checksums.txt before anything is
+# extracted or installed, and the install fails closed: a mismatch, a missing entry or
+# no SHA-256 tool all stop here. That protects against a corrupted or swapped download;
+# it does not protect against a compromised release, since both files come from it. For
+# provenance, verify the build attestation instead (see the README):
+#   gh attestation verify keylens-<target>.tar.gz --repo keylens/keylens
 
 set -euo pipefail
 
@@ -49,6 +56,9 @@ if [ "$VERSION" = "latest" ]; then
 else
   BASE_URL="https://github.com/$REPO/releases/download/$VERSION"
 fi
+# For the installer's own CI test, which serves a fake release locally. Never set this
+# to a host you do not control: it is where the binary *and* its checksum come from.
+BASE_URL="${KEYLENS_INSTALL_BASE_URL:-$BASE_URL}"
 
 ARCHIVE="${BIN}-${TARGET}.tar.gz"
 URL="${BASE_URL}/${ARCHIVE}"
@@ -64,6 +74,39 @@ if ! curl -fsSL "$URL" -o "$TMP/$ARCHIVE"; then
   echo "       check that a release exists at https://github.com/$REPO/releases" >&2
   exit 1
 fi
+
+# ── Verify ───────────────────────────────────────────────────────────────────
+
+if ! curl -fsSL "$BASE_URL/checksums.txt" -o "$TMP/checksums.txt"; then
+  echo "error: could not download checksums.txt from $BASE_URL" >&2
+  echo "       refusing to install an unverified binary" >&2
+  exit 1
+fi
+
+# Exact filename match on the second field, so `keylens-x.tar.gz.sig` or a crafted
+# line cannot satisfy the lookup for `keylens-x.tar.gz`.
+EXPECTED=$(awk -v f="$ARCHIVE" '$2 == f || $2 == "*"f { print $1; exit }' "$TMP/checksums.txt")
+if [ -z "$EXPECTED" ]; then
+  echo "error: checksums.txt has no entry for $ARCHIVE" >&2
+  exit 1
+fi
+
+if command -v sha256sum >/dev/null 2>&1; then
+  ACTUAL=$(sha256sum "$TMP/$ARCHIVE" | awk '{ print $1 }')
+elif command -v shasum >/dev/null 2>&1; then
+  ACTUAL=$(shasum -a 256 "$TMP/$ARCHIVE" | awk '{ print $1 }')
+else
+  echo "error: neither sha256sum nor shasum is available to verify the download" >&2
+  exit 1
+fi
+
+if [ "$ACTUAL" != "$EXPECTED" ]; then
+  echo "error: checksum mismatch for $ARCHIVE" >&2
+  echo "       expected $EXPECTED" >&2
+  echo "       got      $ACTUAL" >&2
+  exit 1
+fi
+echo "  Checksum OK (sha256 $ACTUAL)"
 
 tar -xzf "$TMP/$ARCHIVE" -C "$TMP"
 
