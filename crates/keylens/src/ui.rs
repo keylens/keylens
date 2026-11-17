@@ -1,6 +1,6 @@
 //! Rendering.
 
-use keylens_conn::KeyValue;
+use keylens_conn::{Coverage, KeyMeta, KeyValue};
 use keylens_ui::banner;
 use keylens_ui::format;
 use keylens_ui::theme::Theme;
@@ -305,7 +305,7 @@ fn draw_value(frame: &mut Frame<'_>, app: &App, area: Rect) {
         Span::styled("  ttl ", Theme::dim()),
         Span::styled(format::ttl(meta.ttl_ms), Theme::number()),
         Span::styled("  size ", Theme::dim()),
-        Span::styled(format::count(meta.size), Theme::number()),
+        Span::styled(format::count_or_unknown(meta.size), Theme::number()),
         Span::styled("  mem ", Theme::dim()),
         Span::styled(format::bytes(meta.memory), Theme::number()),
     ]));
@@ -320,12 +320,46 @@ fn draw_value(frame: &mut Frame<'_>, app: &App, area: Rect) {
     }
 
     lines.extend(value_lines(value, area.width.saturating_sub(4) as usize));
+    if let Some(note) = coverage_note(meta, value, app.coverage) {
+        lines.push(Line::raw(""));
+        lines.push(Line::from(Span::styled(note, Theme::dim())));
+    }
 
     let p = Paragraph::new(lines)
         .block(Theme::panel("value", focused))
         .wrap(Wrap { trim: false })
         .scroll((app.detail_scroll, 0));
     frame.render_widget(p, area);
+}
+
+/// Say how much of the value is on screen when it is not all of it.
+///
+/// keylens reads one bounded page of every value. 0.1.7 showed that page with `size N`
+/// above it and nothing else, so 200 rows of a 5,000-element list, or the first `HSCAN`
+/// page of a large hash, looked like the whole thing.
+fn coverage_note(meta: &KeyMeta, value: &KeyValue, coverage: Coverage) -> Option<String> {
+    let Coverage::Partial { shown } = coverage else {
+        return None;
+    };
+    let shown_s = format::count(shown as u64);
+    Some(match (value, meta.size) {
+        (KeyValue::String(_), Some(n)) => format!(
+            "  showing the first {} of {} -- keylens reads at most one bounded page",
+            format::bytes(Some(shown as u64)),
+            format::bytes(Some(n))
+        ),
+        (KeyValue::String(_), None) => format!(
+            "  showing the first {} -- keylens reads at most one bounded page",
+            format::bytes(Some(shown as u64))
+        ),
+        (_, Some(n)) => format!(
+            "  showing {shown_s} of {} -- keylens reads at most one bounded page",
+            format::count(n)
+        ),
+        (_, None) => format!(
+            "  showing {shown_s}; more exist or may exist -- keylens reads at most one bounded page"
+        ),
+    })
 }
 
 /// Stream metadata, consumer groups and per-consumer pending/idle.
@@ -338,14 +372,9 @@ fn stream_lines(s: &keylens_conn::StreamInfo) -> Vec<Line<'static>> {
 
     lines.push(Line::from(vec![
         Span::styled("  length ", Theme::label()),
-        Span::styled(format::count(s.length), Theme::number()),
+        Span::styled(format::count_or_unknown(s.length), Theme::number()),
         Span::styled("  added ", Theme::label()),
-        Span::styled(
-            s.entries_added
-                .map(format::count)
-                .unwrap_or_else(|| "-".into()),
-            Theme::number(),
-        ),
+        Span::styled(format::count_or_unknown(s.entries_added), Theme::number()),
         Span::styled("  last id ", Theme::label()),
         Span::styled(s.last_generated_id.clone(), Theme::value()),
     ]));
@@ -374,14 +403,14 @@ fn stream_lines(s: &keylens_conn::StreamInfo) -> Vec<Line<'static>> {
         lines.push(Line::from(vec![
             Span::styled(format!("  {}", g.name), Theme::accent()),
             Span::styled("  consumers ", Theme::label()),
-            Span::styled(g.consumer_count.to_string(), Theme::number()),
+            Span::styled(format::count_or_unknown(g.consumer_count), Theme::number()),
             Span::styled("  pending ", Theme::label()),
             Span::styled(
-                format::count(g.pending),
-                if g.pending > 0 {
-                    Theme::warn()
-                } else {
-                    Theme::ok()
+                format::count_or_unknown(g.pending),
+                match g.pending {
+                    Some(0) => Theme::ok(),
+                    Some(_) => Theme::warn(),
+                    None => Theme::dim(),
                 },
             ),
             Span::styled("  lag ", Theme::label()),
@@ -413,7 +442,8 @@ fn stream_lines(s: &keylens_conn::StreamInfo) -> Vec<Line<'static>> {
         for c in consumers {
             // A consumer holding entries while idle for a long time is the failure mode
             // this pane exists to surface.
-            let stuck = c.pending > 0 && c.idle_ms > STUCK_IDLE_MS;
+            let stuck = c.pending.is_some_and(|p| p > 0)
+                && c.idle_ms.is_some_and(|idle| idle > STUCK_IDLE_MS);
             let name_style = if stuck {
                 Theme::error()
             } else {
@@ -427,8 +457,8 @@ fn stream_lines(s: &keylens_conn::StreamInfo) -> Vec<Line<'static>> {
                 Span::styled(format!("{:<22}", format::truncate(&c.name, 21)), name_style),
                 Span::styled("pending ", Theme::label()),
                 Span::styled(
-                    format!("{:<8}", format::count(c.pending)),
-                    if c.pending > 0 {
+                    format!("{:<8}", format::count_or_unknown(c.pending)),
+                    if c.pending.is_some_and(|p| p > 0) {
                         Theme::warn()
                     } else {
                         Theme::dim()
@@ -436,7 +466,8 @@ fn stream_lines(s: &keylens_conn::StreamInfo) -> Vec<Line<'static>> {
                 ),
                 Span::styled("idle ", Theme::label()),
                 Span::styled(
-                    format::ttl(Some(c.idle_ms)),
+                    c.idle_ms
+                        .map_or_else(|| "?".into(), |ms| format::ttl(Some(ms))),
                     if stuck { Theme::error() } else { Theme::dim() },
                 ),
             ]));
@@ -540,6 +571,11 @@ fn value_lines(value: &KeyValue, width: usize) -> Vec<Line<'static>> {
         KeyValue::Missing => vec![Line::from(Span::styled(
             "key no longer exists",
             Theme::dim(),
+        ))],
+
+        KeyValue::Changed => vec![Line::from(Span::styled(
+            "key changed type while it was being read -- move off it and back to reload",
+            Theme::warn(),
         ))],
 
         KeyValue::Unsupported(why) => vec![Line::from(Span::styled(why.clone(), Theme::warn()))],

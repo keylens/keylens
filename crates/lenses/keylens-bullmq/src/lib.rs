@@ -22,4 +22,4 @@ pub mod lens;
 pub use events::{EventKind, EventsStatus, Throughput};
 pub use job::{Job, JobRef};
 pub use keys::{QueueKeys, State};
-pub use lens::{BullMqLens, QueueSummary};
+pub use lens::{BullMqLens, QueueList, QueueSummary};

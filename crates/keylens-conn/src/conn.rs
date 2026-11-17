@@ -33,32 +33,72 @@ pub struct ScanPage {
 /// single cursor string used by [`ScanPage`]. This wrapper owns fred's per-primary scanner
 /// state and exposes one page at a time without buffering the whole keyspace.
 pub struct KeyScanner {
-    pages: Pin<Box<dyn Stream<Item = std::result::Result<ScanResult, fred::error::Error>> + Send>>,
+    pages: Pin<Box<dyn Stream<Item = std::result::Result<Vec<String>, fred::error::Error>> + Send>>,
+    /// Set by the first error, and permanent.
+    ///
+    /// fred's scan stream *ends* after an error -- the cursor that failed is gone. Without
+    /// this, the next call saw the end of the stream and returned `None`, which callers
+    /// rightly read as "every key visited": a scan that died halfway reported itself
+    /// complete.
+    failed: Option<String>,
 }
 
 impl KeyScanner {
+    fn new(
+        pages: Pin<
+            Box<dyn Stream<Item = std::result::Result<Vec<String>, fred::error::Error>> + Send>,
+        >,
+    ) -> Self {
+        Self {
+            pages,
+            failed: None,
+        }
+    }
+
     /// Return the next page, or `None` once every relevant server has returned cursor zero.
+    ///
+    /// # Errors
+    ///
+    /// The scan failed. Every later call fails too: a scan cannot be resumed past a lost
+    /// cursor, so the only honest answers left are "failed" and "start a new scan".
     pub async fn next_page(&mut self) -> Result<Option<Vec<String>>> {
-        match self.pages.next().await {
-            Some(Ok(mut page)) => {
-                let keys = page
-                    .take_results()
-                    .unwrap_or_default()
-                    .into_iter()
-                    .filter_map(|key| key.into_string())
-                    .collect();
-                // Explicitly continue this node. Dropping also continues it, but spelling
-                // this out makes the throttling contract independent of Drop behaviour.
-                page.next();
-                Ok(Some(keys))
-            }
-            Some(Err(source)) => Err(ConnError::Command {
+        if let Some(why) = &self.failed {
+            return Err(ConnError::Reply {
                 cmd: "SCAN",
-                source,
-            }),
+                detail: format!("scan stopped by an earlier error ({why}); rescan to start over"),
+            });
+        }
+        match self.pages.next().await {
+            Some(Ok(keys)) => Ok(Some(keys)),
+            Some(Err(source)) => {
+                self.failed = Some(source.details().to_string());
+                Err(ConnError::Command {
+                    cmd: "SCAN",
+                    source,
+                })
+            }
             None => Ok(None),
         }
     }
+
+    /// Whether this scan has failed, and so can never complete.
+    pub fn has_failed(&self) -> bool {
+        self.failed.is_some()
+    }
+}
+
+/// Turn one fred scan page into its keys, and ask for the next one.
+fn page_keys(mut page: ScanResult) -> Vec<String> {
+    let keys = page
+        .take_results()
+        .unwrap_or_default()
+        .into_iter()
+        .filter_map(|key| key.into_string())
+        .collect();
+    // Explicitly continue this node. Dropping also continues it, but spelling this out
+    // makes the throttling contract independent of Drop behaviour.
+    page.next();
+    keys
 }
 
 impl ScanPage {
@@ -272,13 +312,21 @@ impl Conn {
         let pattern = pattern.unwrap_or("*").to_string();
         let scan_type = type_filter.and_then(parse_scan_type);
         let pages: Pin<
-            Box<dyn Stream<Item = std::result::Result<ScanResult, fred::error::Error>> + Send>,
+            Box<dyn Stream<Item = std::result::Result<Vec<String>, fred::error::Error>> + Send>,
         > = if self.client.is_clustered() {
-            Box::pin(self.client.scan_cluster(pattern, Some(count), scan_type))
+            Box::pin(
+                self.client
+                    .scan_cluster(pattern, Some(count), scan_type)
+                    .map(|page| page.map(page_keys)),
+            )
         } else {
-            Box::pin(self.client.scan(pattern, Some(count), scan_type))
+            Box::pin(
+                self.client
+                    .scan(pattern, Some(count), scan_type)
+                    .map(|page| page.map(page_keys)),
+            )
         };
-        KeyScanner { pages }
+        KeyScanner::new(pages)
     }
 
     /// Re-read `INFO`. Cheap enough for the stats pane's refresh tick.
@@ -838,6 +886,44 @@ mod tests {
                 }
             }
         }
+    }
+
+    #[tokio::test]
+    async fn a_scan_that_failed_never_reports_itself_complete() {
+        // fred ends its scan stream after an error. 0.1.7 then returned `Ok(None)` on the
+        // next call, and the browser printed "N keys" as though it had walked the lot.
+        let pages = futures::stream::iter(vec![
+            Ok(vec!["a".to_string()]),
+            Err(fred::error::Error::new(
+                fred::error::ErrorKind::Timeout,
+                "Request timed out.",
+            )),
+        ]);
+        let mut scanner = KeyScanner::new(Box::pin(pages));
+
+        assert_eq!(
+            scanner.next_page().await.unwrap(),
+            Some(vec!["a".to_string()])
+        );
+        assert!(scanner.next_page().await.is_err());
+        assert!(scanner.has_failed());
+        // The stream is exhausted now -- and the answer must still not be "complete".
+        for _ in 0..3 {
+            assert!(
+                scanner.next_page().await.is_err(),
+                "a failed scan read as finished"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn a_clean_scan_still_completes() {
+        let pages = futures::stream::iter(vec![Ok(vec!["a".to_string()]), Ok(vec![])]);
+        let mut scanner = KeyScanner::new(Box::pin(pages));
+        assert!(scanner.next_page().await.unwrap().is_some());
+        assert!(scanner.next_page().await.unwrap().is_some());
+        assert_eq!(scanner.next_page().await.unwrap(), None);
+        assert!(!scanner.has_failed());
     }
 
     #[test]

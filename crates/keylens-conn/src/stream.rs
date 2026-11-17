@@ -18,7 +18,9 @@ const MAX_GROUPS: usize = 32;
 
 #[derive(Debug, Clone, Default)]
 pub struct StreamInfo {
-    pub length: u64,
+    /// `None` when the server did not report it. Not zero: an unreadable length and an
+    /// empty stream are different answers.
+    pub length: Option<u64>,
     pub entries_added: Option<u64>,
     pub last_generated_id: String,
     pub max_deleted_id: String,
@@ -31,8 +33,9 @@ pub struct StreamInfo {
 #[derive(Debug, Clone, Default)]
 pub struct GroupInfo {
     pub name: String,
-    pub consumer_count: u64,
-    pub pending: u64,
+    pub consumer_count: Option<u64>,
+    /// Entries delivered and not yet acknowledged. `None` when unreported.
+    pub pending: Option<u64>,
     pub last_delivered_id: String,
     pub entries_read: Option<i64>,
     /// Entries added to the stream that this group has not yet read.
@@ -48,8 +51,11 @@ pub struct GroupInfo {
 impl GroupInfo {
     /// Consumers holding pending entries, worst first -- the ones worth looking at.
     pub fn stuck_consumers(&self) -> Vec<&ConsumerInfo> {
-        let mut stuck: Vec<&ConsumerInfo> =
-            self.consumers.iter().filter(|c| c.pending > 0).collect();
+        let mut stuck: Vec<&ConsumerInfo> = self
+            .consumers
+            .iter()
+            .filter(|c| c.pending.is_some_and(|p| p > 0))
+            .collect();
         stuck.sort_by_key(|c| std::cmp::Reverse(c.idle_ms));
         stuck
     }
@@ -58,9 +64,9 @@ impl GroupInfo {
 #[derive(Debug, Clone, Default)]
 pub struct ConsumerInfo {
     pub name: String,
-    pub pending: u64,
-    /// Milliseconds since this consumer's last interaction.
-    pub idle_ms: i64,
+    pub pending: Option<u64>,
+    /// Milliseconds since this consumer's last interaction. `None` when unreported.
+    pub idle_ms: Option<i64>,
     /// Redis 7.2+; milliseconds since it last *successfully read* something.
     pub inactive_ms: Option<i64>,
 }
@@ -88,8 +94,8 @@ impl Conn {
         let f = fields(&raw);
 
         let mut info = StreamInfo {
-            length: num(&f, "length").unwrap_or(0) as u64,
-            entries_added: num(&f, "entries-added").map(|n| n as u64),
+            length: count(&f, "length"),
+            entries_added: count(&f, "entries-added"),
             last_generated_id: text(&f, "last-generated-id"),
             max_deleted_id: text(&f, "max-deleted-entry-id"),
             first_entry_id: text(&f, "recorded-first-entry-id"),
@@ -111,8 +117,8 @@ impl Conn {
             }
 
             let mut group = GroupInfo {
-                consumer_count: num(&gf, "consumers").unwrap_or(0) as u64,
-                pending: num(&gf, "pending").unwrap_or(0) as u64,
+                consumer_count: count(&gf, "consumers"),
+                pending: count(&gf, "pending"),
                 last_delivered_id: text(&gf, "last-delivered-id"),
                 entries_read: num(&gf, "entries-read"),
                 lag: num(&gf, "lag"),
@@ -132,7 +138,7 @@ impl Conn {
 
             // XPENDING's summary form gives the id range still outstanding, which is what
             // tells you *how far back* the stall goes.
-            if group.pending > 0
+            if group.pending.is_some_and(|p| p > 0)
                 && let Ok(p) = self
                     .cmd("XPENDING", vec![key.into(), name.as_str().into()])
                     .await
@@ -160,8 +166,8 @@ fn parse_consumers(reply: &Value) -> Vec<ConsumerInfo> {
             let f = fields(c);
             ConsumerInfo {
                 name: text(&f, "name"),
-                pending: num(&f, "pending").unwrap_or(0) as u64,
-                idle_ms: num(&f, "idle").unwrap_or(0),
+                pending: count(&f, "pending"),
+                idle_ms: num(&f, "idle"),
                 inactive_ms: num(&f, "inactive"),
             }
         })
@@ -193,6 +199,13 @@ fn find<'a>(f: &'a [(String, Value)], name: &str) -> Option<&'a Value> {
 
 fn text(f: &[(String, Value)], name: &str) -> String {
     find(f, name).map(display_string).unwrap_or_default()
+}
+
+/// A non-negative count. `None` for a missing field, a nil, or a negative number --
+/// 0.1.7 cast these with `as u64`, so `-1` became 18,446,744,073,709,551,615 and a
+/// missing field became a confident `0`.
+fn count(f: &[(String, Value)], name: &str) -> Option<u64> {
+    num(f, name).and_then(|n| u64::try_from(n).ok())
 }
 
 /// `None` for a missing field *and* for an explicit nil -- Redis returns nil for `lag`
@@ -266,8 +279,8 @@ mod tests {
         let consumers = parse_consumers(&reply);
         assert_eq!(consumers.len(), 2);
         assert_eq!(consumers[1].name, "worker-stuck");
-        assert_eq!(consumers[1].pending, 27);
-        assert_eq!(consumers[1].idle_ms, 13_288);
+        assert_eq!(consumers[1].pending, Some(27));
+        assert_eq!(consumers[1].idle_ms, Some(13_288));
         assert_eq!(consumers[1].inactive_ms, Some(13_288));
     }
 
@@ -296,20 +309,20 @@ mod tests {
             consumers: vec![
                 ConsumerInfo {
                     name: "ok".into(),
-                    pending: 0,
-                    idle_ms: 999_999,
+                    pending: Some(0),
+                    idle_ms: Some(999_999),
                     inactive_ms: None,
                 },
                 ConsumerInfo {
                     name: "a".into(),
-                    pending: 2,
-                    idle_ms: 500,
+                    pending: Some(2),
+                    idle_ms: Some(500),
                     inactive_ms: None,
                 },
                 ConsumerInfo {
                     name: "b".into(),
-                    pending: 27,
-                    idle_ms: 13_288,
+                    pending: Some(27),
+                    idle_ms: Some(13_288),
                     inactive_ms: None,
                 },
             ],
@@ -321,5 +334,20 @@ mod tests {
         assert_eq!(stuck.len(), 2);
         assert_eq!(stuck[0].name, "b", "longest-idle holder comes first");
         assert_eq!(stuck[1].name, "a");
+    }
+
+    #[test]
+    fn negative_or_missing_counts_are_unknown_not_huge_or_zero() {
+        // 0.1.7: `num(..).unwrap_or(0) as u64` -- a missing count read as 0, and a
+        // negative one wrapped to 18,446,744,073,709,551,615.
+        let f = fields(&flat(&[("pending", Value::from(-1i64))]));
+        assert_eq!(count(&f, "pending"), None);
+        assert_eq!(count(&f, "length"), None);
+        let f = fields(&flat(&[("pending", Value::from(4i64))]));
+        assert_eq!(count(&f, "pending"), Some(4));
+
+        let consumers = parse_consumers(&Value::Array(vec![flat(&[("name", Value::from("c"))])]));
+        assert_eq!(consumers[0].pending, None, "a missing pending read as 0");
+        assert_eq!(consumers[0].idle_ms, None);
     }
 }
