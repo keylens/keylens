@@ -117,7 +117,7 @@ impl BullMqLens {
             .capabilities()
             .has(keylens_conn::Feature::ScanTypeFilter)
             .then_some("hash");
-        let mut scanner = conn.key_scanner(Some(&pattern), SCAN_COUNT, type_filter);
+        let mut scanner = conn.key_scanner(Some(&pattern), SCAN_COUNT, type_filter)?;
         let mut reached_end = false;
 
         for _ in 0..MAX_DETECT_PAGES {
@@ -341,7 +341,12 @@ impl BullMqLens {
         let Value::Array(items) = reply else {
             return Ok(Vec::new());
         };
-        Ok(items.iter().filter_map(|v| v.as_string()).collect())
+        // A log line is whatever the job wrote. Keep each bounded, like any element.
+        Ok(items
+            .iter()
+            .filter_map(|v| v.as_string())
+            .map(keylens_conn::bounds::cap_element)
+            .collect())
     }
 }
 

@@ -434,6 +434,17 @@ fn stream_lines(s: &keylens_conn::StreamInfo) -> Vec<Line<'static>> {
             ]));
         }
 
+        if g.consumers_total > g.consumers.len() {
+            lines.push(Line::from(Span::styled(
+                format!(
+                    "    showing {} of {} consumers",
+                    format::count(g.consumers.len() as u64),
+                    format::count(g.consumers_total as u64)
+                ),
+                Theme::warn(),
+            )));
+        }
+
         // Worst offenders first: a group with fifty consumers should not make you scroll
         // to find the one that stopped acknowledging.
         let mut consumers: Vec<_> = g.consumers.iter().collect();

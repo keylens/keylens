@@ -8,6 +8,7 @@
 
 use fred::prelude::Value;
 
+use crate::bounds::{MAX_ENTRY_FIELDS, cap_element};
 use crate::capability::Feature;
 use crate::conn::Conn;
 use crate::error::{ConnError, Result};
@@ -808,7 +809,7 @@ fn decode_hash(reply: &Value) -> Result<(KeyValue, Coverage)> {
 fn decode_set(reply: &Value) -> Result<(KeyValue, Coverage)> {
     let (cursor, items) = scan_items(reply)?;
     let capped = items.len() > PAGE;
-    let value = KeyValue::Set(items.iter().take(PAGE).map(display_string).collect());
+    let value = KeyValue::Set(items.iter().take(PAGE).map(element).collect());
     Ok(cursor_coverage(value, &cursor, capped))
 }
 
@@ -834,9 +835,14 @@ fn reply_byte_len(v: &Value) -> usize {
         .unwrap_or(0)
 }
 
+/// One element of a collection, as kept: rendered, then capped.
+fn element(v: &Value) -> String {
+    cap_element(display_string(v))
+}
+
 fn as_string_vec(v: &Value) -> Vec<String> {
     match v {
-        Value::Array(items) => items.iter().map(display_string).collect(),
+        Value::Array(items) => items.iter().map(element).collect(),
         _ => Vec::new(),
     }
 }
@@ -846,7 +852,7 @@ fn as_field_pairs(items: &[Value]) -> Vec<(String, String)> {
         .as_chunks::<2>()
         .0
         .iter()
-        .map(|c| (display_string(&c[0]), display_string(&c[1])))
+        .map(|c| (element(&c[0]), element(&c[1])))
         .collect()
 }
 
@@ -859,7 +865,7 @@ fn as_scored_pairs(v: &Value) -> Vec<(String, f64)> {
         .0
         .iter()
         .map(|c| {
-            let member = display_string(&c[0]);
+            let member = element(&c[0]);
             // Scores come back as bulk strings in RESP2 and doubles in RESP3.
             let score = c[1].as_f64().unwrap_or(0.0);
             (member, score)
@@ -895,9 +901,19 @@ fn as_stream_entries(v: &Value) -> Vec<StreamEntry> {
             if pair.len() != 2 {
                 return None;
             }
-            let id = display_string(&pair[0]);
+            let id = element(&pair[0]);
             let fields = match &pair[1] {
-                Value::Array(kv) => as_field_pairs(kv),
+                Value::Array(kv) => {
+                    // An entry can carry any number of fields; keep a bounded few and say
+                    // how many more there were.
+                    let kept = kv.get(..MAX_ENTRY_FIELDS * 2).unwrap_or(kv);
+                    let mut fields = as_field_pairs(kept);
+                    let dropped = (kv.len() / 2).saturating_sub(fields.len());
+                    if dropped > 0 {
+                        fields.push(("…".into(), format!("{dropped} more fields not shown")));
+                    }
+                    fields
+                }
                 _ => Vec::new(),
             };
             Some(StreamEntry { id, fields })

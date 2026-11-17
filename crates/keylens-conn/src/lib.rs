@@ -7,6 +7,7 @@
 // guards the production paths would otherwise force `?` into every fixture.
 #![cfg_attr(test, allow(clippy::unwrap_used, clippy::expect_used, clippy::panic))]
 
+pub mod bounds;
 pub mod capability;
 pub mod conn;
 pub mod error;
@@ -25,6 +26,7 @@ pub use fred::prelude::Value;
 /// Re-exported for building RESP3 map replies (tests, and any caller that needs one).
 pub use fred::types::Map;
 
+pub use bounds::Capped;
 pub use capability::{Availability, Capabilities, Feature};
 pub use conn::{Conn, KeyScanner, ScanPage};
 pub use error::{ConnError, Result};

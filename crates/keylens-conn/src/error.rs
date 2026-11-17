@@ -60,6 +60,11 @@ pub enum ConnError {
 
     #[error("command `{0}` is not allowed through the read-only connection API")]
     UnsafeCommand(&'static str),
+
+    /// A read-only command whose arguments ask for an unbounded or oversized read --
+    /// `LRANGE k 0 -1`, `XRANGE` without `COUNT`, `SLOWLOG GET -1`. See [`crate::bounds`].
+    #[error("refusing `{cmd}`: {detail}")]
+    Unbounded { cmd: &'static str, detail: String },
 }
 
 /// Classify a connection failure, upgrading the unhelpful protocol error into a TLS hint.

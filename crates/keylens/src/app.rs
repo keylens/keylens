@@ -3,8 +3,8 @@
 use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
 use keylens_bullmq::{JobRef, QueueList, QueueSummary, State, Throughput};
 use keylens_conn::{
-    ClientInfo, ClusterTopology, Coverage, KeyMeta, KeyValue, Kind, PubSubChannel, ServerInfo,
-    SlowEntry, StreamInfo, redact_url,
+    Capped, ClientInfo, ClusterTopology, Coverage, KeyMeta, KeyValue, Kind, PubSubChannel,
+    ServerInfo, SlowEntry, StreamInfo, redact_url,
 };
 use keylens_lens::Detection;
 use keylens_ui::KeyTree;
@@ -88,6 +88,13 @@ const KIND_CYCLE: [Option<Kind>; 7] = [
     Some(Kind::Stream),
 ];
 
+/// Most keys the tree will hold.
+///
+/// Every `m` adds a batch, and nothing else bounds the tree. Past this the browser stops
+/// asking for more and says why: a filter is the way to look at a keyspace this size, and
+/// a tree of millions of rows is neither navigable nor cheap to rebuild on every batch.
+pub const MAX_TREE_KEYS: usize = 500_000;
+
 fn worker_busy<T>() -> PaneState<T> {
     PaneState::Failed("worker busy — press r to retry".into())
 }
@@ -159,9 +166,9 @@ pub struct App {
     /// Scroll offset for whichever server pane is showing.
     pub pane_scroll: u16,
     pub slowlog: PaneState<Vec<SlowEntry>>,
-    pub clients: PaneState<Vec<ClientInfo>>,
+    pub clients: PaneState<Capped<ClientInfo>>,
     pub cluster: PaneState<Box<ClusterTopology>>,
-    pub pubsub: PaneState<Vec<PubSubChannel>>,
+    pub pubsub: PaneState<Capped<PubSubChannel>>,
 
     /// Lenses that matched this keyspace. Non-empty is what makes the queues tab appear.
     pub detections: Vec<Detection>,
@@ -186,6 +193,8 @@ pub struct App {
     pub error: Option<String>,
     pub loading: bool,
     pub scan_complete: bool,
+    /// The tree reached [`MAX_TREE_KEYS`]; `m` no longer asks for more.
+    pub tree_full: bool,
     /// Covers the gap between "process started" and "first keys arrived", which on a cold
     /// remote keyspace is a real second or two of otherwise-blank screen.
     pub splash: bool,
@@ -240,6 +249,7 @@ impl App {
             error: None,
             loading: true,
             scan_complete: false,
+            tree_full: false,
             splash: true,
             quit: false,
             tx,
@@ -328,6 +338,7 @@ impl App {
                     return;
                 }
                 if reset {
+                    self.tree_full = false;
                     self.tree.clear_keys();
                     self.selected = 0;
                     self.detail = None;
@@ -337,7 +348,9 @@ impl App {
                     self.stream = None;
                     self.pending.detail = None;
                 }
-                for (key, kind) in keys {
+                let room = MAX_TREE_KEYS.saturating_sub(self.tree.len());
+                let over_budget = keys.len() > room;
+                for (key, kind) in keys.into_iter().take(room) {
                     self.tree.insert_with_kind(&key, kind);
                 }
                 self.scan_complete = progress == ScanProgress::Complete;
@@ -358,6 +371,13 @@ impl App {
                         format!("scan failed after {n} keys (incomplete) - r to rescan: {why}")
                     }
                 };
+                if over_budget || self.tree.len() >= MAX_TREE_KEYS {
+                    self.tree_full = true;
+                    self.scan_complete = false;
+                    self.status = format!(
+                        "{n} keys -- tree limit reached; the scan stopped here. / to filter"
+                    );
+                }
                 self.rebuild();
             }
 
@@ -931,7 +951,12 @@ impl App {
             }
 
             KeyCode::Char('m') => {
-                if !self.scan_complete {
+                if self.tree_full {
+                    self.status = format!(
+                        "tree limit of {} keys reached -- / to filter",
+                        keylens_ui::format::count(MAX_TREE_KEYS as u64)
+                    );
+                } else if !self.scan_complete {
                     let scan = self.pending.scan;
                     if self.send(Request::More { scan }).await {
                         self.loading = true;
@@ -1353,6 +1378,30 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn the_tree_stops_growing_at_its_budget_and_says_so() {
+        let (mut a, mut rx) = app_with_rx();
+        let over = MAX_TREE_KEYS + 10;
+        a.apply(Update::Batch {
+            scan: RequestId::default(),
+            keys: (0..over).map(|i| (format!("k:{i}"), None)).collect(),
+            reset: true,
+            progress: ScanProgress::Partial,
+            scanned_pages: 1,
+        });
+        assert_eq!(a.tree.len(), MAX_TREE_KEYS);
+        assert!(a.tree_full);
+        assert!(!a.scan_complete, "a capped tree is not the whole keyspace");
+        assert!(a.status.contains("limit"), "{}", a.status);
+
+        a.handle_normal_key(KeyEvent::from(KeyCode::Char('m')))
+            .await;
+        assert!(
+            rx.try_recv().is_err(),
+            "`m` must not ask for more past the budget"
+        );
+    }
+
+    #[tokio::test]
     async fn bare_search_terms_become_substring_globs() {
         let mut a = app();
         a.mode = Mode::Search;
@@ -1434,7 +1483,7 @@ mod tests {
     async fn r_reloads_the_pane_that_is_showing() {
         let (mut a, mut rx) = app_with_rx();
         a.view = View::Clients;
-        a.clients = PaneState::Ready(vec![]);
+        a.clients = PaneState::Ready(Capped::default());
 
         a.handle_normal_key(KeyEvent::from(KeyCode::Char('r')))
             .await;

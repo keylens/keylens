@@ -5,6 +5,7 @@
 //! rather than surfacing a raw error. On Upstash and ElastiCache that is the *normal*
 //! path, not an edge case.
 
+use crate::bounds::{Capped, MAX_LISTED, cap_element};
 use crate::capability::Feature;
 use crate::conn::Conn;
 use crate::error::Result;
@@ -78,12 +79,19 @@ impl Conn {
         Ok(parse_slowlog(&reply))
     }
 
-    pub async fn client_list(&self) -> Result<Vec<ClientInfo>> {
+    /// Connected clients: at most [`MAX_LISTED`] kept, with the true total.
+    ///
+    /// `CLIENT LIST` has no count or cursor, so the whole list crosses the wire whatever
+    /// keylens asks for. What is bounded is what is kept and rendered.
+    pub async fn client_list(&self) -> Result<Capped<ClientInfo>> {
         if !self.capabilities().has(Feature::ClientList) {
-            return Ok(Vec::new());
+            return Ok(Capped::default());
         }
         let reply = self.cmd("CLIENT", vec!["LIST".into()]).await?;
-        Ok(parse_client_list(&display_string(&reply)))
+        Ok(Capped::keep(
+            parse_client_list(&display_string(&reply)),
+            MAX_LISTED,
+        ))
     }
 
     pub async fn cluster_topology(&self) -> Result<ClusterTopology> {
@@ -105,27 +113,38 @@ impl Conn {
         Ok(topology)
     }
 
-    /// Active pub/sub channels with subscriber counts.
-    pub async fn pubsub_channels(&self, limit: usize) -> Result<Vec<PubSubChannel>> {
+    /// Active pub/sub channels with subscriber counts: at most `limit` kept, with the
+    /// true total.
+    ///
+    /// `PUBSUB CHANNELS` has no `COUNT`, so every channel name crosses the wire however
+    /// small `limit` is. 0.1.7 took the first `limit` silently, so a server with 50,000
+    /// channels showed 200 and nothing said there were more.
+    pub async fn pubsub_channels(&self, limit: usize) -> Result<Capped<PubSubChannel>> {
         if !self.capabilities().has(Feature::PubSub) {
-            return Ok(Vec::new());
+            return Ok(Capped::default());
         }
 
         let reply = self.cmd("PUBSUB", vec!["CHANNELS".into()]).await?;
         let Value::Array(items) = reply else {
-            return Ok(Vec::new());
+            return Ok(Capped::default());
         };
 
-        let names: Vec<String> = items.iter().map(display_string).take(limit).collect();
+        let names = Capped::keep(items.iter().map(display_string), limit);
         if names.is_empty() {
-            return Ok(Vec::new());
+            return Ok(Capped {
+                items: Vec::new(),
+                total: names.total,
+            });
         }
 
         let mut args: Vec<Value> = vec!["NUMSUB".into()];
         args.extend(names.iter().map(|n| Value::from(n.as_str())));
         let counts = self.cmd("PUBSUB", args).await?;
 
-        Ok(parse_numsub(&counts))
+        Ok(Capped {
+            items: parse_numsub(&counts),
+            total: names.total,
+        })
     }
 }
 
@@ -248,7 +267,7 @@ fn parse_numsub(reply: &Value) -> Vec<PubSubChannel> {
         .0
         .iter()
         .map(|c| PubSubChannel {
-            name: display_string(&c[0]),
+            name: cap_element(display_string(&c[0])),
             subscribers: c[1].as_u64().unwrap_or(0),
         })
         .collect()

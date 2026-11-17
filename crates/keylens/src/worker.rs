@@ -9,8 +9,8 @@ use std::sync::Arc;
 
 use keylens_bullmq::{BullMqLens, EventsStatus, Job, JobRef, QueueList, State};
 use keylens_conn::{
-    ClientInfo, ClusterTopology, Conn, Coverage, Feature, KeyMeta, KeyScanner, KeyValue, Kind,
-    PubSubChannel, ServerInfo, SlowEntry, StreamInfo, Value,
+    Capped, ClientInfo, ClusterTopology, Conn, Coverage, Feature, KeyMeta, KeyScanner, KeyValue,
+    Kind, PubSubChannel, ServerInfo, SlowEntry, StreamInfo, Value,
 };
 use keylens_lens::{Detection, Lens};
 use keylens_ui::PaneState;
@@ -168,7 +168,7 @@ pub enum Update {
     },
     Clients {
         id: RequestId,
-        data: PaneState<Vec<ClientInfo>>,
+        data: PaneState<Capped<ClientInfo>>,
     },
     Cluster {
         id: RequestId,
@@ -176,7 +176,7 @@ pub enum Update {
     },
     PubSub {
         id: RequestId,
-        data: PaneState<Vec<PubSubChannel>>,
+        data: PaneState<Capped<PubSubChannel>>,
     },
 
     Detected(Vec<Detection>),
@@ -212,6 +212,8 @@ pub struct Worker {
     scanner: Option<tokio::sync::Mutex<KeyScanner>>,
     /// Generation of `scanner`: the id of the `Rescan` that created it.
     scan: RequestId,
+    /// Why the current generation's scanner could not be created, if it could not.
+    scan_error: Option<String>,
     pattern: Option<String>,
     kind: Option<Kind>,
     complete: bool,
@@ -251,6 +253,7 @@ impl Worker {
             conn: Arc::new(conn),
             scanner: None,
             scan: RequestId::default(),
+            scan_error: None,
             pattern: None,
             kind: None,
             complete: false,
@@ -275,12 +278,30 @@ impl Worker {
                     self.pattern = pattern;
                     self.kind = kind;
                     self.complete = false;
-                    self.scanner = Some(tokio::sync::Mutex::new(self.conn.key_scanner(
+                    self.scan_error = None;
+                    match self.conn.key_scanner(
                         self.pattern.as_deref(),
                         SCAN_COUNT,
                         self.server_type_filter(),
-                    )));
-                    self.scan_batch(true).await
+                    ) {
+                        Ok(scanner) => {
+                            self.scanner = Some(tokio::sync::Mutex::new(scanner));
+                            self.scan_batch(true).await
+                        }
+                        Err(e) => {
+                            // Not `None` alone: a missing scanner reads as "nothing left",
+                            // and a `More` would then report this scan complete.
+                            self.scanner = None;
+                            self.scan_error = Some(e.to_string());
+                            Update::Batch {
+                                scan,
+                                keys: Vec::new(),
+                                reset: true,
+                                progress: ScanProgress::Failed(e.to_string()),
+                                scanned_pages: 0,
+                            }
+                        }
+                    }
                 }
                 // A request always gets a reply, including this one. The UI sets `loading`
                 // when it asks for more; answering an already-finished scan with silence
@@ -402,9 +423,13 @@ impl Worker {
     async fn scan_batch(&mut self, reset: bool) -> Update {
         let mut keys: Vec<String> = Vec::new();
         let mut pages = 0usize;
-        let mut failure: Option<String> = None;
+        let mut failure: Option<String> = self.scan_error.clone();
 
-        while keys.len() < BATCH_TARGET && pages < MAX_PAGES_PER_BATCH && !self.complete {
+        while failure.is_none()
+            && keys.len() < BATCH_TARGET
+            && pages < MAX_PAGES_PER_BATCH
+            && !self.complete
+        {
             // No scanner means no `Rescan` has been handled yet. In the app that cannot
             // happen — `browse` queues `Rescan` before the event loop starts, and the
             // worker drains the channel in order — but `Worker` is public API, and a

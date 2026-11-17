@@ -60,6 +60,19 @@ fn heading(text: &str) -> Line<'static> {
 ///
 /// Returning both halves from one call is what removes the `expect("checked above")` that
 /// used to follow every `placeholder()` test: there is no second lookup to get wrong.
+/// "showing 1,000 of 48,213 clients": the reply had no server-side bound, so all of it
+/// was received; only what is kept is capped.
+fn truncation_note(shown: usize, total: usize, what: &str, cmd: &str) -> Line<'static> {
+    Line::from(Span::styled(
+        format!(
+            "  showing {} of {} {what} -- {cmd} has no count, so the full list was received",
+            format::count(shown as u64),
+            format::count(total as u64),
+        ),
+        Theme::warn(),
+    ))
+}
+
 fn loaded<T>(state: &PaneState<T>) -> Result<&T, Vec<Line<'static>>> {
     state.value_or_message().map_err(|msg| {
         let style = if state.is_error() {
@@ -298,6 +311,12 @@ pub fn clients(app: &App) -> Vec<Line<'static>> {
         Span::styled(format!("{:>5}", "sub"), Theme::dim()),
         Span::styled("  cmd", Theme::dim()),
     ])];
+    if list.is_truncated() {
+        lines.insert(
+            0,
+            truncation_note(list.len(), list.total, "clients", "CLIENT LIST"),
+        );
+    }
 
     for c in list {
         // A long-idle connection is usually a leak or a forgotten subscriber.
@@ -409,6 +428,17 @@ pub fn pubsub(app: &App) -> Vec<Line<'static>> {
         Span::styled(format!("  {:<52}", "channel"), Theme::dim()),
         Span::styled("subscribers", Theme::dim()),
     ])];
+    if channels.is_truncated() {
+        lines.insert(
+            0,
+            truncation_note(
+                channels.len(),
+                channels.total,
+                "channels",
+                "PUBSUB CHANNELS",
+            ),
+        );
+    }
 
     for c in channels {
         lines.push(Line::from(vec![
