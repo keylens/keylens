@@ -13,7 +13,7 @@ use std::time::Duration;
 use keylens_bullmq::EventsStatus;
 use keylens_bullmq::QueueKeys;
 use keylens_bullmq::events::{EventKind, entry_id_ms};
-use keylens_conn::{Conn, Value, key_slot};
+use keylens_conn::{Conn, ConnOptions, Recovery, Value, key_slot};
 use tokio::sync::mpsc::Sender;
 use tracing::{debug, warn};
 
@@ -24,16 +24,15 @@ use crate::worker::Update;
 const BLOCK_MS: i64 = 1_000;
 /// Entries per stream per read. A burst larger than this is simply picked up next loop.
 const COUNT: i64 = 500;
-/// Consecutive `XREAD` failures before the reader stops trying.
+/// Backoff between failed attempts, doubled per failure, capped, and jittered.
 ///
-/// A retry loop with no ceiling is not resilience, it's a leak: against a server that
-/// denies `XREAD` by ACL, every attempt fails identically forever, and because the
-/// interactive build sends logs to a sink the user never learns why the graph is empty.
-/// Give up, say so, and stop spending a command a second on it.
-const MAX_CONSECUTIVE_FAILURES: u32 = 5;
-/// Backoff between failed reads, doubled per failure and capped.
-const RETRY_BASE: Duration = Duration::from_secs(1);
-const RETRY_MAX: Duration = Duration::from_secs(8);
+/// 0.1.7 gave up for good after five consecutive failures -- about fifteen seconds of
+/// outage -- so a Redis restart, a failover or a laptop waking from sleep left the graph
+/// dead for the rest of the session. Failures are now classified instead: a denial stops
+/// at once and says why ([`Recovery::Stop`]); anything else retries forever, at most one
+/// attempt per [`RETRY_MAX`], which is the whole cost of being wrong about "transient".
+const RETRY_BASE: Duration = Duration::from_millis(500);
+const RETRY_MAX: Duration = Duration::from_secs(30);
 
 /// One observed event.
 #[derive(Debug, Clone)]
@@ -41,6 +40,96 @@ pub struct StreamEvent {
     pub queue: String,
     pub kind: EventKind,
     pub at_ms: i64,
+}
+
+/// Exponential backoff with jitter.
+///
+/// Jitter so that several keylens sessions (or several readers) knocked off by the same
+/// restart do not reconnect in lockstep. Drawn from the standard library's per-process
+/// random hasher keys -- no RNG dependency for a few bits of spread.
+#[derive(Debug)]
+pub struct Backoff {
+    base: Duration,
+    max: Duration,
+    attempt: u32,
+}
+
+impl Backoff {
+    pub fn new(base: Duration, max: Duration) -> Self {
+        Self {
+            base,
+            max,
+            attempt: 0,
+        }
+    }
+
+    /// Delay before the next attempt: `base * 2^n` capped at `max`, then jittered into
+    /// `[d/2, d]` so the cap is never exceeded.
+    pub fn next_delay(&mut self) -> Duration {
+        let exp = self
+            .base
+            .saturating_mul(1u32 << self.attempt.min(16))
+            .min(self.max);
+        self.attempt = self.attempt.saturating_add(1);
+        let half = exp / 2;
+        let spread = u64::try_from(half.as_millis()).unwrap_or(u64::MAX).max(1);
+        let jitter = Duration::from_millis(random_u64() % spread);
+        (half + jitter).min(self.max)
+    }
+
+    /// Failures since the last success.
+    pub fn attempts(&self) -> u32 {
+        self.attempt
+    }
+
+    pub fn reset(&mut self) {
+        self.attempt = 0;
+    }
+}
+
+fn random_u64() -> u64 {
+    use std::hash::BuildHasher;
+    std::collections::hash_map::RandomState::new().hash_one(std::time::Instant::now())
+}
+
+/// Open the reader's own connection, retrying transient failures, then follow.
+///
+/// Its own connection because `XREAD BLOCK` holds the connection for the duration of the
+/// block, so sharing the worker's would stall every key lookup behind it.
+pub async fn follow(
+    url: String,
+    options: ConnOptions,
+    prefix: String,
+    queues: Vec<String>,
+    tx: Sender<Update>,
+) {
+    let mut backoff = Backoff::new(RETRY_BASE, RETRY_MAX);
+    loop {
+        match Conn::connect_with(&url, "events", options).await {
+            Ok(conn) => return run(conn, prefix, queues, tx).await,
+            Err(e) => {
+                warn!(error = %e, "could not open a connection for the event stream");
+                let status = match e.recovery() {
+                    // Say so in the UI. Interactive logs go to a sink, so a silent return
+                    // leaves the queue table claiming it is still "attaching…" forever.
+                    Recovery::Stop(why) => {
+                        tx.send(Update::EventsStatus(EventsStatus::Unavailable(why)))
+                            .await
+                            .ok();
+                        return;
+                    }
+                    Recovery::Retry => EventsStatus::Reconnecting {
+                        attempt: backoff.attempts().saturating_add(1),
+                        error: e.to_string(),
+                    },
+                };
+                if tx.send(Update::EventsStatus(status)).await.is_err() {
+                    return;
+                }
+                tokio::time::sleep(backoff.next_delay()).await;
+            }
+        }
+    }
 }
 
 /// Follow every queue's events stream until the channel closes.
@@ -89,6 +178,10 @@ pub async fn run(conn: Conn, prefix: String, queues: Vec<String>, tx: Sender<Upd
 
     // `$` means "only entries added from now on". Reading history would replay hours of
     // events into the first second of the graph and draw a spike that never happened.
+    //
+    // After an outage the cursors keep the last id each stream delivered, so the reader
+    // resumes exactly where it stopped -- no gap and no replay. A stream still at `$`
+    // (nothing seen yet) cannot be resumed; what it wrote during the outage is not shown.
     let mut ids: Vec<String> = vec!["$".to_string(); keys.len()];
 
     if tx
@@ -99,37 +192,47 @@ pub async fn run(conn: Conn, prefix: String, queues: Vec<String>, tx: Sender<Upd
         return;
     }
 
-    let mut failures: u32 = 0;
+    let mut backoff = Backoff::new(RETRY_BASE, RETRY_MAX);
 
     loop {
         let reply = match conn.xread(&keys, &ids, COUNT as u64, BLOCK_MS as u64).await {
             Ok(v) => v,
             Err(e) => {
-                // A blocking read that times out is not an error, but a dropped connection
-                // is. Back off and retry -- the graph degrades rather than the app dying --
-                // but only so many times, because a failure that repeats identically is a
-                // permanent one and retrying it forever helps nobody.
-                failures += 1;
-                warn!(error = %e, failures, "xread failed");
-
-                if failures >= MAX_CONSECUTIVE_FAILURES {
-                    warn!("giving up on the events stream after {failures} failures");
-                    tx.send(Update::EventsStatus(EventsStatus::Unavailable(
-                        e.to_string(),
-                    )))
-                    .await
-                    .ok();
+                warn!(error = %e, attempt = backoff.attempts(), "xread failed");
+                let status = match e.recovery() {
+                    // An ACL denial, an unknown command, a wrong-typed key: identical on
+                    // every attempt. Stop now -- 0.1.7 spent five attempts and ~15s on it.
+                    Recovery::Stop(why) => {
+                        tx.send(Update::EventsStatus(EventsStatus::Unavailable(why)))
+                            .await
+                            .ok();
+                        return;
+                    }
+                    Recovery::Retry => EventsStatus::Reconnecting {
+                        attempt: backoff.attempts().saturating_add(1),
+                        error: e.to_string(),
+                    },
+                };
+                if tx.send(Update::EventsStatus(status)).await.is_err() {
                     return;
                 }
-
-                tokio::time::sleep(retry_delay(failures)).await;
+                tokio::time::sleep(backoff.next_delay()).await;
                 continue;
             }
         };
 
-        // A read that came back resets the budget: a single blip mid-session must not
-        // count towards a ceiling meant for permanent failures.
-        failures = 0;
+        // A read that came back is recovery. Say so once, and reset the backoff so the
+        // next blip starts from the bottom again.
+        if backoff.attempts() > 0 {
+            backoff.reset();
+            if tx
+                .send(Update::EventsStatus(EventsStatus::Live))
+                .await
+                .is_err()
+            {
+                return;
+            }
+        }
 
         let events = parse_xread(&reply, &keys, &queues, &mut ids);
         if events.is_empty() {
@@ -223,14 +326,6 @@ fn parse_xread(
 
 fn as_text(v: &Value) -> String {
     v.as_string().unwrap_or_default()
-}
-
-/// Exponential backoff, capped. The cap matters more than the curve: the point is to stop
-/// hammering a server that is refusing us, not to converge on some ideal interval.
-fn retry_delay(failures: u32) -> Duration {
-    RETRY_BASE
-        .saturating_mul(1u32 << failures.min(5).saturating_sub(1))
-        .min(RETRY_MAX)
 }
 
 #[cfg(test)]
@@ -328,40 +423,34 @@ mod tests {
     }
 
     #[test]
-    fn retries_back_off_and_stop_climbing() {
-        // The point of the cap is to stop hammering a server that is refusing us. An
-        // uncapped doubling would also overflow the shift long before it got useful.
-        let delays: Vec<u64> = (1..=MAX_CONSECUTIVE_FAILURES)
-            .map(|f| retry_delay(f).as_secs())
-            .collect();
-
-        assert_eq!(
-            delays[0],
-            RETRY_BASE.as_secs(),
-            "first retry is immediate-ish"
-        );
+    fn backoff_climbs_to_its_cap_and_never_past_it() {
+        let mut b = Backoff::new(RETRY_BASE, RETRY_MAX);
+        let delays: Vec<Duration> = (0..40).map(|_| b.next_delay()).collect();
+        assert!(delays.iter().all(|d| *d <= RETRY_MAX), "{delays:?}");
         assert!(
-            delays.windows(2).all(|w| w[1] >= w[0]),
-            "delays must never shrink: {delays:?}"
+            delays[0] <= RETRY_BASE,
+            "the first retry is quick: {:?}",
+            delays[0]
         );
+        // Jitter keeps each delay within [cap/2, cap] once the cap is reached.
         assert!(
-            delays.iter().all(|d| *d <= RETRY_MAX.as_secs()),
-            "capped at {}s: {delays:?}",
-            RETRY_MAX.as_secs()
+            delays[20..].iter().all(|d| *d >= RETRY_MAX / 2),
+            "{delays:?}"
         );
+        assert_eq!(b.attempts(), 40);
+        b.reset();
+        assert_eq!(b.attempts(), 0);
+        assert!(b.next_delay() <= RETRY_BASE, "reset starts from the bottom");
     }
 
     #[test]
-    fn the_retry_budget_is_finite() {
-        // A loop with no ceiling is not resilience: against a permanent failure it spends
-        // one command a second, forever, with the log going to a sink.
-        const { assert!(MAX_CONSECUTIVE_FAILURES > 0) };
-        let total: u64 = (1..MAX_CONSECUTIVE_FAILURES)
-            .map(|f| retry_delay(f).as_secs())
-            .sum();
+    fn an_outage_of_any_length_costs_at_most_one_attempt_per_cap() {
+        // The bound that replaced "give up after five": command volume during an outage.
+        let mut b = Backoff::new(RETRY_BASE, RETRY_MAX);
+        let hour: Duration = (0..200).map(|_| b.next_delay()).sum();
         assert!(
-            total <= 60,
-            "the reader should give up inside a minute, not {total}s"
+            hour > Duration::from_secs(60 * 45),
+            "200 attempts took only {hour:?}"
         );
     }
 

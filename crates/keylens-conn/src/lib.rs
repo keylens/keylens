@@ -28,8 +28,8 @@ pub use fred::types::Map;
 
 pub use bounds::Capped;
 pub use capability::{Availability, Capabilities, Feature};
-pub use conn::{Conn, KeyScanner, ScanPage};
-pub use error::{ConnError, Result};
+pub use conn::{Conn, ConnOptions, KeyScanner, ScanPage};
+pub use error::{ConnError, Recovery, Result};
 pub use server::{ClientInfo, ClusterNode, ClusterTopology, PubSubChannel, SlowEntry};
 pub use server_info::{ServerInfo, Vendor};
 pub use stream::{ConsumerInfo, GroupInfo, StreamInfo};

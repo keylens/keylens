@@ -61,6 +61,15 @@ pub enum ConnError {
     #[error("command `{0}` is not allowed through the read-only connection API")]
     UnsafeCommand(&'static str),
 
+    /// The server rejected our credentials on a reconnect. Terminal: keylens has stopped
+    /// reconnecting rather than retry a password the server has already refused.
+    #[error(
+        "the server rejected keylens' credentials when reconnecting ({0}); stopped \
+         reconnecting. Was the password or ACL user changed? Restart keylens with valid \
+         credentials."
+    )]
+    AuthLost(String),
+
     /// A read-only command whose arguments ask for an unbounded or oversized read --
     /// `LRANGE k 0 -1`, `XRANGE` without `COUNT`, `SLOWLOG GET -1`. See [`crate::bounds`].
     #[error("refusing `{cmd}`: {detail}")]
@@ -157,9 +166,105 @@ fn to_tls_url(url: &str) -> String {
 
 pub type Result<T> = std::result::Result<T, ConnError>;
 
+/// What a long-running reader should do after a failure.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Recovery {
+    /// Likely to clear on its own: a dropped connection, a timeout, a server restarting
+    /// or loading its dataset. Back off and try again.
+    Retry,
+    /// Will fail the same way every time: an ACL denial, a wrong password, an unknown
+    /// command, a malformed request. Retrying spends a command per attempt for nothing,
+    /// so stop and say why.
+    Stop(String),
+}
+
+impl ConnError {
+    /// Classify this failure for a retry loop.
+    ///
+    /// Unknown failures retry. A reader that backs off to a ceiling costs one command per
+    /// interval while it is wrong; one that stops on a transient error stays dead for the
+    /// rest of the session, which is the failure this exists to remove.
+    pub fn recovery(&self) -> Recovery {
+        let first_line = |s: &str| s.lines().next().unwrap_or(s).trim().to_string();
+        match self {
+            ConnError::Command { source, .. } | ConnError::Connect(source) => {
+                if *source.kind() == fred::error::ErrorKind::Auth {
+                    return Recovery::Stop(first_line(source.details()));
+                }
+                let details = source.details();
+                let code = details.split_whitespace().next().unwrap_or_default();
+                match code {
+                    "NOPERM" | "NOAUTH" | "WRONGPASS" | "WRONGTYPE" => {
+                        Recovery::Stop(first_line(details))
+                    }
+                    "ERR" if details.to_ascii_lowercase().contains("unknown command") => {
+                        Recovery::Stop(first_line(details))
+                    }
+                    _ => Recovery::Retry,
+                }
+            }
+            ConnError::ConnectTimeout(_) => Recovery::Retry,
+            ConnError::AuthLost(why) => Recovery::Stop(why.clone()),
+            ConnError::LikelyNeedsTls { .. }
+            | ConnError::Url(_)
+            | ConnError::Reply { .. }
+            | ConnError::Range { .. }
+            | ConnError::UnsafeCommand(_)
+            | ConnError::Unbounded { .. } => Recovery::Stop(first_line(&self.to_string())),
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn command(kind: fred::error::ErrorKind, msg: &'static str) -> ConnError {
+        ConnError::Command {
+            cmd: "XREAD",
+            source: fred::error::Error::new(kind, msg),
+        }
+    }
+
+    #[test]
+    fn denials_stop_and_outages_retry() {
+        use fred::error::ErrorKind as K;
+        for (kind, msg) in [
+            (
+                K::Unknown,
+                "NOPERM User x has no permissions to run the 'xread' command",
+            ),
+            (K::Auth, "WRONGPASS invalid username-password pair"),
+            (K::Unknown, "NOAUTH Authentication required."),
+            (K::Unknown, "ERR unknown command 'XREAD'"),
+            (
+                K::Unknown,
+                "WRONGTYPE Operation against a key holding the wrong kind of value",
+            ),
+        ] {
+            assert!(
+                matches!(command(kind.clone(), msg).recovery(), Recovery::Stop(_)),
+                "{msg} must stop"
+            );
+        }
+        for (kind, msg) in [
+            (K::Timeout, "Request timed out."),
+            (K::IO, "Connection reset by peer"),
+            (K::Unknown, "LOADING Redis is loading the dataset in memory"),
+            (K::Unknown, "MASTERDOWN Link with MASTER is down"),
+            (K::Canceled, "Canceled."),
+        ] {
+            assert_eq!(
+                command(kind, msg).recovery(),
+                Recovery::Retry,
+                "{msg} must retry"
+            );
+        }
+        assert_eq!(
+            ConnError::ConnectTimeout("x".into()).recovery(),
+            Recovery::Retry
+        );
+    }
     use fred::error::{Error, ErrorKind};
 
     fn protocol_err() -> Error {

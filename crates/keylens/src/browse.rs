@@ -5,10 +5,8 @@ use std::time::Duration;
 use color_eyre::Result;
 use crossterm::event::{Event, EventStream, KeyEventKind};
 use futures::StreamExt;
-use keylens_bullmq::EventsStatus;
 use keylens_conn::{Conn, redact_url};
 use tokio::sync::mpsc;
-use tracing::warn;
 
 use crate::app::App;
 use crate::config::Target;
@@ -239,26 +237,13 @@ impl StreamerHandle {
         let url = self.url.clone();
         let tx = self.updates.clone();
 
-        self.task = Some(tokio::spawn(async move {
-            // Its own connection: `XREAD BLOCK` holds the connection for the duration of
-            // the block, so sharing the worker's would stall every key lookup behind it.
-            let conn = match Conn::connect(&url, "events").await {
-                Ok(c) => c,
-                Err(e) => {
-                    warn!(error = %e, "could not open a connection for the event stream");
-                    // Say so in the UI. Interactive logs go to a sink, so a silent return
-                    // leaves the queue table claiming it is still "attaching…" forever.
-                    tx.send(Update::EventsStatus(EventsStatus::Unavailable(
-                        e.to_string(),
-                    )))
-                    .await
-                    .ok();
-                    return;
-                }
-            };
-
-            crate::events::run(conn, prefix, queues, tx).await;
-        }));
+        self.task = Some(tokio::spawn(crate::events::follow(
+            url,
+            keylens_conn::ConnOptions::default(),
+            prefix,
+            queues,
+            tx,
+        )));
     }
 }
 
