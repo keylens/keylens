@@ -33,8 +33,17 @@ pub struct ScanPage {
 /// A Redis cursor belongs to one server, so a cluster scan cannot be represented by the
 /// single cursor string used by [`ScanPage`]. This wrapper owns fred's per-primary scanner
 /// state and exposes one page at a time without buffering the whole keyspace.
+/// One page from fred: the keys, and how many names were not valid UTF-8.
+type RawPage = std::result::Result<(Vec<String>, u64), fred::error::Error>;
+
 pub struct KeyScanner {
-    pages: Pin<Box<dyn Stream<Item = std::result::Result<Vec<String>, fred::error::Error>> + Send>>,
+    pages: Pin<Box<dyn Stream<Item = RawPage> + Send>>,
+    /// Keys whose names are not valid UTF-8, seen so far and not returned.
+    ///
+    /// keylens addresses keys by `String`, so a binary key name cannot be listed or read.
+    /// 0.1.7 dropped them without a trace; the tree then misrepresented the keyspace.
+    /// They are still not shown, but they are counted, and the count is reported.
+    unlisted: u64,
     /// Deadline for one page.
     ///
     /// fred sends scan pages without a response timeout -- `default_command_timeout` does
@@ -53,13 +62,12 @@ pub struct KeyScanner {
 
 impl KeyScanner {
     fn new(
-        pages: Pin<
-            Box<dyn Stream<Item = std::result::Result<Vec<String>, fred::error::Error>> + Send>,
-        >,
+        pages: Pin<Box<dyn Stream<Item = RawPage> + Send>>,
         page_timeout: std::time::Duration,
     ) -> Self {
         Self {
             pages,
+            unlisted: 0,
             page_timeout,
             failed: None,
         }
@@ -89,7 +97,10 @@ impl KeyScanner {
             ))),
         };
         match next {
-            Some(Ok(keys)) => Ok(Some(keys)),
+            Some(Ok((keys, unlisted))) => {
+                self.unlisted = self.unlisted.saturating_add(unlisted);
+                Ok(Some(keys))
+            }
             Some(Err(source)) => {
                 self.failed = Some(source.details().to_string());
                 Err(ConnError::Command {
@@ -101,24 +112,31 @@ impl KeyScanner {
         }
     }
 
+    /// Keys seen whose names are not valid UTF-8, and so were not returned.
+    pub fn unlisted(&self) -> u64 {
+        self.unlisted
+    }
+
     /// Whether this scan has failed, and so can never complete.
     pub fn has_failed(&self) -> bool {
         self.failed.is_some()
     }
 }
 
-/// Turn one fred scan page into its keys, and ask for the next one.
-fn page_keys(mut page: ScanResult) -> Vec<String> {
-    let keys = page
-        .take_results()
-        .unwrap_or_default()
+/// Turn one fred scan page into its keys (and a count of non-UTF-8 names), and ask for
+/// the next one.
+fn page_keys(mut page: ScanResult) -> (Vec<String>, u64) {
+    let raw = page.take_results().unwrap_or_default();
+    let total = raw.len();
+    let keys: Vec<String> = raw
         .into_iter()
         .filter_map(|key| key.into_string())
         .collect();
+    let unlisted = u64::try_from(total.saturating_sub(keys.len())).unwrap_or(u64::MAX);
     // Explicitly continue this node. Dropping also continues it, but spelling this out
     // makes the throttling contract independent of Drop behaviour.
     page.next();
-    keys
+    (keys, unlisted)
 }
 
 impl ScanPage {
@@ -396,9 +414,7 @@ impl Conn {
         check_scan_count(count)?;
         let pattern = pattern.unwrap_or("*").to_string();
         let scan_type = type_filter.and_then(parse_scan_type);
-        let pages: Pin<
-            Box<dyn Stream<Item = std::result::Result<Vec<String>, fred::error::Error>> + Send>,
-        > = if self.client.is_clustered() {
+        let pages: Pin<Box<dyn Stream<Item = RawPage> + Send>> = if self.client.is_clustered() {
             Box::pin(
                 self.client
                     .scan_cluster(pattern, Some(count), scan_type)
@@ -619,8 +635,19 @@ impl Conn {
                 })?;
         }
 
-        let replies = pipe.try_all::<Value>().await;
+        let mut replies = pipe.try_all::<Value>().await;
         if replies.len() != cmds.len() {
+            // fred answers a pipeline that failed as a whole -- a timeout, a dropped
+            // connection -- with that one error. Report it, not a "reply count" mismatch:
+            // 0.1.7 turned every pipeline timeout into "unexpected reply shape".
+            if let Some(pos) = replies.iter().position(|r| r.is_err())
+                && let Err(source) = replies.swap_remove(pos)
+            {
+                return Err(self.auth_failure().unwrap_or(ConnError::Command {
+                    cmd: "PIPELINE",
+                    source,
+                }));
+            }
             return Err(ConnError::Reply {
                 cmd: "PIPELINE",
                 detail: format!("expected {} replies, got {}", cmds.len(), replies.len()),
@@ -1003,7 +1030,7 @@ mod tests {
         // fred ends its scan stream after an error. 0.1.7 then returned `Ok(None)` on the
         // next call, and the browser printed "N keys" as though it had walked the lot.
         let pages = futures::stream::iter(vec![
-            Ok(vec!["a".to_string()]),
+            Ok((vec!["a".to_string()], 0)),
             Err(fred::error::Error::new(
                 fred::error::ErrorKind::Timeout,
                 "Request timed out.",
@@ -1028,12 +1055,17 @@ mod tests {
 
     #[tokio::test]
     async fn a_clean_scan_still_completes() {
-        let pages = futures::stream::iter(vec![Ok(vec!["a".to_string()]), Ok(vec![])]);
+        let pages = futures::stream::iter(vec![Ok((vec!["a".to_string()], 2)), Ok((vec![], 1))]);
         let mut scanner = KeyScanner::new(Box::pin(pages), COMMAND_TIMEOUT);
         assert!(scanner.next_page().await.unwrap().is_some());
         assert!(scanner.next_page().await.unwrap().is_some());
         assert_eq!(scanner.next_page().await.unwrap(), None);
         assert!(!scanner.has_failed());
+        assert_eq!(
+            scanner.unlisted(),
+            3,
+            "non-UTF-8 names are counted, not lost"
+        );
     }
 
     #[tokio::test(start_paused = true)]

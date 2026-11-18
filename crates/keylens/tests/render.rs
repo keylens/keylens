@@ -37,6 +37,7 @@ fn app_with(keys: &[&str]) -> (App, Receiver<Request>) {
         reset: true,
         progress: ScanProgress::Complete,
         scanned_pages: 1,
+        unlisted: 0,
     });
     (app, rx)
 }
@@ -749,6 +750,7 @@ fn splash_shows_the_wordmark_until_the_first_batch_lands() {
         reset: true,
         progress: ScanProgress::Complete,
         scanned_pages: 1,
+        unlisted: 0,
     });
     assert!(!app.splash);
     let out = render(&mut app, 100, 30);
@@ -980,6 +982,7 @@ async fn a_saturated_worker_never_blocks_the_ui() {
         reset: true,
         progress: ScanProgress::Complete,
         scanned_pages: 1,
+        unlisted: 0,
     });
 
     // Fill the single channel slot, then keep going. Each of these would previously have
@@ -1018,6 +1021,7 @@ async fn a_dropped_fetch_does_not_leave_the_pane_claiming_to_load_forever() {
         reset: true,
         progress: ScanProgress::Complete,
         scanned_pages: 1,
+        unlisted: 0,
     });
 
     // One slot, already occupied.

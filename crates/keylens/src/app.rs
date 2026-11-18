@@ -330,6 +330,7 @@ impl App {
                 reset,
                 progress,
                 scanned_pages,
+                unlisted,
             } => {
                 // A batch from a superseded scan describes a filter that is no longer
                 // applied. Dropping it also leaves `loading` alone: the scan the status
@@ -377,6 +378,13 @@ impl App {
                     self.status = format!(
                         "{n} keys -- tree limit reached; the scan stopped here. / to filter"
                     );
+                }
+                if unlisted > 0 {
+                    self.status.push_str(&format!(
+                        " - {} key{} with non-UTF-8 names not shown",
+                        keylens_ui::format::count(unlisted),
+                        if unlisted == 1 { "" } else { "s" }
+                    ));
                 }
                 self.rebuild();
             }
@@ -1096,6 +1104,7 @@ mod tests {
             reset: false,
             progress: ScanProgress::Complete,
             scanned_pages: 1,
+            unlisted: 0,
         }
     }
 
@@ -1266,6 +1275,7 @@ mod tests {
             reset: true,
             progress: ScanProgress::Partial,
             scanned_pages: 1,
+            unlisted: 0,
         });
 
         // Change the filter. The `More` answered for the old filter arrives after.
@@ -1278,6 +1288,7 @@ mod tests {
             reset: false,
             progress: ScanProgress::Complete,
             scanned_pages: 1,
+            unlisted: 0,
         });
         assert!(
             a.loading,
@@ -1295,6 +1306,7 @@ mod tests {
             reset: false,
             progress: ScanProgress::Failed("stale".into()),
             scanned_pages: 0,
+            unlisted: 0,
         });
         assert!(
             !a.status.contains("stale"),
@@ -1329,6 +1341,7 @@ mod tests {
             reset: true,
             progress: ScanProgress::Complete,
             scanned_pages: 1,
+            unlisted: 0,
         });
         assert!(a.stream.is_none(), "consumer groups outlived their key");
         assert!(a.pending_key().is_none());
@@ -1344,10 +1357,30 @@ mod tests {
             reset: true,
             progress: ScanProgress::Complete,
             scanned_pages: 1,
+            unlisted: 0,
         });
         assert_eq!(a.rows.len(), 1);
         // A lone key folds to a single row for its whole path.
         assert_eq!(a.rows[0].path, "new:1");
+    }
+
+    #[test]
+    fn keys_that_cannot_be_listed_are_counted_in_the_status() {
+        // 0.1.7 dropped non-UTF-8 key names without a trace.
+        let mut a = app();
+        a.apply(Update::Batch {
+            scan: RequestId::default(),
+            keys: vec![("k".into(), None)],
+            reset: true,
+            progress: ScanProgress::Complete,
+            scanned_pages: 1,
+            unlisted: 2,
+        });
+        assert!(
+            a.status.contains("2 keys with non-UTF-8 names not shown"),
+            "{}",
+            a.status
+        );
     }
 
     #[test]
@@ -1361,6 +1394,7 @@ mod tests {
             reset: true,
             progress: ScanProgress::Failed("Request timed out.".into()),
             scanned_pages: 3,
+            unlisted: 0,
         });
         assert!(!a.loading);
         assert!(!a.scan_complete, "a failed scan claimed to be complete");
@@ -1387,6 +1421,7 @@ mod tests {
             reset: true,
             progress: ScanProgress::Partial,
             scanned_pages: 1,
+            unlisted: 0,
         });
         assert_eq!(a.tree.len(), MAX_TREE_KEYS);
         assert!(a.tree_full);

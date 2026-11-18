@@ -222,7 +222,7 @@ jobs:
         uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
 
       - name: Start fixtures
-        run: docker compose up -d --build --wait
+        run: docker compose --profile recached up -d --build --wait
 
       - name: Let the producer build a backlog
         # The live tests assert on failed jobs with stack traces, a populated events
@@ -238,9 +238,51 @@ jobs:
       - name: cargo test --test faults
         run: cargo test --test faults -- --ignored --test-threads 1
 
+      - name: cargo test --test adversarial (Redis, Valkey)
+        run: |
+          cargo test --test adversarial -- --ignored --test-threads 1
+          KEYLENS_TEST_URL=redis://127.0.0.1:6380 cargo test --test adversarial -- --ignored --test-threads 1
+
+      # Both Recached read paths: 0.2.3 lacks HSCAN/SSCAN/GETRANGE (sequential path),
+      # 0.5.2 has them (speculative path).
+      - name: cargo test --test live (Recached 0.2.3, 0.5.2)
+        run: |
+          KEYLENS_TEST_RECACHED_URL=redis://127.0.0.1:6381 cargo test --test live -- --ignored
+          KEYLENS_TEST_RECACHED_URL=redis://127.0.0.1:6382 cargo test --test live -- --ignored
+
       - name: Fixture logs on failure
         if: failure()
         run: docker compose logs --tail 100
+
+  # ─── Cluster + Sentinel ────────────────────────────────────────────────────
+  topology:
+    name: Topology (Cluster + Sentinel)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+        with:
+          persist-credentials: false
+
+      - name: Install Rust (pinned)
+        uses: dtolnay/rust-toolchain@df2a88e9fe4098bad09cb42c3dec7187f15861fc # master
+        with:
+          toolchain: 1.98.0
+
+      - name: Cache
+        uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
+
+      - name: Start topology fixtures
+        run: docker compose --profile topology up -d --wait cluster sentinel
+
+      - name: cargo test --test topology
+        env:
+          KEYLENS_TEST_CLUSTER_URL: redis-cluster://127.0.0.1:7100
+          KEYLENS_TEST_SENTINEL_URL: redis-sentinel://:sentinel-pw@127.0.0.1:26390/0?sentinelServiceName=keylens
+        run: cargo test --test topology -- --ignored --test-threads 1
+
+      - name: Fixture logs on failure
+        if: failure()
+        run: docker compose --profile topology logs --tail 100
 
   # ─── Build check (all platforms) ───────────────────────────────────────────
   build:

@@ -8,7 +8,7 @@
 
 use fred::prelude::Value;
 
-use crate::bounds::{MAX_ENTRY_FIELDS, cap_element};
+use crate::bounds::{MAX_ELEMENT_BYTES, MAX_ENTRY_FIELDS};
 use crate::capability::Feature;
 use crate::conn::Conn;
 use crate::error::{ConnError, Result};
@@ -835,9 +835,35 @@ fn reply_byte_len(v: &Value) -> usize {
         .unwrap_or(0)
 }
 
-/// One element of a collection, as kept: rendered, then capped.
+/// One element of a collection, as kept: at most [`MAX_ELEMENT_BYTES`] of it.
+///
+/// An oversized element is rendered from its first bytes only. Rendering it whole and then
+/// capping copied every byte once more: a page of 200 one-MiB elements peaked at ~404 MiB
+/// RSS, twice the reply, for 3 MiB kept. The reply itself still has to arrive -- Redis has
+/// no per-element bound -- but it is no longer duplicated.
 fn element(v: &Value) -> String {
-    cap_element(display_string(v))
+    match v.as_bytes() {
+        Some(b) if b.len() > MAX_ELEMENT_BYTES => capped_element(b),
+        _ => display_string(v),
+    }
+}
+
+fn capped_element(b: &[u8]) -> String {
+    let head = b.get(..MAX_ELEMENT_BYTES).unwrap_or(b);
+    let text = match std::str::from_utf8(head) {
+        Ok(s) => s.to_string(),
+        // UTF-8 cut mid-character by the cap: keep the valid prefix.
+        Err(e) if e.error_len().is_none() => {
+            String::from_utf8_lossy(head.get(..e.valid_up_to()).unwrap_or_default()).into_owned()
+        }
+        // Binary: the same short preview `display_string` gives any binary value.
+        Err(_) => {
+            let preview = String::from_utf8_lossy(head.get(..200).unwrap_or(head));
+            return format!("<{} bytes> {preview}", b.len());
+        }
+    };
+    let shown = text.len();
+    format!("{text} … [{} bytes, first {shown} shown]", b.len())
 }
 
 fn as_string_vec(v: &Value) -> Vec<String> {
@@ -1221,6 +1247,21 @@ mod tests {
             args.get(2).and_then(Value::as_i64),
             Some(MAX_STRING_BYTES as i64)
         );
+    }
+
+    #[test]
+    fn an_oversized_element_is_capped_without_being_copied_whole() {
+        let big = Value::from("é".repeat(MAX_ELEMENT_BYTES)); // 2x the cap, multibyte
+        let kept = element(&big);
+        assert!(kept.len() <= MAX_ELEMENT_BYTES + 64, "{}", kept.len());
+        assert!(
+            kept.contains(&format!("[{} bytes", MAX_ELEMENT_BYTES * 2)),
+            "{kept:.80}"
+        );
+        let binary = Value::Bytes(vec![0xFF; MAX_ELEMENT_BYTES * 4].into());
+        assert!(element(&binary).starts_with(&format!("<{} bytes>", MAX_ELEMENT_BYTES * 4)));
+        // Small elements are untouched.
+        assert_eq!(element(&Value::from("small")), "small");
     }
 
     #[test]

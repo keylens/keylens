@@ -135,6 +135,9 @@ pub enum Update {
         reset: bool,
         progress: ScanProgress,
         scanned_pages: usize,
+        /// Keys this scan has seen whose names are not valid UTF-8 and cannot be listed.
+        /// Cumulative for the scan generation.
+        unlisted: u64,
     },
     Detail {
         id: RequestId,
@@ -299,6 +302,7 @@ impl Worker {
                                 reset: true,
                                 progress: ScanProgress::Failed(e.to_string()),
                                 scanned_pages: 0,
+                                unlisted: 0,
                             }
                         }
                     }
@@ -317,6 +321,7 @@ impl Worker {
                     reset: false,
                     progress: ScanProgress::Partial,
                     scanned_pages: 0,
+                    unlisted: 0,
                 },
                 Request::More { .. } => self.scan_batch(false).await,
 
@@ -459,8 +464,10 @@ impl Worker {
             }
         }
 
+        let unlisted = self.scanner.as_mut().map_or(0, |s| s.get_mut().unlisted());
         let typed = self.type_keys(keys).await;
         Update::Batch {
+            unlisted,
             scan: self.scan,
             keys: typed,
             reset,

@@ -132,30 +132,38 @@ impl Conn {
             })
             .collect();
 
-        // Every group's consumers and pending summary in ONE round trip. 0.1.7 issued them
-        // one after another: up to 64 sequential round trips to open one stream key,
-        // which at 390ms is twenty-five seconds of `loading…`.
+        // Every group's consumers, and the pending summary of each group that has pending
+        // entries, in ONE round trip. 0.1.7 issued them one after another: up to 64
+        // sequential round trips to open one stream key -- 1.2s for 20 groups at 50ms.
         let mut cmds: Vec<(&'static str, Vec<Value>)> = Vec::with_capacity(groups.len() * 2);
+        let mut pending_slot: Vec<Option<usize>> = Vec::with_capacity(groups.len());
         for g in &groups {
             cmds.push((
                 "XINFO",
                 vec!["CONSUMERS".into(), key.into(), g.name.as_str().into()],
             ));
-            cmds.push(("XPENDING", vec![key.into(), g.name.as_str().into()]));
+            if g.pending.is_some_and(|p| p > 0) {
+                cmds.push(("XPENDING", vec![key.into(), g.name.as_str().into()]));
+                pending_slot.push(Some(cmds.len() - 1));
+            } else {
+                pending_slot.push(None);
+            }
         }
         if !cmds.is_empty() {
             // A failure degrades the per-group detail, not the stream.
             if let Ok(replies) = self.pipeline(&cmds).await {
-                for (g, pair) in groups.iter_mut().zip(replies.chunks(2)) {
-                    if let Some(Ok(c)) = pair.first() {
+                let mut slot = 0usize;
+                for (g, pending_at) in groups.iter_mut().zip(&pending_slot) {
+                    if let Some(Ok(c)) = replies.get(slot) {
                         let all = parse_consumers(c);
                         g.consumers_total = all.len();
                         g.consumers = all.into_iter().take(MAX_LISTED).collect();
                     }
+                    slot += 1 + usize::from(pending_at.is_some());
                     // XPENDING's summary form gives the id range still outstanding, which
                     // is what tells you *how far back* the stall goes.
-                    if g.pending.is_some_and(|p| p > 0)
-                        && let Some(Ok(Value::Array(summary))) = pair.get(1)
+                    if let Some(at) = pending_at
+                        && let Some(Ok(Value::Array(summary))) = replies.get(*at)
                         && summary.len() >= 3
                     {
                         g.pending_min_id = display_string(&summary[1]);

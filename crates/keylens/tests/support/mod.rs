@@ -35,6 +35,8 @@ pub struct FaultProxy {
     accepted: Arc<AtomicU64>,
     /// Bytes forwarded client -> server, a proxy for command volume.
     upstream_bytes: Arc<AtomicU64>,
+    /// One-way delay added to every forwarded chunk, in microseconds: simulated distance.
+    delay_us: Arc<AtomicU64>,
     listener: JoinHandle<()>,
 }
 
@@ -48,13 +50,15 @@ impl FaultProxy {
         let conns: Arc<Mutex<Vec<JoinHandle<()>>>> = Arc::default();
         let accepted = Arc::new(AtomicU64::new(0));
         let upstream_bytes = Arc::new(AtomicU64::new(0));
+        let delay_us = Arc::new(AtomicU64::new(0));
 
         let task = {
-            let (mode, conns, accepted, upstream_bytes) = (
+            let (mode, conns, accepted, upstream_bytes, delay_us) = (
                 mode.clone(),
                 conns.clone(),
                 accepted.clone(),
                 upstream_bytes.clone(),
+                delay_us.clone(),
             );
             tokio::spawn(async move {
                 loop {
@@ -69,6 +73,7 @@ impl FaultProxy {
                     let upstream = upstream.clone();
                     let mode = mode.clone();
                     let upstream_bytes = upstream_bytes.clone();
+                    let delay_us = delay_us.clone();
                     let handle = tokio::spawn(async move {
                         let Ok(server) = TcpStream::connect(&upstream).await else {
                             return;
@@ -77,8 +82,8 @@ impl FaultProxy {
                         let _ = server.set_nodelay(true);
                         let (cr, cw) = client.into_split();
                         let (sr, sw) = server.into_split();
-                        let up = pump(cr, sw, mode.clone(), Some(upstream_bytes));
-                        let down = pump(sr, cw, mode, None);
+                        let up = pump(cr, sw, mode.clone(), Some(upstream_bytes), delay_us.clone());
+                        let down = pump(sr, cw, mode, None, delay_us);
                         tokio::select! {
                             () = up => {}
                             () = down => {}
@@ -95,6 +100,7 @@ impl FaultProxy {
             conns,
             accepted,
             upstream_bytes,
+            delay_us,
             listener: task,
         }
     }
@@ -102,6 +108,14 @@ impl FaultProxy {
     /// `redis://127.0.0.1:<port>` for this proxy, with optional credentials.
     pub fn url(&self) -> String {
         format!("redis://{}", self.addr)
+    }
+
+    /// Add `one_way` to every forwarded chunk in each direction (RTT is about twice it).
+    pub fn set_delay(&self, one_way: std::time::Duration) {
+        self.delay_us.store(
+            u64::try_from(one_way.as_micros()).unwrap_or(u64::MAX),
+            Ordering::SeqCst,
+        );
     }
 
     pub fn set_mode(&self, mode: Mode) {
@@ -142,6 +156,7 @@ async fn pump(
     mut to: tokio::net::tcp::OwnedWriteHalf,
     mode: Arc<AtomicU8>,
     counter: Option<Arc<AtomicU64>>,
+    delay_us: Arc<AtomicU64>,
 ) {
     let mut buf = vec![0u8; 64 * 1024];
     loop {
@@ -151,6 +166,10 @@ async fn pump(
         };
         if mode.load(Ordering::SeqCst) == Mode::Blackhole as u8 {
             continue; // read and discard: the peer sees an open, silent socket
+        }
+        let delay = delay_us.load(Ordering::SeqCst);
+        if delay > 0 {
+            tokio::time::sleep(std::time::Duration::from_micros(delay)).await;
         }
         if let Some(c) = &counter {
             c.fetch_add(n as u64, Ordering::SeqCst);

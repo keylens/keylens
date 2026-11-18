@@ -52,17 +52,84 @@ services:
   #   KEYLENS_TEST_RECACHED_URL=redis://127.0.0.1:6381 \
   #     cargo test --test live -- --ignored
   #
-  # The package is public, so no `docker login` is needed. It stays behind a profile
-  # so the ordinary two-server fixture doesn't pull a third image, and the Recached
-  # live tests skip unless the URL is set.
+  # The package is public (ghcr.io/recached-sh -- the old recached-dev path is denied,
+  # which aborted the whole `up`). It stays behind a profile so the ordinary two-server
+  # fixture doesn't pull a third image, and the Recached live tests skip unless the URL
+  # is set.
   recached:
-    image: ghcr.io/recached-dev/recached:v0.2.3
+    image: ghcr.io/recached-sh/recached:v0.2.3
     container_name: keylens-recached
     profiles: ["recached"]
     ports:
       - "6381:6379"
     environment:
       RECACHED_BIND: 0.0.0.0
+
+  # Current Recached, which has HSCAN/SSCAN/GETRANGE: the speculative read path.
+  #   KEYLENS_TEST_RECACHED_URL=redis://127.0.0.1:6382 cargo test --test live -- --ignored
+  recached-current:
+    image: ghcr.io/recached-sh/recached:v0.5.2
+    container_name: keylens-recached-current
+    profiles: ["recached"]
+    ports:
+      - "6382:6379"
+    environment:
+      RECACHED_BIND: 0.0.0.0
+
+  # Redis Cluster: three primaries in ONE container, announcing 127.0.0.1, so the
+  # addresses the cluster hands out (MOVED, CLUSTER SLOTS) are the ones the host can
+  # reach through the published ports. Separate containers would announce bridge IPs.
+  # 71xx, not 7000: macOS binds 7000 for AirPlay Receiver.
+  #   docker compose --profile topology up -d --wait
+  #   KEYLENS_TEST_CLUSTER_URL=redis-cluster://127.0.0.1:7100 \
+  #     cargo test --test topology -- --ignored
+  cluster:
+    image: redis:8-alpine
+    container_name: keylens-cluster
+    profiles: ["topology"]
+    ports:
+      - "7100-7102:7100-7102"
+    entrypoint: ["/bin/sh", "-c"]
+    command:
+      - |
+        for p in 7100 7101 7102; do
+          redis-server --port $$p --cluster-enabled yes --cluster-config-file /tmp/nodes-$$p.conf \
+            --cluster-announce-ip 127.0.0.1 --save '' --appendonly no --daemonize yes --dir /tmp
+        done
+        sleep 1
+        redis-cli --cluster create 127.0.0.1:7100 127.0.0.1:7101 127.0.0.1:7102 \
+          --cluster-replicas 0 --cluster-yes
+        exec tail -f /dev/null
+    healthcheck:
+      test: ["CMD-SHELL", "redis-cli -p 7100 cluster info | grep -q cluster_state:ok"]
+      interval: 2s
+      timeout: 2s
+      retries: 30
+
+  # Sentinel with a password, in front of one password-protected primary, in one
+  # container for the same address reason. keylens builds fred without `sentinel-auth`,
+  # so the url's userinfo credentials authenticate to both the sentinel and the primary
+  # (`?sentinelPassword=` is not read -- though it is redacted wherever a url is shown).
+  #   KEYLENS_TEST_SENTINEL_URL='redis-sentinel://:sentinel-pw@127.0.0.1:26390/0?sentinelServiceName=keylens' \
+  #     cargo test --test topology -- --ignored
+  sentinel:
+    image: redis:8-alpine
+    container_name: keylens-sentinel
+    profiles: ["topology"]
+    ports:
+      - "6390:6390"
+      - "26390:26390"
+    entrypoint: ["/bin/sh", "-c"]
+    command:
+      - |
+        redis-server --port 6390 --save '' --appendonly no --daemonize yes --requirepass sentinel-pw
+        printf 'port 26390\nsentinel monitor keylens 127.0.0.1 6390 1\nsentinel auth-pass keylens sentinel-pw\nsentinel down-after-milliseconds keylens 5000\nrequirepass sentinel-pw\n' > /tmp/sentinel.conf
+        exec redis-sentinel /tmp/sentinel.conf
+    healthcheck:
+      test: ["CMD-SHELL", "redis-cli -p 26390 -a sentinel-pw --no-auth-warning sentinel get-master-addr-by-name keylens | grep -q 6390"]
+      interval: 2s
+      timeout: 2s
+      retries: 30
 
   producer:
     build: ./fixtures

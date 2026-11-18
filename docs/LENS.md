@@ -44,6 +44,16 @@ often against production.
 - **Use the read-only command API.** `Conn::cmd` and `Conn::pipeline` reject commands and
   subcommands outside the audited allowlist. If a detector needs another read command, add
   and test that narrow form rather than exposing the raw client.
+- **Ask for bounded reads; expect a refusal otherwise.** Since 0.1.8 the same API checks
+  arguments: index ranges must be same-sign with a span of at most 1,000, `XRANGE` needs a
+  `COUNT`, `SCAN`-family `COUNT` is 1..=10,000, `SLOWLOG GET -1` and `XINFO … FULL` are
+  refused. A refused command fails with `ConnError::Unbounded` *before* anything is sent.
+  `Conn::key_scanner` returns a `Result` for the same reason. The per-command table in
+  `keylens_conn::bounds` says which replies are bounded on the wire and which (like
+  `PUBSUB CHANNELS`) cannot be — cap what you keep from those, and report the total.
+- **Unknown is not zero.** If a count fails, surface `None`/`?`; a `0` reads as "empty" on
+  exactly the queue that is broken. A `KeyScanner` that returned an error stays failed —
+  never treat a later `Ok(None)` from it as "everything was visited".
 - **`Ok(None)` means "not present."** Reserve `Err` for genuine failures. A detector that
   errors is logged and skipped — a broken lens must never stop someone from connecting,
   because the general browser works fine without any lens.

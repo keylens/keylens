@@ -229,8 +229,8 @@ fn list_connections() -> Result<()> {
         // The URL can carry a password, so it is masked rather than printed.
         println!(
             "  {:<width$}  {}{}",
-            c.name,
-            redact_url(&c.url),
+            keylens_ui::format::terminal_safe(&c.name),
+            keylens_ui::format::terminal_safe(&redact_url(&c.url)),
             if c.readonly { "  [readonly]" } else { "" }
         );
     }
