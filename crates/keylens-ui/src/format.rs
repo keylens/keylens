@@ -99,6 +99,40 @@ pub fn count(n: u64) -> String {
     out
 }
 
+/// Make untrusted text safe to write to a terminal outside ratatui.
+///
+/// Key names, queue names, `INFO` fields and server error text are all chosen by
+/// whoever can write to the server. Printed raw by the non-interactive commands, an
+/// `ESC ] 0 ; … BEL` retitled the terminal and `ESC [ 2 J` cleared it -- measured with a
+/// BullMQ queue named that way under `keylens probe --queues`. Control characters (C0,
+/// DEL, C1) and bidi overrides, which reorder what a reader sees, become visible escapes.
+/// The TUI does not need this: ratatui drops control characters from cells.
+pub fn terminal_safe(s: &str) -> String {
+    let mut out = String::with_capacity(s.len());
+    for c in s.chars() {
+        let bidi = matches!(c, '\u{202A}'..='\u{202E}' | '\u{2066}'..='\u{2069}');
+        if c.is_control() || bidi {
+            let n = u32::from(c);
+            if n <= 0xFF {
+                out.push_str(&format!("\\x{n:02x}"));
+            } else {
+                out.push_str(&format!("\\u{{{n:x}}}"));
+            }
+        } else {
+            out.push(c);
+        }
+    }
+    out
+}
+
+/// A count that may not be known. Unknown renders as `?`, never as `0`.
+///
+/// A count the server would not give us and a count of zero mean opposite things to
+/// someone deciding whether a queue is healthy, so they must not look alike.
+pub fn count_or_unknown(n: Option<u64>) -> String {
+    n.map_or_else(|| "?".to_string(), count)
+}
+
 /// Pretty-print a JSON payload, or return `None` when it isn't JSON.
 ///
 /// Job payloads are JSON far more often than not, and reading a minified blob in a pane
@@ -172,6 +206,20 @@ pub fn bar(fraction: f64, width: usize) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn terminal_safe_neutralises_escape_sequences_and_bidi_overrides() {
+        let evil = "evil\x1b]0;PWNED\x07\x1b[2J\r\x08\u{9b}31m\u{202E}txt";
+        let safe = terminal_safe(evil);
+        assert!(!safe.chars().any(|c| c.is_control()), "{safe:?}");
+        assert!(!safe.contains('\u{202E}'));
+        assert_eq!(
+            safe,
+            "evil\\x1b]0;PWNED\\x07\\x1b[2J\\x0d\\x08\\x9b31m\\u{202e}txt"
+        );
+        // Ordinary text, including non-ASCII, is untouched.
+        assert_eq!(terminal_safe("bull:emails — 日本"), "bull:emails — 日本");
+    }
 
     #[test]
     fn ttl_distinguishes_no_expiry_from_zero() {

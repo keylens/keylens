@@ -7,6 +7,90 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.1.8] — 2026-11-17
+
+Correctness, reliability and security hardening. No new features: every change makes an
+existing view more truthful, an existing failure recoverable, or an existing surface
+harder to misuse. Each was reproduced against 0.1.7 before it was fixed; see
+[docs/releases/0.1.8.md](docs/releases/0.1.8.md) for the evidence and the release-gate
+report.
+
+### Fixed
+
+- **Stale replies rendered under the wrong item.** A job detail had no identity (open job
+  A, then B: A's reply rendered under B); a job page was matched on its state only, so one
+  queue's `failed` page could render under another's; an old key's error, or a failed
+  `INFO` refresh, replaced the selected key's value. Every request now carries an id and
+  only the newest reply of each kind is applied.
+- **Unknown rendered as zero.** A failed `LLEN`/`ZCARD` showed "0 waiting", an unread meta
+  hash showed "running", a failed size showed `size 0`, and a negative `XINFO` count
+  wrapped to 18 quintillion. Unknown values now render as `?`.
+- **A failed scan reported itself complete**, after dropping the keys it had gathered.
+  Failure is now permanent for that scan, keeps its keys, and says "incomplete".
+- **Partial values looked whole.** The first bounded page of a value is labelled
+  ("showing 200 of 5,000"); `HSCAN`/`SSCAN` coverage comes from the cursor and the page
+  cap; an exactly-64 KiB string is no longer marked truncated.
+- **"Key no longer exists" for keys that exist**: under a key-pattern ACL, `TYPE` is denied
+  and was read as type `none`. A key that changes type mid-read now says so.
+- **A half-open connection wedged the browser.** A `SCAN` page had no response timeout
+  (still waiting after 60s, measured), and the worker serves requests in order. Pages are
+  now bounded by the command timeout.
+- **Live throughput died for the session after an outage** (0.1.7 gave up after ~115s of
+  outage and never resumed). The events reader now reconnects with jittered backoff capped
+  at 30s, shows "reconnecting", and stops at once only on a denial (`NOPERM`, wrong
+  password, unknown command).
+- **A rotated password produced endless "Request timed out"** while the client retried the
+  stale password forever. keylens now stops reconnecting and says the credentials were
+  rejected.
+- **Sentinel passwords were printed in clear** by `probe`, `connections` and the status
+  bar (`?sentinelPassword=`). Credential-like query parameters are masked.
+- **Terminal escape injection** through `keylens probe --queues`: a queue (key) name
+  containing `ESC ] 0 ; … BEL` retitled the terminal and `ESC [ 2 J` cleared it. Control
+  and bidi characters from the server are now printed as visible escapes.
+- **The installer installed a tampered archive.** `install.sh` now verifies the archive
+  against `checksums.txt` and fails closed.
+- Stream group detail took two sequential round trips per group (42 for 20 groups); it is
+  now one pipeline (3 round trips).
+- Keys whose names are not valid UTF-8 were dropped without a trace; they are now counted
+  in the status bar (they still cannot be opened).
+
+### Changed
+
+- The connection layer refuses read-only commands with unbounded arguments
+  (`LRANGE k 0 -1`, `XRANGE` without `COUNT`, `SLOWLOG GET -1`, `SCAN COUNT 10⁸`,
+  `MEMORY USAGE … SAMPLES 0`, `XINFO STREAM … FULL`) before they reach the server, with
+  `ConnError::Unbounded`. `keylens_conn::bounds` documents, per command, what is bounded on
+  the wire and what cannot be.
+- What keylens keeps is bounded: 16 KiB per element, 128 fields per stream entry, 1,000
+  rows (with the true total) for `CLIENT LIST`, `PUBSUB CHANNELS` and consumers, 500,000
+  keys in the tree.
+- `KEYLENS_LOG_FILE` is created owner-only (`0600`) and a symlinked path is refused. A
+  config file holding passwords that others can read, and a password in `--url`, each get
+  a one-line warning.
+- CI and release: read-only default token, every action pinned to a commit SHA (with
+  Dependabot), no persisted checkout credentials, the release tag passed via `env`,
+  actionlint from a checksum-verified release, `--locked` builds, and signed build
+  provenance for release archives (`gh attestation verify`).
+- Dependencies updated for RUSTSEC-2026-0285, -0346, -0348, -0349 (rustls), -0382
+  (rustls-webpki) and -0386 (tokio), which had failed the weekly supply-chain job since
+  2026-09-21.
+- The Sentinel url example in the README was wrong; it is
+  `redis-sentinel://host:26379/0?sentinelServiceName=mymaster`.
+
+### Added
+
+- Test suites against real servers: `faults` (a proxy that blackholes, refuses, severs or
+  delays), `adversarial` (hostile names, huge values, thousands of consumers and channels,
+  malformed BullMQ records), and `topology` (Redis Cluster and Sentinel), all in CI, plus
+  both Recached read paths. Compose gains the `topology` profile and Recached 0.5.2, and
+  the Recached image path is fixed (`ghcr.io/recached-sh`).
+- `cargo run --example bench` and `bench/run.sh`: per-scenario wall time, server command
+  count, retained bytes, peak RSS and CPU, with injectable latency.
+- Library: `ConnOptions`/`Conn::connect_with`, `Coverage`/`KeyRead`, `Capped<T>`,
+  `Recovery`, `ConnError::{Unbounded, AuthLost}`, `KeyValue::Changed`,
+  `EventsStatus::Reconnecting`, `QueueList`. Several public signatures changed to carry
+  unknowns (`Option`) and coverage; see the release notes.
+
 ## [0.1.7] — 2026-09-05
 
 Security and correctness pass over untrusted input, plus the toolchain gates that catch it.

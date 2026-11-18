@@ -1,10 +1,10 @@
 //! Application state and input handling.
 
 use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
-use keylens_bullmq::{JobRef, QueueSummary, State, Throughput};
+use keylens_bullmq::{JobRef, QueueList, QueueSummary, State, Throughput};
 use keylens_conn::{
-    ClientInfo, ClusterTopology, KeyMeta, KeyValue, Kind, PubSubChannel, ServerInfo, SlowEntry,
-    StreamInfo, redact_url,
+    Capped, ClientInfo, ClusterTopology, Coverage, KeyMeta, KeyValue, Kind, PubSubChannel,
+    ServerInfo, SlowEntry, StreamInfo, redact_url,
 };
 use keylens_lens::Detection;
 use keylens_ui::KeyTree;
@@ -13,7 +13,7 @@ use keylens_ui::tree::Row;
 use ratatui::widgets::ListState;
 use tokio::sync::mpsc::Sender;
 
-use crate::worker::{JobDetail, Request, Update};
+use crate::worker::{JobDetail, Request, RequestId, ScanProgress, Update};
 
 /// The top-level tabs.
 ///
@@ -88,8 +88,45 @@ const KIND_CYCLE: [Option<Kind>; 7] = [
     Some(Kind::Stream),
 ];
 
+/// Most keys the tree will hold.
+///
+/// Every `m` adds a batch, and nothing else bounds the tree. Past this the browser stops
+/// asking for more and says why: a filter is the way to look at a keyspace this size, and
+/// a tree of millions of rows is neither navigable nor cheap to rebuild on every batch.
+pub const MAX_TREE_KEYS: usize = 500_000;
+
 fn worker_busy<T>() -> PaneState<T> {
     PaneState::Failed("worker busy — press r to retry".into())
+}
+
+/// The newest request issued for each kind of reply.
+///
+/// A reply is applied only when it answers the request recorded here. Anything else
+/// answers a question the user has stopped asking — a key they scrolled past, a job they
+/// backed out of, a scan whose filter they changed — and painting it would show one
+/// thing's data under another thing's heading.
+#[derive(Debug, Default)]
+struct Pending {
+    /// The current scan generation. Batches from any other generation are dropped.
+    scan: RequestId,
+    /// The key read the value pane is waiting on, and which key it was.
+    detail: Option<(RequestId, String)>,
+    /// The newest stats refresh *applied*. Stats are accepted newest-wins rather than
+    /// exact-match because the worker coalesces refreshes: it skips a tick while one is
+    /// still out, so the newest *issued* id may never be answered at all.
+    info_applied: RequestId,
+    slowlog: Option<RequestId>,
+    clients: Option<RequestId>,
+    cluster: Option<RequestId>,
+    pubsub: Option<RequestId>,
+    queues: Option<RequestId>,
+    jobs: Option<RequestId>,
+    job: Option<RequestId>,
+}
+
+/// Whether a reply for `id` answers the request recorded in `slot`.
+fn answers(slot: Option<RequestId>, id: RequestId) -> bool {
+    slot == Some(id)
 }
 
 pub struct App {
@@ -101,12 +138,16 @@ pub struct App {
     pub list_state: ListState,
 
     pub detail: Option<(KeyMeta, KeyValue)>,
+    /// Whether `detail`'s value is the whole value or its first bounded page.
+    pub coverage: Coverage,
     /// Consumer-group state for the selected key, when it's a stream.
     pub stream: Option<Box<StreamInfo>>,
     pub detail_scroll: u16,
-    /// Key whose detail we asked for most recently. Replies for anything else are stale
-    /// -- they arrive when the user scrolls faster than the server answers.
-    pending_key: Option<String>,
+    /// The newest request of each kind; see [`Pending`].
+    pending: Pending,
+    /// Last id handed out. Ids are issued here, not by the worker, so that a request
+    /// and the check on its reply cannot disagree about what was asked.
+    last_id: RequestId,
     /// The cursor moved and the key under it has not been fetched yet.
     ///
     /// Cursor movement marks; the event loop fetches once the keys stop coming. Firing a
@@ -125,14 +166,14 @@ pub struct App {
     /// Scroll offset for whichever server pane is showing.
     pub pane_scroll: u16,
     pub slowlog: PaneState<Vec<SlowEntry>>,
-    pub clients: PaneState<Vec<ClientInfo>>,
+    pub clients: PaneState<Capped<ClientInfo>>,
     pub cluster: PaneState<Box<ClusterTopology>>,
-    pub pubsub: PaneState<Vec<PubSubChannel>>,
+    pub pubsub: PaneState<Capped<PubSubChannel>>,
 
     /// Lenses that matched this keyspace. Non-empty is what makes the queues tab appear.
     pub detections: Vec<Detection>,
     pub level: QueueLevel,
-    pub queues: PaneState<Vec<QueueSummary>>,
+    pub queues: PaneState<QueueList>,
     pub queue_selected: usize,
     pub job_state: State,
     pub jobs: PaneState<Vec<JobRef>>,
@@ -142,11 +183,18 @@ pub struct App {
     pub throughput: Throughput,
 
     pub server: ServerInfo,
+    /// Why the last stats refresh failed, if it did. Shown on the stats pane — a failed
+    /// `INFO` is not a reason to hide the value of the key being inspected.
+    pub info_error: Option<String>,
     pub url: String,
     pub status: String,
+    /// A failure of the current scan or of the selected key's read. Rendered in place of
+    /// the value, so it must only ever describe the current scan or the selected key.
     pub error: Option<String>,
     pub loading: bool,
     pub scan_complete: bool,
+    /// The tree reached [`MAX_TREE_KEYS`]; `m` no longer asks for more.
+    pub tree_full: bool,
     /// Covers the gap between "process started" and "first keys arrived", which on a cold
     /// remote keyspace is a real second or two of otherwise-blank screen.
     pub splash: bool,
@@ -163,9 +211,11 @@ impl App {
             selected: 0,
             list_state: ListState::default(),
             detail: None,
+            coverage: Coverage::Complete,
             stream: None,
             detail_scroll: 0,
-            pending_key: None,
+            pending: Pending::default(),
+            last_id: RequestId::default(),
             selection_dirty: false,
             focus: Focus::Tree,
             mode: Mode::Normal,
@@ -189,6 +239,7 @@ impl App {
             job: PaneState::Idle,
             throughput: Throughput::default(),
             server,
+            info_error: None,
             // App is public within the library, so enforce the display boundary here too;
             // callers should not have to remember that Redis URLs can contain passwords.
             url: redact_url(&url),
@@ -198,6 +249,7 @@ impl App {
             error: None,
             loading: true,
             scan_complete: false,
+            tree_full: false,
             splash: true,
             quit: false,
             tx,
@@ -208,12 +260,53 @@ impl App {
         self.rows.get(self.selected)
     }
 
-    /// The key whose detail reply the app will currently accept.
+    /// Hand out the next request id.
+    fn issue(&mut self) -> RequestId {
+        self.last_id = self.last_id.next();
+        self.last_id
+    }
+
+    /// Record that the value pane is waiting on `key`, returning the id its reply must
+    /// carry.
     ///
     /// Exposed so tests can stage a selection without driving the worker; the staleness
     /// rule in [`App::apply`] depends on it.
-    pub fn set_pending_key(&mut self, key: Option<String>) {
-        self.pending_key = key;
+    pub fn expect_detail(&mut self, key: impl Into<String>) -> RequestId {
+        let id = self.issue();
+        self.pending.detail = Some((id, key.into()));
+        id
+    }
+
+    /// The key the value pane is waiting on, if any.
+    pub fn pending_key(&self) -> Option<&str> {
+        self.pending.detail.as_ref().map(|(_, k)| k.as_str())
+    }
+
+    /// Stage the pending request for a queue-view reply, for tests. Returns the id the
+    /// reply must carry.
+    pub fn expect_queues(&mut self) -> RequestId {
+        let id = self.issue();
+        self.pending.queues = Some(id);
+        id
+    }
+
+    /// See [`expect_queues`](Self::expect_queues).
+    pub fn expect_jobs(&mut self) -> RequestId {
+        let id = self.issue();
+        self.pending.jobs = Some(id);
+        id
+    }
+
+    /// See [`expect_queues`](Self::expect_queues).
+    pub fn expect_job(&mut self) -> RequestId {
+        let id = self.issue();
+        self.pending.job = Some(id);
+        id
+    }
+
+    /// The current scan generation, for tests that stage a batch.
+    pub fn scan_generation(&self) -> RequestId {
+        self.pending.scan
     }
 
     /// Rebuild the visible rows, keeping the cursor on the same path where possible.
@@ -232,46 +325,85 @@ impl App {
     pub fn apply(&mut self, update: Update) {
         match update {
             Update::Batch {
+                scan,
                 keys,
                 reset,
-                complete,
+                progress,
                 scanned_pages,
+                unlisted,
             } => {
+                // A batch from a superseded scan describes a filter that is no longer
+                // applied. Dropping it also leaves `loading` alone: the scan the status
+                // bar is waiting on has not answered yet.
+                if scan != self.pending.scan {
+                    return;
+                }
                 if reset {
+                    self.tree_full = false;
                     self.tree.clear_keys();
                     self.selected = 0;
                     self.detail = None;
+                    // The stream panel belongs to the detail it was read with. Clearing
+                    // one without the other left a previous key's consumer groups on
+                    // screen above an empty value pane.
+                    self.stream = None;
+                    self.pending.detail = None;
                 }
-                for (key, kind) in keys {
+                let room = MAX_TREE_KEYS.saturating_sub(self.tree.len());
+                let over_budget = keys.len() > room;
+                for (key, kind) in keys.into_iter().take(room) {
                     self.tree.insert_with_kind(&key, kind);
                 }
-                self.scan_complete = complete;
+                self.scan_complete = progress == ScanProgress::Complete;
                 self.loading = false;
-                self.error = None;
                 // The first batch is the signal that there's something worth showing.
                 self.splash = false;
-                self.status = if complete {
-                    format!("{} keys", keylens_ui::format::count(self.tree.len() as u64))
-                } else {
-                    format!(
-                        "{} keys so far ({scanned_pages} page{}) - `m` for more",
-                        keylens_ui::format::count(self.tree.len() as u64),
+                let n = keylens_ui::format::count(self.tree.len() as u64);
+                self.status = match progress {
+                    ScanProgress::Complete => format!("{n} keys"),
+                    ScanProgress::Partial => format!(
+                        "{n} keys so far ({scanned_pages} page{}) - `m` for more",
                         if scanned_pages == 1 { "" } else { "s" }
-                    )
+                    ),
+                    // The status bar, not the value pane: the keys listed are real, the
+                    // selected key's value is unaffected, and the honest summary is "this
+                    // is not the whole keyspace".
+                    ScanProgress::Failed(why) => {
+                        format!("scan failed after {n} keys (incomplete) - r to rescan: {why}")
+                    }
                 };
+                if over_budget || self.tree.len() >= MAX_TREE_KEYS {
+                    self.tree_full = true;
+                    self.scan_complete = false;
+                    self.status = format!(
+                        "{n} keys -- tree limit reached; the scan stopped here. / to filter"
+                    );
+                }
+                if unlisted > 0 {
+                    self.status.push_str(&format!(
+                        " - {} key{} with non-UTF-8 names not shown",
+                        keylens_ui::format::count(unlisted),
+                        if unlisted == 1 { "" } else { "s" }
+                    ));
+                }
                 self.rebuild();
             }
 
             Update::Detail {
+                id,
                 meta,
                 value,
+                coverage,
                 stream,
             } => {
-                // Drop replies for a key the user has already scrolled past.
-                if self.pending_key.as_deref() == Some(meta.key.as_str()) {
+                // Drop replies for a key the user has already scrolled past -- and for an
+                // older read of the *same* key, which the key name alone cannot tell
+                // apart from the current one.
+                if self.pending.detail.as_ref().map(|(want, _)| *want) == Some(id) {
                     self.detail_scroll = 0;
                     self.stream = stream;
                     self.detail = Some((*meta, *value));
+                    self.coverage = coverage;
                     // A key that loaded is proof the last failure is over. The value pane
                     // renders `error` in place of the value, so leaving a stale one set
                     // meant one bad key hid every key selected after it until a rescan.
@@ -279,17 +411,51 @@ impl App {
                 }
             }
 
-            Update::Info(info) => self.server = *info,
-
-            Update::Error(e) => {
-                self.loading = false;
-                self.error = Some(e);
+            Update::DetailFailed { id, key, error } => {
+                // A failure is a reply like any other. Applied unconditionally, an old
+                // key's error replaced the value of whichever key was selected when it
+                // happened to arrive.
+                if self.pending.detail.as_ref().map(|(want, _)| *want) == Some(id) {
+                    self.detail = None;
+                    self.stream = None;
+                    self.error = Some(format!("{key}: {error}"));
+                }
             }
 
-            Update::Slowlog(s) => self.slowlog = s,
-            Update::Clients(s) => self.clients = s,
-            Update::Cluster(s) => self.cluster = s,
-            Update::PubSub(s) => self.pubsub = s,
+            Update::Info { id, info } => {
+                if id > self.pending.info_applied {
+                    self.pending.info_applied = id;
+                    self.server = *info;
+                    self.info_error = None;
+                }
+            }
+            Update::InfoFailed { id, error } => {
+                if id > self.pending.info_applied {
+                    self.pending.info_applied = id;
+                    self.info_error = Some(error);
+                }
+            }
+
+            Update::Slowlog { id, data } => {
+                if answers(self.pending.slowlog, id) {
+                    self.slowlog = data;
+                }
+            }
+            Update::Clients { id, data } => {
+                if answers(self.pending.clients, id) {
+                    self.clients = data;
+                }
+            }
+            Update::Cluster { id, data } => {
+                if answers(self.pending.cluster, id) {
+                    self.cluster = data;
+                }
+            }
+            Update::PubSub { id, data } => {
+                if answers(self.pending.pubsub, id) {
+                    self.pubsub = data;
+                }
+            }
 
             Update::Detected(d) => self.detections = d,
             Update::EventsStatus(s) => self.throughput.status = s,
@@ -298,22 +464,33 @@ impl App {
                     self.throughput.record(&e.queue, e.kind, e.at_ms);
                 }
             }
-            Update::Queues(s) => {
-                if let Some(list) = s.ready() {
+            Update::Queues { id, data } => {
+                if !answers(self.pending.queues, id) {
+                    return;
+                }
+                if let Some(list) = data.ready() {
                     self.queue_selected = self.queue_selected.min(list.len().saturating_sub(1));
                 }
-                self.queues = s;
+                self.queues = data;
             }
-            Update::Jobs { state, data } => {
-                // Ignore a page for a state the user has already cycled away from.
-                if state == self.job_state {
-                    if let Some(list) = data.ready() {
-                        self.job_selected = self.job_selected.min(list.len().saturating_sub(1));
-                    }
-                    self.jobs = data;
+            Update::Jobs { id, data } => {
+                // Only the page for the newest (queue, state) asked for. Matching on the
+                // state alone let one queue's `failed` page render under another's.
+                if !answers(self.pending.jobs, id) {
+                    return;
+                }
+                if let Some(list) = data.ready() {
+                    self.job_selected = self.job_selected.min(list.len().saturating_sub(1));
+                }
+                self.jobs = data;
+            }
+            Update::Job { id, data } => {
+                // The job detail had no identity at all: open job A, back out, open job B,
+                // and A's reply rendered under B's id.
+                if answers(self.pending.job, id) {
+                    self.job = data;
                 }
             }
-            Update::Job(s) => self.job = s,
         }
     }
 
@@ -371,12 +548,12 @@ impl App {
                     self.rescan().await;
                 }
             }
-            View::Stats => {
-                let _ = self.send(Request::RefreshInfo).await;
-            }
+            View::Stats => self.refresh_info().await,
             View::Slowlog => {
                 if force || self.slowlog.is_idle() {
-                    self.slowlog = if self.send(Request::LoadSlowlog).await {
+                    let id = self.issue();
+                    self.slowlog = if self.send(Request::LoadSlowlog { id }).await {
+                        self.pending.slowlog = Some(id);
                         PaneState::Loading
                     } else {
                         worker_busy()
@@ -385,7 +562,9 @@ impl App {
             }
             View::Clients => {
                 if force || self.clients.is_idle() {
-                    self.clients = if self.send(Request::LoadClients).await {
+                    let id = self.issue();
+                    self.clients = if self.send(Request::LoadClients { id }).await {
+                        self.pending.clients = Some(id);
                         PaneState::Loading
                     } else {
                         worker_busy()
@@ -394,7 +573,9 @@ impl App {
             }
             View::Cluster => {
                 if force || self.cluster.is_idle() {
-                    self.cluster = if self.send(Request::LoadCluster).await {
+                    let id = self.issue();
+                    self.cluster = if self.send(Request::LoadCluster { id }).await {
+                        self.pending.cluster = Some(id);
                         PaneState::Loading
                     } else {
                         worker_busy()
@@ -403,7 +584,9 @@ impl App {
             }
             View::PubSub => {
                 if force || self.pubsub.is_idle() {
-                    self.pubsub = if self.send(Request::LoadPubSub).await {
+                    let id = self.issue();
+                    self.pubsub = if self.send(Request::LoadPubSub { id }).await {
+                        self.pending.pubsub = Some(id);
                         PaneState::Loading
                     } else {
                         worker_busy()
@@ -413,7 +596,9 @@ impl App {
             View::Queues => match self.level {
                 QueueLevel::Queues => {
                     if force || self.queues.is_idle() {
-                        self.queues = if self.send(Request::LoadQueues).await {
+                        let id = self.issue();
+                        self.queues = if self.send(Request::LoadQueues { id }).await {
+                            self.pending.queues = Some(id);
                             PaneState::Loading
                         } else {
                             worker_busy()
@@ -431,7 +616,9 @@ impl App {
             return;
         };
         let state = self.job_state;
-        self.jobs = if self.send(Request::LoadJobs { queue, state }).await {
+        let id = self.issue();
+        self.jobs = if self.send(Request::LoadJobs { id, queue, state }).await {
+            self.pending.jobs = Some(id);
             PaneState::Loading
         } else {
             worker_busy()
@@ -442,10 +629,12 @@ impl App {
         let Some(queue) = self.selected_queue().map(|q| q.name.clone()) else {
             return;
         };
-        let Some(id) = self.selected_job().map(|j| j.id.clone()) else {
+        let Some(job) = self.selected_job().map(|j| j.id.clone()) else {
             return;
         };
-        self.job = if self.send(Request::LoadJob { queue, id }).await {
+        let id = self.issue();
+        self.job = if self.send(Request::LoadJob { id, queue, job }).await {
+            self.pending.job = Some(id);
             PaneState::Loading
         } else {
             worker_busy()
@@ -564,6 +753,13 @@ impl App {
         }
     }
 
+    /// Ask for a stats refresh. Called on the refresh tick and when the stats tab opens.
+    pub async fn refresh_info(&mut self) {
+        let id = self.issue();
+        // A full channel just skips this tick; the next one asks again.
+        let _ = self.send(Request::RefreshInfo { id }).await;
+    }
+
     /// Note that the cursor moved, without fetching yet.
     ///
     /// The fetch happens in [`flush_selection`](Self::flush_selection) once input goes
@@ -593,30 +789,42 @@ impl App {
         if !is_key {
             self.detail = None;
             self.stream = None;
-            self.pending_key = None;
+            self.pending.detail = None;
             return;
         }
 
         // Already showing it, or already asked for it: a repeat keypress on the same row
         // must not re-fetch.
-        if self.pending_key.as_deref() == Some(path.as_str()) {
+        if self.pending_key() == Some(path.as_str()) {
             return;
         }
 
-        self.pending_key = Some(path.clone());
-        if !self.send(Request::Select { key: path }).await {
+        let id = self.expect_detail(path.clone());
+        if !self.send(Request::Select { id, key: path }).await {
             // The worker is saturated. Leave it dirty so the next idle tick retries
             // rather than the pane sitting on `loading…` for a request that never went.
-            self.pending_key = None;
+            self.pending.detail = None;
             self.selection_dirty = true;
         }
     }
 
-    async fn rescan(&mut self) {
+    /// Start a new scan generation with the current filter.
+    pub async fn rescan(&mut self) {
         let (pattern, kind) = (self.pattern.clone(), self.kind_filter);
-        if self.send(Request::Rescan { pattern, kind }).await {
+        let scan = self.issue();
+        if self
+            .send(Request::Rescan {
+                scan,
+                pattern,
+                kind,
+            })
+            .await
+        {
+            // Only once it is actually queued: a rejected rescan leaves the previous
+            // generation's batches as the ones worth applying.
+            self.pending.scan = scan;
             self.loading = true;
-            self.status = "scanning…".into();
+            self.status = "scanning keyspace…".into();
             self.scan_complete = false;
         } else {
             self.loading = false;
@@ -751,8 +959,14 @@ impl App {
             }
 
             KeyCode::Char('m') => {
-                if !self.scan_complete {
-                    if self.send(Request::More).await {
+                if self.tree_full {
+                    self.status = format!(
+                        "tree limit of {} keys reached -- / to filter",
+                        keylens_ui::format::count(MAX_TREE_KEYS as u64)
+                    );
+                } else if !self.scan_complete {
+                    let scan = self.pending.scan;
+                    if self.send(Request::More { scan }).await {
                         self.loading = true;
                     } else {
                         self.loading = false;
@@ -885,10 +1099,12 @@ mod tests {
 
     fn batch(keys: &[&str]) -> Update {
         Update::Batch {
+            scan: RequestId::default(),
             keys: keys.iter().map(|k| (k.to_string(), None)).collect(),
             reset: false,
-            complete: true,
+            progress: ScanProgress::Complete,
             scanned_pages: 1,
+            unlisted: 0,
         }
     }
 
@@ -938,40 +1154,197 @@ mod tests {
         assert_eq!(a.selected_row().unwrap().path, before);
     }
 
+    fn meta(key: &str) -> Box<KeyMeta> {
+        Box::new(KeyMeta {
+            key: key.into(),
+            kind: Kind::String,
+            ttl_ms: None,
+            size: Some(1),
+            memory: None,
+        })
+    }
+
+    fn detail(id: RequestId, key: &str, text: &str) -> Update {
+        Update::Detail {
+            id,
+            meta: meta(key),
+            value: Box::new(KeyValue::String(text.into())),
+            coverage: Coverage::Complete,
+            stream: None,
+        }
+    }
+
     #[test]
     fn stale_detail_replies_are_dropped() {
         let mut a = app();
         a.apply(batch(&["k1", "k2"]));
-        a.pending_key = Some("k2".into());
+        let k1 = a.expect_detail("k1");
+        let k2 = a.expect_detail("k2");
 
-        a.apply(Update::Detail {
-            meta: Box::new(KeyMeta {
-                key: "k1".into(),
-                kind: Kind::String,
-                ttl_ms: None,
-                size: 1,
-                memory: None,
-            }),
-            value: Box::new(KeyValue::String("stale".into())),
-            stream: None,
-        });
+        a.apply(detail(k1, "k1", "stale"));
         assert!(
             a.detail.is_none(),
             "reply for k1 must not render while k2 is selected"
         );
 
-        a.apply(Update::Detail {
-            meta: Box::new(KeyMeta {
-                key: "k2".into(),
-                kind: Kind::String,
-                ttl_ms: None,
-                size: 1,
-                memory: None,
-            }),
-            value: Box::new(KeyValue::String("fresh".into())),
-            stream: None,
-        });
+        a.apply(detail(k2, "k2", "fresh"));
         assert!(a.detail.is_some());
+    }
+
+    #[test]
+    fn an_older_read_of_the_same_key_is_dropped() {
+        // Select k, move away, come back: two reads of `k` are in flight. Matching on the
+        // key name accepted both, so whichever arrived last won -- including the older
+        // one, which can carry a value the key no longer has.
+        let mut a = app();
+        let first = a.expect_detail("k");
+        let _away = a.expect_detail("other");
+        let second = a.expect_detail("k");
+
+        a.apply(detail(second, "k", "new"));
+        a.apply(detail(first, "k", "old"));
+        assert!(
+            matches!(&a.detail, Some((_, KeyValue::String(v))) if v == "new"),
+            "the older reply overwrote the newer one: {:?}",
+            a.detail
+        );
+    }
+
+    #[test]
+    fn a_stale_key_failure_does_not_replace_the_selected_value() {
+        let mut a = app();
+        let old = a.expect_detail("old");
+        let cur = a.expect_detail("cur");
+        a.apply(detail(cur, "cur", "value"));
+
+        a.apply(Update::DetailFailed {
+            id: old,
+            key: "old".into(),
+            error: "WRONGTYPE".into(),
+        });
+        assert!(a.error.is_none(), "old key's error painted over `cur`");
+        assert!(a.detail.is_some());
+
+        // The current key's own failure is still shown, and says which key it was.
+        a.apply(Update::DetailFailed {
+            id: cur,
+            key: "cur".into(),
+            error: "timeout".into(),
+        });
+        assert_eq!(a.error.as_deref(), Some("cur: timeout"));
+    }
+
+    #[test]
+    fn a_stats_refresh_failure_never_reaches_the_value_pane() {
+        let mut a = app();
+        let id = a.expect_detail("k");
+        a.apply(detail(id, "k", "value"));
+
+        a.apply(Update::InfoFailed {
+            id: RequestId::new(1_000),
+            error: "INFO timed out".into(),
+        });
+        assert!(a.error.is_none(), "an INFO failure hid the selected key");
+        assert_eq!(a.info_error.as_deref(), Some("INFO timed out"));
+
+        // A later successful refresh clears it; an older one does not resurrect it.
+        a.apply(Update::Info {
+            id: RequestId::new(1_001),
+            info: Box::new(ServerInfo::parse("redis_version:8.0.1\r\n")),
+        });
+        assert!(a.info_error.is_none());
+        a.apply(Update::InfoFailed {
+            id: RequestId::new(999),
+            error: "late".into(),
+        });
+        assert!(
+            a.info_error.is_none(),
+            "an older refresh's failure was applied"
+        );
+        assert_eq!(a.server.version, "8.0.1");
+    }
+
+    #[tokio::test]
+    async fn batches_from_a_superseded_scan_are_dropped() {
+        let (mut a, mut rx) = app_with_rx();
+        a.rescan().await;
+        let old = a.scan_generation();
+        a.apply(Update::Batch {
+            scan: old,
+            keys: vec![("old:1".into(), None)],
+            reset: true,
+            progress: ScanProgress::Partial,
+            scanned_pages: 1,
+            unlisted: 0,
+        });
+
+        // Change the filter. The `More` answered for the old filter arrives after.
+        a.pattern = Some("new:*".into());
+        a.rescan().await;
+        assert_ne!(a.scan_generation(), old);
+        a.apply(Update::Batch {
+            scan: old,
+            keys: vec![("old:2".into(), None)],
+            reset: false,
+            progress: ScanProgress::Complete,
+            scanned_pages: 1,
+            unlisted: 0,
+        });
+        assert!(
+            a.loading,
+            "a stale batch must not end the new scan's loading state"
+        );
+        assert!(
+            !a.scan_complete,
+            "a stale batch claimed the new scan was complete"
+        );
+        assert!(a.rows.iter().all(|r| r.path != "old:2"));
+
+        a.apply(Update::Batch {
+            scan: old,
+            keys: vec![],
+            reset: false,
+            progress: ScanProgress::Failed("stale".into()),
+            scanned_pages: 0,
+            unlisted: 0,
+        });
+        assert!(
+            !a.status.contains("stale"),
+            "an old scan's failure was shown"
+        );
+
+        // Both rescans went out with the generation the app recorded.
+        let gens: Vec<RequestId> = std::iter::from_fn(|| rx.try_recv().ok())
+            .filter_map(|r| match r {
+                Request::Rescan { scan, .. } => Some(scan),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(gens, vec![old, a.scan_generation()]);
+    }
+
+    #[test]
+    fn a_reset_batch_clears_the_previous_stream_panel() {
+        let mut a = app();
+        let id = a.expect_detail("s");
+        a.apply(Update::Detail {
+            id,
+            meta: meta("s"),
+            value: Box::new(KeyValue::Stream(vec![])),
+            coverage: Coverage::Complete,
+            stream: Some(Box::default()),
+        });
+        assert!(a.stream.is_some());
+        a.apply(Update::Batch {
+            scan: RequestId::default(),
+            keys: vec![],
+            reset: true,
+            progress: ScanProgress::Complete,
+            scanned_pages: 1,
+            unlisted: 0,
+        });
+        assert!(a.stream.is_none(), "consumer groups outlived their key");
+        assert!(a.pending_key().is_none());
     }
 
     #[test]
@@ -979,10 +1352,12 @@ mod tests {
         let mut a = app();
         a.apply(batch(&["old:1"]));
         a.apply(Update::Batch {
+            scan: RequestId::default(),
             keys: vec![("new:1".into(), None)],
             reset: true,
-            complete: true,
+            progress: ScanProgress::Complete,
             scanned_pages: 1,
+            unlisted: 0,
         });
         assert_eq!(a.rows.len(), 1);
         // A lone key folds to a single row for its whole path.
@@ -990,11 +1365,75 @@ mod tests {
     }
 
     #[test]
-    fn error_clears_loading_state() {
+    fn keys_that_cannot_be_listed_are_counted_in_the_status() {
+        // 0.1.7 dropped non-UTF-8 key names without a trace.
         let mut a = app();
-        a.apply(Update::Error("boom".into()));
+        a.apply(Update::Batch {
+            scan: RequestId::default(),
+            keys: vec![("k".into(), None)],
+            reset: true,
+            progress: ScanProgress::Complete,
+            scanned_pages: 1,
+            unlisted: 2,
+        });
+        assert!(
+            a.status.contains("2 keys with non-UTF-8 names not shown"),
+            "{}",
+            a.status
+        );
+    }
+
+    #[test]
+    fn a_failed_scan_keeps_its_keys_and_says_it_is_incomplete() {
+        // 0.1.7 replaced the batch with a bare error -- dropping every key gathered before
+        // the failure -- and the next `m` then reported the keyspace complete.
+        let mut a = app();
+        a.apply(Update::Batch {
+            scan: RequestId::default(),
+            keys: vec![("k:1".into(), None), ("k:2".into(), None)],
+            reset: true,
+            progress: ScanProgress::Failed("Request timed out.".into()),
+            scanned_pages: 3,
+            unlisted: 0,
+        });
         assert!(!a.loading);
-        assert_eq!(a.error.as_deref(), Some("boom"));
+        assert!(!a.scan_complete, "a failed scan claimed to be complete");
+        assert_eq!(
+            a.tree.len(),
+            2,
+            "keys gathered before the failure were dropped"
+        );
+        assert!(a.status.contains("incomplete"), "{}", a.status);
+        assert!(a.status.contains("Request timed out."), "{}", a.status);
+        assert!(
+            a.error.is_none(),
+            "a scan failure must not blank the value pane"
+        );
+    }
+
+    #[tokio::test]
+    async fn the_tree_stops_growing_at_its_budget_and_says_so() {
+        let (mut a, mut rx) = app_with_rx();
+        let over = MAX_TREE_KEYS + 10;
+        a.apply(Update::Batch {
+            scan: RequestId::default(),
+            keys: (0..over).map(|i| (format!("k:{i}"), None)).collect(),
+            reset: true,
+            progress: ScanProgress::Partial,
+            scanned_pages: 1,
+            unlisted: 0,
+        });
+        assert_eq!(a.tree.len(), MAX_TREE_KEYS);
+        assert!(a.tree_full);
+        assert!(!a.scan_complete, "a capped tree is not the whole keyspace");
+        assert!(a.status.contains("limit"), "{}", a.status);
+
+        a.handle_normal_key(KeyEvent::from(KeyCode::Char('m')))
+            .await;
+        assert!(
+            rx.try_recv().is_err(),
+            "`m` must not ask for more past the budget"
+        );
     }
 
     #[tokio::test]
@@ -1063,7 +1502,7 @@ mod tests {
         a.handle_normal_key(KeyEvent::from(KeyCode::Char('3')))
             .await;
         assert!(matches!(a.slowlog, PaneState::Loading));
-        assert!(matches!(rx.try_recv(), Ok(Request::LoadSlowlog)));
+        assert!(matches!(rx.try_recv(), Ok(Request::LoadSlowlog { .. })));
 
         // Coming back to an already-loaded pane must not refire the request.
         a.slowlog = PaneState::Ready(vec![]);
@@ -1079,7 +1518,7 @@ mod tests {
     async fn r_reloads_the_pane_that_is_showing() {
         let (mut a, mut rx) = app_with_rx();
         a.view = View::Clients;
-        a.clients = PaneState::Ready(vec![]);
+        a.clients = PaneState::Ready(Capped::default());
 
         a.handle_normal_key(KeyEvent::from(KeyCode::Char('r')))
             .await;
@@ -1087,7 +1526,7 @@ mod tests {
             matches!(a.clients, PaneState::Loading),
             "r should force a reload"
         );
-        assert!(matches!(rx.try_recv(), Ok(Request::LoadClients)));
+        assert!(matches!(rx.try_recv(), Ok(Request::LoadClients { .. })));
     }
 
     #[tokio::test]
@@ -1121,11 +1560,19 @@ mod tests {
         }
     }
 
+    fn apply_queues(a: &mut App, list: Vec<QueueSummary>) {
+        let id = a.expect_queues();
+        a.apply(Update::Queues {
+            id,
+            data: PaneState::Ready(list.into()),
+        });
+    }
+
     fn summary(name: &str, paused: bool) -> QueueSummary {
         QueueSummary {
             name: name.into(),
-            paused,
-            counts: State::ALL.iter().map(|s| (*s, 3)).collect(),
+            paused: Some(paused),
+            counts: State::ALL.iter().map(|s| (*s, Some(3))).collect(),
         }
     }
 
@@ -1161,16 +1608,15 @@ mod tests {
         let mut a = app();
         a.apply(Update::Detected(vec![detection()]));
         a.view = View::Queues;
-        a.apply(Update::Queues(PaneState::Ready(vec![summary(
-            "emails", false,
-        )])));
+        apply_queues(&mut a, vec![summary("emails", false)]);
         assert_eq!(a.level, QueueLevel::Queues);
 
         a.handle_queues_key(KeyEvent::from(KeyCode::Enter)).await;
         assert_eq!(a.level, QueueLevel::Jobs);
 
+        let id = a.expect_jobs();
         a.apply(Update::Jobs {
-            state: a.job_state,
+            id,
             data: PaneState::Ready(vec![JobRef {
                 id: "42".into(),
                 score: Some(1.0),
@@ -1192,7 +1638,7 @@ mod tests {
     async fn cannot_drill_into_an_empty_queue_list() {
         let mut a = app();
         a.view = View::Queues;
-        a.apply(Update::Queues(PaneState::Ready(vec![])));
+        apply_queues(&mut a, vec![]);
         a.handle_queues_key(KeyEvent::from(KeyCode::Enter)).await;
         assert_eq!(
             a.level,
@@ -1205,9 +1651,7 @@ mod tests {
     async fn bracket_keys_cycle_job_state_and_wrap() {
         let mut a = app();
         a.view = View::Queues;
-        a.apply(Update::Queues(PaneState::Ready(vec![summary(
-            "emails", false,
-        )])));
+        apply_queues(&mut a, vec![summary("emails", false)]);
         a.level = QueueLevel::Jobs;
         assert_eq!(a.job_state, State::Failed);
 
@@ -1224,13 +1668,25 @@ mod tests {
     async fn state_cycling_does_nothing_at_the_queue_list_level() {
         let mut a = app();
         a.view = View::Queues;
-        a.apply(Update::Queues(PaneState::Ready(vec![summary(
-            "emails", false,
-        )])));
+        apply_queues(&mut a, vec![summary("emails", false)]);
         a.handle_queues_key(KeyEvent::from(KeyCode::Char(']')))
             .await;
         assert_eq!(a.job_state, State::Failed, "no job list open to re-filter");
         assert_eq!(a.level, QueueLevel::Queues);
+    }
+
+    fn jobs_page(id: RequestId, ids: &[&str]) -> Update {
+        Update::Jobs {
+            id,
+            data: PaneState::Ready(
+                ids.iter()
+                    .map(|j| JobRef {
+                        id: (*j).into(),
+                        score: None,
+                    })
+                    .collect(),
+            ),
+        }
     }
 
     #[test]
@@ -1238,30 +1694,127 @@ mod tests {
         // Cycling states faster than the server answers must not paint the old page under
         // the new heading.
         let mut a = app();
+        let failed = a.expect_jobs();
         a.job_state = State::Waiting;
-        a.apply(Update::Jobs {
-            state: State::Failed,
-            data: PaneState::Ready(vec![JobRef {
-                id: "stale".into(),
-                score: None,
-            }]),
-        });
+        let waiting = a.expect_jobs();
+        a.apply(jobs_page(failed, &["stale"]));
         assert!(
             a.jobs.ready().is_none(),
             "reply for `failed` must not render under `waiting`"
         );
+        a.apply(jobs_page(waiting, &["fresh"]));
+        assert_eq!(a.selected_job().map(|j| j.id.as_str()), Some("fresh"));
+    }
+
+    #[tokio::test]
+    async fn a_job_page_for_another_queue_in_the_same_state_is_dropped() {
+        // The page used to be matched on its state alone. Open `emails` -> failed, back
+        // out, open `reports` -> failed: `emails`' page arrived late and rendered under
+        // `reports`, with nothing on screen to say so.
+        let (mut a, mut rx) = app_with_rx();
+        a.view = View::Queues;
+        apply_queues(
+            &mut a,
+            vec![summary("emails", false), summary("reports", false)],
+        );
+        while rx.try_recv().is_ok() {}
+
+        a.handle_queues_key(KeyEvent::from(KeyCode::Enter)).await;
+        let Ok(Request::LoadJobs {
+            id: emails, queue, ..
+        }) = rx.try_recv()
+        else {
+            panic!("entering a queue must request its jobs")
+        };
+        assert_eq!(queue, "emails");
+        a.handle_queues_key(KeyEvent::from(KeyCode::Esc)).await;
+        a.handle_queues_key(KeyEvent::from(KeyCode::Down)).await;
+        a.handle_queues_key(KeyEvent::from(KeyCode::Enter)).await;
+        let Ok(Request::LoadJobs {
+            id: reports,
+            queue,
+            state,
+        }) = rx.try_recv()
+        else {
+            panic!("entering a queue must request its jobs")
+        };
+        assert_eq!((queue.as_str(), state), ("reports", State::Failed));
+
+        a.apply(jobs_page(emails, &["emails-job"]));
+        assert!(
+            a.jobs.ready().is_none(),
+            "emails' failed page rendered under reports"
+        );
+        a.apply(jobs_page(reports, &["reports-job"]));
+        assert_eq!(a.selected_job().map(|j| j.id.as_str()), Some("reports-job"));
+    }
+
+    fn job_detail(id: RequestId, job: &str) -> Update {
+        Update::Job {
+            id,
+            data: PaneState::Ready(Some(Box::new(JobDetail {
+                job: keylens_bullmq::Job {
+                    id: job.into(),
+                    ..Default::default()
+                },
+                logs: vec![],
+            }))),
+        }
+    }
+
+    #[test]
+    fn a_job_detail_for_a_job_no_longer_open_is_dropped() {
+        // Job detail replies had no identity at all: whichever arrived last rendered,
+        // under whichever job the user had open by then.
+        let mut a = app();
+        let first = a.expect_job();
+        let second = a.expect_job();
+        a.apply(job_detail(second, "B"));
+        a.apply(job_detail(first, "A"));
+        let shown = a
+            .job
+            .ready()
+            .and_then(|j| j.as_ref())
+            .map(|d| d.job.id.clone());
+        assert_eq!(
+            shown.as_deref(),
+            Some("B"),
+            "job A's detail rendered under job B"
+        );
+    }
+
+    #[test]
+    fn a_superseded_pane_reload_does_not_end_the_newer_load() {
+        let mut a = app();
+        let first = a.issue();
+        let second = a.issue();
+        a.pending.slowlog = Some(second);
+        a.slowlog = PaneState::Loading;
+        a.apply(Update::Slowlog {
+            id: first,
+            data: PaneState::Ready(vec![]),
+        });
+        assert!(matches!(a.slowlog, PaneState::Loading));
+        a.apply(Update::Slowlog {
+            id: second,
+            data: PaneState::Ready(vec![]),
+        });
+        assert!(matches!(a.slowlog, PaneState::Ready(_)));
     }
 
     #[test]
     fn a_shrinking_queue_list_clamps_the_cursor() {
         let mut a = app();
-        a.apply(Update::Queues(PaneState::Ready(vec![
-            summary("a", false),
-            summary("b", false),
-            summary("c", false),
-        ])));
+        apply_queues(
+            &mut a,
+            vec![
+                summary("a", false),
+                summary("b", false),
+                summary("c", false),
+            ],
+        );
         a.queue_selected = 2;
-        a.apply(Update::Queues(PaneState::Ready(vec![summary("a", false)])));
+        apply_queues(&mut a, vec![summary("a", false)]);
         assert_eq!(a.queue_selected, 0, "cursor must not point past the end");
     }
 

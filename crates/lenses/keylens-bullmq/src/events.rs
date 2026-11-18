@@ -174,7 +174,11 @@ pub enum EventsStatus {
     Attaching,
     /// Reader is on the streams. An empty graph means the queues are genuinely idle.
     Live,
-    /// The reader gave up, with the reason. Nothing will arrive; say so.
+    /// The reader lost its stream and is retrying with backoff. The graph is frozen, not
+    /// empty: it shows what arrived before the outage.
+    Reconnecting { attempt: u32, error: String },
+    /// Will not work here -- an ACL denial, no stream support, keys spread across cluster
+    /// slots. Not retried. Nothing will arrive; say so.
     Unavailable(String),
 }
 

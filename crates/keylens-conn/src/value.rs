@@ -8,6 +8,7 @@
 
 use fred::prelude::Value;
 
+use crate::bounds::{MAX_ELEMENT_BYTES, MAX_ENTRY_FIELDS};
 use crate::capability::Feature;
 use crate::conn::Conn;
 use crate::error::{ConnError, Result};
@@ -16,6 +17,12 @@ use crate::error::{ConnError, Result};
 pub const PAGE: usize = 200;
 /// Cap on a single string value. Longer strings are truncated with a marker.
 pub const MAX_STRING_BYTES: usize = 64 * 1024;
+/// Bytes requested by the bounded string read: one more than is ever kept.
+///
+/// The extra byte is how truncation is *known* rather than guessed. Asking for exactly
+/// [`MAX_STRING_BYTES`] cannot tell a value of exactly that length from a longer one, so
+/// 0.1.7 marked every exactly-64 KiB value as truncated when nothing had been cut.
+const STRING_PROBE_BYTES: usize = MAX_STRING_BYTES + 1;
 
 /// The same two bounds as Redis range arguments.
 ///
@@ -23,9 +30,10 @@ pub const MAX_STRING_BYTES: usize = 64 * 1024;
 /// on the way to `i64` would ask for the whole collection. These are const-evaluated and
 /// checked below, so the cast happens once at compile time and never at runtime.
 const PAGE_BOUND: i64 = PAGE as i64;
-const MAX_STRING_BOUND: i64 = MAX_STRING_BYTES as i64;
+/// Inclusive `GETRANGE` end: `0..=MAX_STRING_BYTES` is [`STRING_PROBE_BYTES`] bytes.
+const STRING_PROBE_END: i64 = (STRING_PROBE_BYTES - 1) as i64;
 const _: () = assert!(
-    PAGE_BOUND > 0 && MAX_STRING_BOUND > 0,
+    PAGE_BOUND > 0 && STRING_PROBE_END > 0,
     "page constants must stay positive as Redis range bounds"
 );
 
@@ -130,9 +138,35 @@ pub struct KeyMeta {
     /// Remaining TTL in milliseconds. `None` means no expiry set.
     pub ttl_ms: Option<i64>,
     /// Element count, or byte length for strings.
-    pub size: u64,
+    ///
+    /// `None` means the size could not be read -- not that the key is empty. 0.1.7 stored
+    /// a failed `HLEN` as `0`, which rendered a two-million-field hash as `size 0`.
+    pub size: Option<u64>,
     /// `MEMORY USAGE`, when the server permits it.
     pub memory: Option<u64>,
+}
+
+/// How much of a value one read returned.
+///
+/// keylens reads one bounded page of every value. Whether that page is the whole value
+/// is a fact about the read, and it is only `Complete` when the reply proves it: a range
+/// that came back short, a cursor that came back `0`, a string shorter than the cap.
+/// Anything else is `Partial`, including "full page, size unknown", because a full page
+/// is exactly what a larger value looks like.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Coverage {
+    /// Every element, or every byte, the server held at read time.
+    Complete,
+    /// The first `shown` rows (or bytes, for a string). More exist, or may exist.
+    Partial { shown: usize },
+}
+
+/// One bounded read of a key: what it is, what was read, and whether that was all of it.
+#[derive(Debug, Clone)]
+pub struct KeyRead {
+    pub meta: KeyMeta,
+    pub value: KeyValue,
+    pub coverage: Coverage,
 }
 
 #[derive(Debug, Clone)]
@@ -151,6 +185,9 @@ pub enum KeyValue {
     Stream(Vec<StreamEntry>),
     /// Key vanished between listing and reading -- normal on a live keyspace.
     Missing,
+    /// The key changed type between `TYPE` and the read (`WRONGTYPE`). It exists, so
+    /// "no longer exists" would be false; reading it again will show the new type.
+    Changed,
     /// The server cannot provide a safely paged representation of this value.
     Unsupported(String),
 }
@@ -165,7 +202,7 @@ impl KeyValue {
             KeyValue::Set(v) => v.len(),
             KeyValue::ZSet(v) => v.len(),
             KeyValue::Stream(v) => v.len(),
-            KeyValue::Missing | KeyValue::Unsupported(_) => 0,
+            KeyValue::Missing | KeyValue::Changed | KeyValue::Unsupported(_) => 0,
         }
     }
 
@@ -225,9 +262,7 @@ impl Conn {
         let replies = self.pipeline(&cmds).await?;
         let reply = |i: usize| replies.get(i).and_then(|r| r.as_ref().ok());
 
-        let kind = reply(0)
-            .map(|v| Kind::parse(&display_string(v)))
-            .unwrap_or(Kind::None);
+        let kind = type_from(&replies, 0)?;
 
         // PTTL: -1 = no expiry, -2 = key gone. Both mean "nothing to show".
         let ttl_raw = reply(1).and_then(|v| v.as_i64()).unwrap_or(-1);
@@ -243,10 +278,12 @@ impl Conn {
     }
 
     /// Element count, or byte length for a string. One command, and it needs the type.
-    pub async fn key_size(&self, key: &str, kind: Kind) -> Result<u64> {
+    ///
+    /// `Ok(None)` for a type with no size command, or a reply that is not a count.
+    pub async fn key_size(&self, key: &str, kind: Kind) -> Result<Option<u64>> {
         match kind.size_cmd() {
-            Some(cmd) => Ok(self.cmd(cmd, vec![key.into()]).await?.as_u64().unwrap_or(0)),
-            None => Ok(0),
+            Some(cmd) => Ok(self.cmd(cmd, vec![key.into()]).await?.as_u64()),
+            None => Ok(None),
         }
     }
 
@@ -263,7 +300,7 @@ impl Conn {
                 key: key.into(),
                 kind: head.kind,
                 ttl_ms: None,
-                size: 0,
+                size: Some(0),
                 memory: None,
             });
         }
@@ -292,7 +329,7 @@ impl Conn {
     /// At 35ms this saves 70ms nobody notices. Against a managed endpoint measured at
     /// 390ms it is the difference between a key opening in 0.4s and in 1.2s, on every
     /// single keypress — which is what makes browsing feel broken rather than distant.
-    pub async fn read_key(&self, key: &str) -> Result<(KeyMeta, KeyValue)> {
+    pub async fn read_key(&self, key: &str) -> Result<KeyRead> {
         // Speculation only pays when the bounded reads exist for every type. Servers
         // missing one take the sequential path so the unsupported result is specific to
         // the selected type. No measure-then-read fallback is safe: the key can grow
@@ -318,12 +355,12 @@ impl Conn {
             cmds.push(("MEMORY", vec!["USAGE".into(), key.into()]));
         }
 
-        let replies = self.pipeline(&cmds).await?;
-        let at = |i: usize| replies.get(i).and_then(|r| r.as_ref().ok());
+        let mut replies = self.pipeline(&cmds).await?;
 
-        let kind = at(SLOT_TYPE)
-            .map(|v| Kind::parse(&display_string(v)))
-            .unwrap_or(Kind::None);
+        // A failed `TYPE` is an error, not an absent key. 0.1.7 read it as `none` and
+        // told the user the key no longer existed -- on an ACL that merely denies TYPE.
+        let kind = type_from(&replies, SLOT_TYPE)?;
+        let at = |i: usize| replies.get(i).and_then(|r| r.as_ref().ok());
         // PTTL: -1 = no expiry, -2 = key gone. Both mean "nothing to show".
         let ttl_raw = at(SLOT_PTTL).and_then(|v| v.as_i64()).unwrap_or(-1);
         let slot = kind.slot();
@@ -332,79 +369,139 @@ impl Conn {
             key: key.into(),
             kind,
             ttl_ms: (ttl_raw >= 0).then_some(ttl_raw),
-            // A size that failed is a missing number, not a missing key.
-            size: slot
-                .and_then(|s| at(SIZE_BASE + s))
-                .and_then(|v| v.as_u64())
-                .unwrap_or(0),
+            // A size that failed is a missing number, not a zero.
+            size: match kind {
+                Kind::None => Some(0),
+                _ => slot
+                    .and_then(|s| at(SIZE_BASE + s))
+                    .and_then(|v| v.as_u64()),
+            },
             // MEMORY USAGE is blocked on several managed hosts; absence is not an error.
             memory: want_memory
                 .then(|| at(SLOT_MEMORY).and_then(|v| v.as_u64()))
                 .flatten(),
         };
 
-        let value = match slot.and_then(|s| at(VALUE_BASE + s)) {
-            Some(reply) => decode_value(kind, reply)?,
-            None => absent(kind),
+        let (value, coverage) = match slot {
+            None => (absent(kind), Coverage::Complete),
+            Some(s) => match take_slot(&mut replies, VALUE_BASE + s) {
+                Some(Ok(reply)) => decode_value(kind, &reply, meta.size)?,
+                // The type changed between `TYPE` and this read, a few commands later.
+                Some(Err(e)) if is_wrongtype(&e) => (KeyValue::Changed, Coverage::Complete),
+                // Anything else -- an ACL denying `HSCAN`, say -- is a failure to report,
+                // not an absent value. 0.1.7 rendered it as "key no longer exists".
+                Some(Err(e)) => return Err(e),
+                None => {
+                    return Err(ConnError::Reply {
+                        cmd: "PIPELINE",
+                        detail: "value slot missing from the reply".into(),
+                    });
+                }
+            },
         };
 
-        Ok((meta, value))
+        Ok(KeyRead {
+            meta,
+            value,
+            coverage,
+        })
     }
 
     /// The two-round-trip path, for servers without every bounded read command.
     ///
     /// Still collapsed where it can be: the size and the value both need the type but not
     /// each other, so they go out together.
-    async fn read_key_sequentially(&self, key: &str) -> Result<(KeyMeta, KeyValue)> {
+    async fn read_key_sequentially(&self, key: &str) -> Result<KeyRead> {
         let head = self.key_head(key).await?;
 
         if head.kind == Kind::None {
-            return Ok((
-                KeyMeta {
+            return Ok(KeyRead {
+                meta: KeyMeta {
                     key: key.into(),
                     kind: head.kind,
                     ttl_ms: None,
-                    size: 0,
+                    size: Some(0),
                     memory: None,
                 },
-                KeyValue::Missing,
-            ));
+                value: KeyValue::Missing,
+                coverage: Coverage::Complete,
+            });
         }
 
-        let (size, value) = tokio::join!(
+        let (size, page) = tokio::join!(
             self.key_size(key, head.kind),
-            self.read_value(key, head.kind, 0),
+            self.read_page(key, head.kind),
         );
+        // A failed size is unknown, not zero, and not a reason to drop the value.
+        let size = size.ok().flatten();
+        let (value, coverage) = match page {
+            Ok(page) => page,
+            Err(e) if is_wrongtype(&e) => (KeyValue::Changed, Coverage::Complete),
+            Err(e) => return Err(e),
+        };
+        let coverage = match (coverage, size) {
+            // The ranged reads judge completeness from the reply alone; with the size in
+            // hand a full page that happens to be the whole value can be called complete.
+            (Coverage::Partial { shown }, Some(n))
+                if fits(shown, n) && !head.kind.is_cursor_paged() =>
+            {
+                Coverage::Complete
+            }
+            (c, _) => c,
+        };
 
-        Ok((
-            KeyMeta {
+        Ok(KeyRead {
+            meta: KeyMeta {
                 key: key.into(),
                 kind: head.kind,
                 ttl_ms: head.ttl_ms,
-                size: size.unwrap_or(0),
+                size,
                 memory: head.memory,
             },
-            value?,
-        ))
+            value,
+            coverage,
+        })
     }
 
     /// Read up to [`PAGE`] elements starting at `offset`.
     ///
-    /// `offset` is honoured exactly for the ordered types (list, zset, stream), which is
-    /// what `LRANGE`/`ZRANGE`/`XRANGE` index by.
+    /// `offset` is honoured exactly for the ordered types (list, zset), which is what
+    /// `LRANGE`/`ZRANGE` index by.
     ///
-    /// Hash and set **ignore it** and always return the first cursor page. That is a
-    /// limitation, not a convention: `HSCAN`/`SSCAN` are resumed by an opaque cursor from
-    /// the previous reply, not by an element index, so paging them needs the caller to
-    /// carry that cursor back in. Until this signature does, claiming otherwise here would
-    /// describe an API that does not exist.
+    /// # Errors
+    ///
+    /// [`ConnError::Range`] for a non-zero `offset` on a hash, set or stream. Those are
+    /// paged by an opaque cursor or an entry id, not an index. 0.1.7 silently ignored the
+    /// offset and returned the first page again, so a caller paging by offset saw page
+    /// one repeated forever and believed it had read the whole value.
     pub async fn read_value(&self, key: &str, kind: Kind, offset: usize) -> Result<KeyValue> {
+        if offset != 0 && (kind.is_cursor_paged() || kind == Kind::Stream) {
+            return Err(ConnError::Range {
+                cmd: kind.size_cmd().unwrap_or("RANGE"),
+                offset,
+                detail: "this type is paged by cursor or entry id, not by offset",
+            });
+        }
+        Ok(self.read_range(key, kind, offset).await?.0)
+    }
+
+    /// The first page of a value, and whether it was all of it.
+    async fn read_page(&self, key: &str, kind: Kind) -> Result<(KeyValue, Coverage)> {
+        self.read_range(key, kind, 0).await
+    }
+
+    async fn read_range(
+        &self,
+        key: &str,
+        kind: Kind,
+        offset: usize,
+    ) -> Result<(KeyValue, Coverage)> {
         // Checked, not cast: an offset past `i64::MAX` wraps to a negative, which Redis
         // reads as "from the end" and turns a bounded page into the whole collection.
         let (start, stop) = page_bounds(offset, kind)?;
 
-        let value = match kind {
-            Kind::None => KeyValue::Missing,
+        let page = match kind {
+            Kind::None => (KeyValue::Missing, Coverage::Complete),
 
             Kind::String => {
                 // GETRANGE, not GET: a 500MB string must not be pulled into the TUI.
@@ -412,7 +509,7 @@ impl Conn {
                     let reply = self
                         .cmd(
                             "GETRANGE",
-                            vec![key.into(), 0.into(), (MAX_STRING_BOUND - 1).into()],
+                            vec![key.into(), 0.into(), STRING_PROBE_END.into()],
                         )
                         .await?;
                     decode_string(&reply)
@@ -420,8 +517,11 @@ impl Conn {
                     // Measuring first and issuing GET second has a race: another client can
                     // replace the value with a huge string between those commands. On a
                     // server without GETRANGE there is no genuinely bounded read.
-                    KeyValue::Unsupported(
-                        "this server has no bounded string read (GETRANGE)".into(),
+                    (
+                        KeyValue::Unsupported(
+                            "this server has no bounded string read (GETRANGE)".into(),
+                        ),
+                        Coverage::Complete,
                     )
                 }
             }
@@ -430,7 +530,7 @@ impl Conn {
                 let reply = self
                     .cmd("LRANGE", vec![key.into(), start.into(), stop.into()])
                     .await?;
-                KeyValue::List(as_string_vec(&reply))
+                ranged(KeyValue::List(as_string_vec(&reply)))
             }
 
             Kind::ZSet => {
@@ -440,7 +540,7 @@ impl Conn {
                         vec![key.into(), start.into(), stop.into(), "WITHSCORES".into()],
                     )
                     .await?;
-                KeyValue::ZSet(as_scored_pairs(&reply))
+                ranged(KeyValue::ZSet(as_scored_pairs(&reply)))
             }
 
             Kind::Hash => {
@@ -453,7 +553,12 @@ impl Conn {
                         .await?;
                     decode_hash(&reply)?
                 } else {
-                    KeyValue::Unsupported("this server has no bounded hash read (HSCAN)".into())
+                    (
+                        KeyValue::Unsupported(
+                            "this server has no bounded hash read (HSCAN)".into(),
+                        ),
+                        Coverage::Complete,
+                    )
                 }
             }
 
@@ -467,7 +572,10 @@ impl Conn {
                         .await?;
                     decode_set(&reply)?
                 } else {
-                    KeyValue::Unsupported("this server has no bounded set read (SSCAN)".into())
+                    (
+                        KeyValue::Unsupported("this server has no bounded set read (SSCAN)".into()),
+                        Coverage::Complete,
+                    )
                 }
             }
 
@@ -484,14 +592,70 @@ impl Conn {
                         ],
                     )
                     .await?;
-                KeyValue::Stream(as_stream_entries(&reply))
+                ranged(KeyValue::Stream(as_stream_entries(&reply)))
             }
 
-            Kind::Other => absent(Kind::Other),
+            Kind::Other => (absent(Kind::Other), Coverage::Complete),
         };
 
-        Ok(value)
+        Ok(page)
     }
+}
+
+impl Kind {
+    /// Hash and set are read by `HSCAN`/`SSCAN`, whose position is an opaque cursor.
+    fn is_cursor_paged(&self) -> bool {
+        matches!(self, Kind::Hash | Kind::Set)
+    }
+}
+
+/// Whether `shown` rows account for a value of `size` elements.
+fn fits(shown: usize, size: u64) -> bool {
+    u64::try_from(shown).is_ok_and(|shown| shown >= size)
+}
+
+/// Coverage of a ranged (`LRANGE`/`ZRANGE`/`XRANGE … COUNT`) first page, from the reply
+/// alone: a page that came back short reached the end; a full one may not have.
+fn ranged(value: KeyValue) -> (KeyValue, Coverage) {
+    let shown = value.len();
+    let coverage = if shown < PAGE {
+        Coverage::Complete
+    } else {
+        Coverage::Partial { shown }
+    };
+    (value, coverage)
+}
+
+/// Move one reply out of a pipeline result without disturbing the others' positions.
+fn take_slot(replies: &mut [Result<Value>], i: usize) -> Option<Result<Value>> {
+    replies
+        .get_mut(i)
+        .map(|r| std::mem::replace(r, Ok(Value::Null)))
+}
+
+/// The key's type from a pipeline's `TYPE` slot. An error in that slot is the read's
+/// error: "the key is gone" and "we could not ask" are different answers.
+fn type_from(replies: &[Result<Value>], i: usize) -> Result<Kind> {
+    match replies.get(i) {
+        Some(Ok(v)) => Ok(Kind::parse(&display_string(v))),
+        Some(Err(ConnError::Command { source, .. })) => Err(ConnError::Command {
+            cmd: "TYPE",
+            source: source.clone(),
+        }),
+        Some(Err(e)) => Err(ConnError::Reply {
+            cmd: "TYPE",
+            detail: e.to_string(),
+        }),
+        None => Err(ConnError::Reply {
+            cmd: "TYPE",
+            detail: "missing from the pipeline reply".into(),
+        }),
+    }
+}
+
+/// Whether a command failed because the key holds another type.
+fn is_wrongtype(e: &ConnError) -> bool {
+    matches!(e, ConnError::Command { source, .. } if source.details().starts_with("WRONGTYPE"))
 }
 
 /// Inclusive `[start, stop]` bounds for one [`PAGE`] starting at `offset`.
@@ -532,7 +696,7 @@ fn value_cmd(kind: Kind, key: &str) -> (&'static str, Vec<Value>) {
         // GETRANGE, not GET: a 500MB string must not be pulled into the TUI.
         Kind::String => (
             "GETRANGE",
-            vec![key.into(), 0.into(), (MAX_STRING_BOUND - 1).into()],
+            vec![key.into(), 0.into(), STRING_PROBE_END.into()],
         ),
         Kind::Hash => (
             "HSCAN",
@@ -563,16 +727,28 @@ fn value_cmd(kind: Kind, key: &str) -> (&'static str, Vec<Value>) {
 
 /// Turn one type's reply into a value. The single decoder per type, shared by the
 /// speculative read and the sequential one.
-fn decode_value(kind: Kind, reply: &Value) -> Result<KeyValue> {
-    Ok(match kind {
+///
+/// `size` is the element count read alongside, when it was; with it, a full first page
+/// that is in fact the whole value can be called complete.
+fn decode_value(kind: Kind, reply: &Value, size: Option<u64>) -> Result<(KeyValue, Coverage)> {
+    let (value, coverage) = match kind {
         Kind::String => decode_string(reply),
         Kind::Hash => decode_hash(reply)?,
-        Kind::List => KeyValue::List(as_string_vec(reply)),
+        Kind::List => ranged(KeyValue::List(as_string_vec(reply))),
         Kind::Set => decode_set(reply)?,
-        Kind::ZSet => KeyValue::ZSet(as_scored_pairs(reply)),
-        Kind::Stream => KeyValue::Stream(as_stream_entries(reply)),
-        Kind::None | Kind::Other => absent(kind),
-    })
+        Kind::ZSet => ranged(KeyValue::ZSet(as_scored_pairs(reply))),
+        Kind::Stream => ranged(KeyValue::Stream(as_stream_entries(reply))),
+        Kind::None | Kind::Other => (absent(kind), Coverage::Complete),
+    };
+    let coverage = match (coverage, size) {
+        (Coverage::Partial { shown }, Some(n))
+            if fits(shown, n) && !kind.is_cursor_paged() && kind != Kind::String =>
+        {
+            Coverage::Complete
+        }
+        (c, _) => c,
+    };
+    Ok((value, coverage))
 }
 
 /// What to show when there is no value to decode.
@@ -581,43 +757,71 @@ fn absent(kind: Kind) -> KeyValue {
         Kind::Other => {
             KeyValue::Unsupported("module type -- no viewer for this key yet".to_string())
         }
-        // Either the key is gone, or its read failed because the type changed between the
-        // `TYPE` in the pipeline and the read a few commands later. Both mean there is
-        // nothing to render for the type we were told about.
         _ => KeyValue::Missing,
     }
 }
 
-fn decode_string(reply: &Value) -> KeyValue {
+/// Decode a bounded `GETRANGE` reply of up to [`STRING_PROBE_BYTES`] bytes.
+///
+/// Truncated means the reply was *longer* than [`MAX_STRING_BYTES`] -- which the extra
+/// probe byte makes knowable. What is kept is at most `MAX_STRING_BYTES`.
+fn decode_string(reply: &Value) -> (KeyValue, Coverage) {
     // Measure the *reply*, not the rendered text. `display_string` turns a binary payload
-    // into `<N bytes> …200 chars`, which is far shorter than the bytes it stands for -- so
-    // checking the rendered length silently dropped the marker on exactly the values most
-    // likely to be truncated.
-    let truncated = reply_byte_len(reply) >= MAX_STRING_BYTES;
-    let mut s = display_string(reply);
-    if truncated {
-        s.push_str("\n\n... truncated ...");
+    // into `<N bytes> …200 chars`, which is far shorter than the bytes it stands for.
+    if reply_byte_len(reply) <= MAX_STRING_BYTES {
+        return (KeyValue::String(display_string(reply)), Coverage::Complete);
     }
-    KeyValue::String(s)
+    let kept = match reply {
+        Value::String(s) => Value::from(prefix_on_char_boundary(s, MAX_STRING_BYTES)),
+        other => match other.as_bytes() {
+            Some(b) => Value::Bytes(b.get(..MAX_STRING_BYTES).unwrap_or(b).to_vec().into()),
+            None => other.clone(),
+        },
+    };
+    let mut s = display_string(&kept);
+    s.push_str("\n\n... truncated ...");
+    (
+        KeyValue::String(s),
+        Coverage::Partial {
+            shown: MAX_STRING_BYTES,
+        },
+    )
 }
 
-fn decode_hash(reply: &Value) -> Result<KeyValue> {
-    let items = scan_items(reply)?;
-    // SCAN COUNT is a target, not a hard limit. Keep the UI/API page bounded even if the
-    // server returns a larger compact-encoding bucket in one step.
-    Ok(KeyValue::Hash(as_field_pairs(
-        &items[..items.len().min(PAGE * 2)],
-    )))
+/// The longest prefix of `s` that is at most `max` bytes and ends on a char boundary.
+fn prefix_on_char_boundary(s: &str, max: usize) -> &str {
+    let mut end = max.min(s.len());
+    while end > 0 && !s.is_char_boundary(end) {
+        end -= 1;
+    }
+    s.get(..end).unwrap_or_default()
 }
 
-fn decode_set(reply: &Value) -> Result<KeyValue> {
-    Ok(KeyValue::Set(
-        scan_items(reply)?
-            .iter()
-            .take(PAGE)
-            .map(display_string)
-            .collect(),
-    ))
+fn decode_hash(reply: &Value) -> Result<(KeyValue, Coverage)> {
+    let (cursor, items) = scan_items(reply)?;
+    // SCAN COUNT is a target, not a hard limit: a compact-encoded hash comes back whole in
+    // one step whatever COUNT says. Keep at most one page, and say when that cut anything.
+    let capped = items.len() > PAGE * 2;
+    let value = KeyValue::Hash(as_field_pairs(items.get(..PAGE * 2).unwrap_or(&items)));
+    Ok(cursor_coverage(value, &cursor, capped))
+}
+
+fn decode_set(reply: &Value) -> Result<(KeyValue, Coverage)> {
+    let (cursor, items) = scan_items(reply)?;
+    let capped = items.len() > PAGE;
+    let value = KeyValue::Set(items.iter().take(PAGE).map(element).collect());
+    Ok(cursor_coverage(value, &cursor, capped))
+}
+
+/// A cursor-paged first page is complete only when the server said so (cursor `0`) and
+/// nothing it sent was dropped by the page cap.
+fn cursor_coverage(value: KeyValue, cursor: &str, capped: bool) -> (KeyValue, Coverage) {
+    let coverage = if cursor == "0" && !capped {
+        Coverage::Complete
+    } else {
+        Coverage::Partial { shown: value.len() }
+    };
+    (value, coverage)
 }
 
 /// Byte length of a reply, before it is rendered for display.
@@ -631,9 +835,40 @@ fn reply_byte_len(v: &Value) -> usize {
         .unwrap_or(0)
 }
 
+/// One element of a collection, as kept: at most [`MAX_ELEMENT_BYTES`] of it.
+///
+/// An oversized element is rendered from its first bytes only. Rendering it whole and then
+/// capping copied every byte once more: a page of 200 one-MiB elements peaked at ~404 MiB
+/// RSS, twice the reply, for 3 MiB kept. The reply itself still has to arrive -- Redis has
+/// no per-element bound -- but it is no longer duplicated.
+fn element(v: &Value) -> String {
+    match v.as_bytes() {
+        Some(b) if b.len() > MAX_ELEMENT_BYTES => capped_element(b),
+        _ => display_string(v),
+    }
+}
+
+fn capped_element(b: &[u8]) -> String {
+    let head = b.get(..MAX_ELEMENT_BYTES).unwrap_or(b);
+    let text = match std::str::from_utf8(head) {
+        Ok(s) => s.to_string(),
+        // UTF-8 cut mid-character by the cap: keep the valid prefix.
+        Err(e) if e.error_len().is_none() => {
+            String::from_utf8_lossy(head.get(..e.valid_up_to()).unwrap_or_default()).into_owned()
+        }
+        // Binary: the same short preview `display_string` gives any binary value.
+        Err(_) => {
+            let preview = String::from_utf8_lossy(head.get(..200).unwrap_or(head));
+            return format!("<{} bytes> {preview}", b.len());
+        }
+    };
+    let shown = text.len();
+    format!("{text} … [{} bytes, first {shown} shown]", b.len())
+}
+
 fn as_string_vec(v: &Value) -> Vec<String> {
     match v {
-        Value::Array(items) => items.iter().map(display_string).collect(),
+        Value::Array(items) => items.iter().map(element).collect(),
         _ => Vec::new(),
     }
 }
@@ -643,7 +878,7 @@ fn as_field_pairs(items: &[Value]) -> Vec<(String, String)> {
         .as_chunks::<2>()
         .0
         .iter()
-        .map(|c| (display_string(&c[0]), display_string(&c[1])))
+        .map(|c| (element(&c[0]), element(&c[1])))
         .collect()
 }
 
@@ -656,7 +891,7 @@ fn as_scored_pairs(v: &Value) -> Vec<(String, f64)> {
         .0
         .iter()
         .map(|c| {
-            let member = display_string(&c[0]);
+            let member = element(&c[0]);
             // Scores come back as bulk strings in RESP2 and doubles in RESP3.
             let score = c[1].as_f64().unwrap_or(0.0);
             (member, score)
@@ -665,10 +900,10 @@ fn as_scored_pairs(v: &Value) -> Vec<(String, f64)> {
 }
 
 /// `HSCAN`/`SSCAN` reply is `[cursor, [items...]]`.
-fn scan_items(v: &Value) -> Result<Vec<Value>> {
+fn scan_items(v: &Value) -> Result<(String, Vec<Value>)> {
     match v {
         Value::Array(parts) if parts.len() == 2 => match &parts[1] {
-            Value::Array(items) => Ok(items.clone()),
+            Value::Array(items) => Ok((display_string(&parts[0]), items.clone())),
             other => Err(ConnError::Reply {
                 cmd: "SCAN",
                 detail: format!("items not an array: {other:?}"),
@@ -692,9 +927,19 @@ fn as_stream_entries(v: &Value) -> Vec<StreamEntry> {
             if pair.len() != 2 {
                 return None;
             }
-            let id = display_string(&pair[0]);
+            let id = element(&pair[0]);
             let fields = match &pair[1] {
-                Value::Array(kv) => as_field_pairs(kv),
+                Value::Array(kv) => {
+                    // An entry can carry any number of fields; keep a bounded few and say
+                    // how many more there were.
+                    let kept = kv.get(..MAX_ENTRY_FIELDS * 2).unwrap_or(kv);
+                    let mut fields = as_field_pairs(kept);
+                    let dropped = (kv.len() / 2).saturating_sub(fields.len());
+                    if dropped > 0 {
+                        fields.push(("…".into(), format!("{dropped} more fields not shown")));
+                    }
+                    fields
+                }
                 _ => Vec::new(),
             };
             Some(StreamEntry { id, fields })
@@ -825,7 +1070,8 @@ mod tests {
     fn scan_items_rejects_malformed_replies() {
         assert!(scan_items(&Value::from("nope")).is_err());
         let ok = Value::Array(vec![Value::from("0"), Value::Array(vec![Value::from("x")])]);
-        assert_eq!(scan_items(&ok).unwrap().len(), 1);
+        let (cursor, items) = scan_items(&ok).unwrap();
+        assert_eq!((cursor.as_str(), items.len()), ("0", 1));
     }
 
     #[test]
@@ -883,21 +1129,166 @@ mod tests {
     #[test]
     fn scan_count_overshoot_is_capped_in_the_decoded_page() {
         let set_reply = Value::Array(vec![
-            Value::from("1"),
+            Value::from("0"),
             Value::Array((0..PAGE + 20).map(|i| Value::from(i as i64)).collect()),
         ]);
-        let KeyValue::Set(set) = decode_set(&set_reply).unwrap() else {
+        let (KeyValue::Set(set), coverage) = decode_set(&set_reply).unwrap() else {
             unreachable!()
         };
         assert_eq!(set.len(), PAGE);
+        // Cursor 0 says the server sent everything, but the cap dropped 20 of it.
+        assert_eq!(coverage, Coverage::Partial { shown: PAGE });
 
         let hash_items = (0..PAGE + 20)
             .flat_map(|i| [Value::from(format!("f{i}")), Value::from("v")])
             .collect();
-        let hash_reply = Value::Array(vec![Value::from("1"), Value::Array(hash_items)]);
-        let KeyValue::Hash(hash) = decode_hash(&hash_reply).unwrap() else {
+        let hash_reply = Value::Array(vec![Value::from("0"), Value::Array(hash_items)]);
+        let (KeyValue::Hash(hash), coverage) = decode_hash(&hash_reply).unwrap() else {
             unreachable!()
         };
         assert_eq!(hash.len(), PAGE);
+        assert_eq!(coverage, Coverage::Partial { shown: PAGE });
+    }
+
+    fn scan_reply(cursor: &str, n: usize) -> Value {
+        Value::Array(vec![
+            Value::from(cursor),
+            Value::Array((0..n).map(|i| Value::from(format!("m{i}"))).collect()),
+        ])
+    }
+
+    #[test]
+    fn a_cursor_page_is_complete_only_when_the_cursor_says_so() {
+        // 0.1.7 discarded the cursor: a 10-member first page of a 1,000-member set looked
+        // exactly like a 10-member set.
+        let (_, more) = decode_set(&scan_reply("1792", 10)).unwrap();
+        assert_eq!(more, Coverage::Partial { shown: 10 });
+        let (_, done) = decode_set(&scan_reply("0", 10)).unwrap();
+        assert_eq!(done, Coverage::Complete);
+    }
+
+    #[test]
+    fn a_full_ranged_page_is_partial_unless_the_size_proves_otherwise() {
+        let full = Value::Array((0..PAGE).map(|i| Value::from(i as i64)).collect());
+        let short = Value::Array((0..3).map(|i| Value::from(i as i64)).collect());
+
+        assert_eq!(
+            decode_value(Kind::List, &short, None).unwrap().1,
+            Coverage::Complete
+        );
+        // A full page is what a larger list looks like, so without a size it is partial...
+        assert_eq!(
+            decode_value(Kind::List, &full, None).unwrap().1,
+            Coverage::Partial { shown: PAGE }
+        );
+        assert_eq!(
+            decode_value(Kind::List, &full, Some(5_000)).unwrap().1,
+            Coverage::Partial { shown: PAGE }
+        );
+        // ...and complete when the size says it is all there is.
+        assert_eq!(
+            decode_value(Kind::List, &full, Some(PAGE as u64))
+                .unwrap()
+                .1,
+            Coverage::Complete
+        );
+    }
+
+    #[test]
+    fn a_string_of_exactly_the_cap_is_not_marked_truncated() {
+        // 0.1.7 asked for exactly MAX bytes and called `>= MAX` truncated, so a value of
+        // exactly 64 KiB carried a "truncated" marker with nothing cut.
+        let exact = Value::from("a".repeat(MAX_STRING_BYTES));
+        let (KeyValue::String(s), coverage) = decode_string(&exact) else {
+            unreachable!()
+        };
+        assert_eq!(coverage, Coverage::Complete);
+        assert!(!s.contains("truncated"));
+
+        // One byte over -- which only the probe byte can reveal -- is truncated, and what
+        // is kept never exceeds the cap.
+        let over = Value::from("a".repeat(STRING_PROBE_BYTES));
+        let (KeyValue::String(s), coverage) = decode_string(&over) else {
+            unreachable!()
+        };
+        assert_eq!(
+            coverage,
+            Coverage::Partial {
+                shown: MAX_STRING_BYTES
+            }
+        );
+        assert!(s.ends_with("... truncated ..."));
+        let kept = s.split("\n\n").next().unwrap_or_default();
+        assert_eq!(
+            kept.len(),
+            MAX_STRING_BYTES,
+            "kept more or less than the cap"
+        );
+    }
+
+    #[test]
+    fn truncating_a_utf8_string_keeps_it_valid() {
+        let raw = format!("{}é", "a".repeat(MAX_STRING_BYTES - 1)); // é straddles the cap
+        let (KeyValue::String(s), _) = decode_string(&Value::from(raw)) else {
+            unreachable!()
+        };
+        assert!(s.starts_with(&"a".repeat(MAX_STRING_BYTES - 1)));
+        assert!(
+            !s.contains('é'),
+            "a split char must be dropped, not mangled"
+        );
+    }
+
+    #[test]
+    fn the_speculative_string_read_asks_for_one_probe_byte() {
+        let (cmd, args) = value_cmd(Kind::String, "k");
+        assert_eq!(cmd, "GETRANGE");
+        assert_eq!(
+            args.get(2).and_then(Value::as_i64),
+            Some(MAX_STRING_BYTES as i64)
+        );
+    }
+
+    #[test]
+    fn an_oversized_element_is_capped_without_being_copied_whole() {
+        let big = Value::from("é".repeat(MAX_ELEMENT_BYTES)); // 2x the cap, multibyte
+        let kept = element(&big);
+        assert!(kept.len() <= MAX_ELEMENT_BYTES + 64, "{}", kept.len());
+        assert!(
+            kept.contains(&format!("[{} bytes", MAX_ELEMENT_BYTES * 2)),
+            "{kept:.80}"
+        );
+        let binary = Value::Bytes(vec![0xFF; MAX_ELEMENT_BYTES * 4].into());
+        assert!(element(&binary).starts_with(&format!("<{} bytes>", MAX_ELEMENT_BYTES * 4)));
+        // Small elements are untouched.
+        assert_eq!(element(&Value::from("small")), "small");
+    }
+
+    #[test]
+    fn a_failed_type_is_an_error_not_an_absent_key() {
+        let denied = Err(ConnError::Command {
+            cmd: "TYPE",
+            source: fred::error::Error::new(
+                fred::error::ErrorKind::Unknown,
+                "NOPERM this user has no permissions to run the 'type' command",
+            ),
+        });
+        assert!(type_from(&[denied], 0).is_err());
+        assert_eq!(
+            type_from(&[Ok(Value::from("none"))], 0).unwrap(),
+            Kind::None
+        );
+    }
+
+    #[test]
+    fn wrongtype_is_recognised_and_other_failures_are_not() {
+        let err = |msg: &'static str| ConnError::Command {
+            cmd: "HSCAN",
+            source: fred::error::Error::new(fred::error::ErrorKind::Unknown, msg),
+        };
+        assert!(is_wrongtype(&err(
+            "WRONGTYPE Operation against a key holding the wrong kind of value"
+        )));
+        assert!(!is_wrongtype(&err("NOPERM no permissions")));
     }
 }

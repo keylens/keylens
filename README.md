@@ -99,7 +99,8 @@ curl -fsSL https://github.com/keylens/keylens/releases/latest/download/install.s
 ```
 
 It installs to `/usr/local/bin` and asks for `sudo` only if that directory isn't writable.
-Two knobs:
+Before extracting anything it checks the archive against the release's `checksums.txt` and
+stops on a mismatch (since 0.1.8). Two knobs:
 
 ```sh
 VERSION=v0.1.0 curl -fsSL .../install.sh | bash      # pin a release
@@ -137,6 +138,14 @@ Every release ships a `checksums.txt`. Worth verifying if you're piping to a she
 ```sh
 curl -fsSLO https://github.com/keylens/keylens/releases/latest/download/checksums.txt
 sha256sum --check --ignore-missing checksums.txt
+```
+
+A checksum proves the download matches the release, not who built the release. From 0.1.8
+every archive also carries a signed build-provenance attestation tying it to the release
+workflow and commit:
+
+```sh
+gh attestation verify keylens-<target>.tar.gz --repo keylens/keylens
 ```
 
 **From source** — needs Rust 1.90+ (edition 2024):
@@ -177,7 +186,7 @@ keylens --url redis://127.0.0.1:6379/3          # database 3
 keylens --url rediss://cache.example.com:6380   # TLS
 keylens --url redis://:password@host:6379       # password only
 keylens --url redis://user:password@host:6379   # ACL user
-keylens --url redis-sentinel://host:26379/mymaster
+keylens --url 'redis-sentinel://host:26379/0?sentinelServiceName=mymaster'
 keylens --url redis-cluster://node1:6379
 ```
 
@@ -193,8 +202,14 @@ error. If your server uses a private CA, point at it with `SSL_CERT_FILE`:
 SSL_CERT_FILE=/path/to/ca.crt keylens --url rediss://redis.internal:6379
 ```
 
+For Sentinel, the path is the database number and the service name is a query parameter.
+Credentials in the url's userinfo (`redis-sentinel://:pw@host:26379/0?…`) are used for both
+the sentinels and the primary; a separate `sentinelPassword` parameter is not read (it is
+still masked wherever keylens shows a url).
+
 Since a URL on the command line lands in your shell history and in `ps`, prefer the
-environment variable or a named connection for anything with a password:
+environment variable or a named connection for anything with a password. keylens prints a
+one-line note when it sees a password in `--url`:
 
 ```sh
 export KEYLENS_URL=rediss://user:pass@prod.example.com:6379
@@ -306,7 +321,7 @@ A bare search term becomes a substring match (`emails` → `*emails*`). Type you
 | `KEYLENS_URL` | Default connection URL |
 | `NO_COLOR` | Disable colour (any value). `--no-color` does the same |
 | `KEYLENS_LOG` | Log filter, e.g. `debug` or `keylens_conn=trace` |
-| `KEYLENS_LOG_FILE` | Where to write logs in the browser |
+| `KEYLENS_LOG_FILE` | Where to write logs in the browser. Created owner-only (`0600`); a symlink is refused |
 | `SSL_CERT_FILE` | CA bundle for `rediss://` against a private CA |
 
 Logs never go to stderr while the browser is running — they'd paint over the frame. Set
@@ -490,7 +505,7 @@ the reason.
 | Streams + consumer groups | ✅ | ✅ | — no stream types |
 | BullMQ lens | ✅ | ✅ | — needs streams |
 
-The Recached column is what `keylens probe` reports against `ghcr.io/recached-dev/recached:v0.3.2`;
+The Recached column is what `keylens probe` reports against `ghcr.io/recached-sh/recached:v0.3.2`;
 it is maintained by hand, which is why [ROADMAP.md](ROADMAP.md) wants it generated from the probe
 instead. Nothing keys off these versions at runtime — keylens gates on the capability it detected,
 never on a version string — so a Recached that gains a command lights the pane up with no change here.
@@ -537,8 +552,17 @@ That's what v0.1 is designed for. It is read-only throughout — there is no cod
 writes — and `KEYS` is never issued, only cursor-paged `SCAN` with a bounded `COUNT`. A
 workspace test fails the build if `KEYS`, `HGETALL` or `SMEMBERS` appear in command source.
 Unbounded collection reads are treated the same way as `KEYS`, because
-`HGETALL` on a two-million-field hash blocks the server just as hard. Mutations are a v0.2
-question and will be gated behind the `readonly` connection flag that already exists.
+`HGETALL` on a two-million-field hash blocks the server just as hard. Since 0.1.8 the
+connection layer also refuses read-only commands with unbounded *arguments* —
+`LRANGE k 0 -1`, `XRANGE` without `COUNT`, `SLOWLOG GET -1` — before they reach the server.
+Mutations are a v0.2 question and will be gated behind the `readonly` connection flag that
+already exists.
+
+Read-only is not the same as free. What keylens can and cannot bound is listed per command in
+the [`keylens_conn::bounds`](crates/keylens-conn/src/bounds.rs) docs. In short, ranged reads
+are hard-bounded in element count. `SCAN … COUNT` is only a hint to the server.
+`PUBSUB CHANNELS`, `CLIENT LIST` and `XINFO CONSUMERS` have no count at all, so their whole
+reply crosses the wire; keylens bounds what it keeps and tells you how many there were.
 
 ### Does it work with Upstash, ElastiCache, MemoryDB or Aiven?
 
@@ -550,8 +574,11 @@ Note that most managed hosts are TLS-only, so the scheme is `rediss://`.
 
 ### Does it support Redis Cluster and Sentinel?
 
-Yes — `redis-cluster://` and `redis-sentinel://host:26379/mymaster`. There's a cluster
-topology pane, which distinguishes "this is a standalone server" from "your host blocked
+Yes — `redis-cluster://` and `redis-sentinel://host:26379/0?sentinelServiceName=mymaster`.
+Both are tested against real topologies (the compose `topology` profile): a cluster scan
+covers every primary exactly once, a scan that loses a primary reports itself incomplete, and
+live BullMQ throughput needs the queues' streams in one hash slot (a `{tag}` prefix). There's
+a cluster topology pane, which distinguishes "this is a standalone server" from "your host blocked
 `CLUSTER`" because those are the same probe failure but not the same problem.
 
 ### How is this different from RedisInsight?
@@ -622,7 +649,10 @@ docker compose up -d --build
 |---|---|
 | Redis 8 | `redis://127.0.0.1:6379` |
 | Valkey 8 | `redis://127.0.0.1:6380` |
-| Recached (optional) | `redis://127.0.0.1:6381` |
+| Recached 0.2.3 (profile `recached`) | `redis://127.0.0.1:6381` |
+| Recached 0.5.2 (profile `recached`) | `redis://127.0.0.1:6382` |
+| Redis Cluster, 3 primaries (profile `topology`) | `redis-cluster://127.0.0.1:7100` |
+| Sentinel + primary (profile `topology`) | `redis-sentinel://:sentinel-pw@127.0.0.1:26390/0?sentinelServiceName=keylens` |
 
 Recached sits behind a compose profile so the ordinary two-server fixture doesn't pull a third
 image. The image is a public GHCR package — no `docker login`:
@@ -648,6 +678,23 @@ cargo run -p keylens -- --url redis://127.0.0.1:6380 probe      # vendor detecti
 
 cargo test                                        # hermetic: no Redis, no terminal
 cargo test --test live -- --ignored               # against the fixtures above
+cargo test --test faults -- --ignored --test-threads 1       # blackholed, refused and severed links
+cargo test --test adversarial -- --ignored --test-threads 1  # hostile names, huge values, many consumers
+KEYLENS_TEST_CLUSTER_URL=redis-cluster://127.0.0.1:7100 \
+KEYLENS_TEST_SENTINEL_URL='redis-sentinel://:sentinel-pw@127.0.0.1:26390/0?sentinelServiceName=keylens' \
+  cargo test --test topology -- --ignored --test-threads 1
+```
+
+`faults` puts a TCP proxy between keylens and the real server that can blackhole, refuse or
+sever connections, or add latency; `adversarial` writes the data a hostile tenant could.
+
+Benchmarks run one scenario per process so peak RSS and CPU are attributable, against a
+server with no other traffic:
+
+```sh
+cargo build --release --example bench
+target/release/examples/bench seed           # seeds the compose Valkey on :6380
+bench/run.sh target/release/examples/bench   # markdown table
 ```
 
 Rendering is tested headlessly with ratatui's `TestBackend`, so pane layout and every
@@ -657,11 +704,18 @@ value viewer are covered in CI without a terminal.
 
 These are enforced, not aspirational:
 
-- **`KEYS` is never issued.** Only cursor-paged `SCAN` with a bounded `COUNT`. The same
+- **`KEYS` is never issued.** Only cursor-paged `SCAN` with a bounded `COUNT` hint. The same
   applies to unbounded collection reads — `HGETALL` on a two-million-field hash blocks the
   server just as hard, so hashes and sets are read with `HSCAN`/`SSCAN` and lists, zsets
   and streams with explicit ranges. A workspace test fails the build if any of those
-  literals appear in source.
+  literals appear in source, and the connection layer refuses unbounded arguments.
+- **Bounds are claimed only where Redis provides them.** Storage and rendering are bounded
+  everywhere: one page per value, 16 KiB per element, 1,000 rows of any count-less reply,
+  500,000 keys in the tree. Wire transfer is bounded only where the command takes a range
+  or a count; where it can't be (`PUBSUB CHANNELS`, `CLIENT LIST`, per-element sizes), the
+  docs say so and the UI shows the true total.
+- **Unknown is not zero.** A count that could not be read renders as `?`, a first page says
+  it is a first page, and a scan that failed never reports itself complete.
 - **Vendor is detected, never assumed.** `INFO server_name` distinguishes Redis, Valkey,
   Recached, Dragonfly, KeyDB and Garnet — and a server that answers no `INFO` at all still
   connects and browses. Feature gating keys off detected capabilities, never a version.

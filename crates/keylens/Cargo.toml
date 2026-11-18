@@ -41,6 +41,8 @@ bytesize.workspace = true
 
 [dev-dependencies]
 keylens-conn = { workspace = true, features = ["dangerous-test-commands"] }
+# The fault-injection proxy in tests/support needs sockets; the shipped binary does not.
+tokio = { workspace = true, features = ["net", "io-util"] }
 
 [lints]
 workspace = true

@@ -5,10 +5,8 @@ use std::time::Duration;
 use color_eyre::Result;
 use crossterm::event::{Event, EventStream, KeyEventKind};
 use futures::StreamExt;
-use keylens_bullmq::EventsStatus;
 use keylens_conn::{Conn, redact_url};
 use tokio::sync::mpsc;
-use tracing::warn;
 
 use crate::app::App;
 use crate::config::Target;
@@ -106,13 +104,9 @@ pub async fn run(target: &Target) -> Result<()> {
     // Detection first: it's cheap, and its result decides whether a queues tab exists and
     // which streams the event reader follows.
     req_tx.send(Request::Detect).await.ok();
-    req_tx
-        .send(Request::Rescan {
-            pattern: None,
-            kind: None,
-        })
-        .await
-        .ok();
+    // Through the app, not the raw sender: the scan generation is issued there, and a
+    // batch whose generation the app never recorded would be dropped as stale.
+    app.rescan().await;
 
     let streamer = StreamerHandle {
         url: url.to_string(),
@@ -120,7 +114,7 @@ pub async fn run(target: &Target) -> Result<()> {
         task: None,
     };
 
-    let result = event_loop(&mut terminal, &mut app, &mut up_rx, &req_tx, streamer, rtt).await;
+    let result = event_loop(&mut terminal, &mut app, &mut up_rx, streamer, rtt).await;
     ratatui::restore();
 
     // `app` owns a clone of the request sender and outlives this scope, so dropping this
@@ -243,26 +237,13 @@ impl StreamerHandle {
         let url = self.url.clone();
         let tx = self.updates.clone();
 
-        self.task = Some(tokio::spawn(async move {
-            // Its own connection: `XREAD BLOCK` holds the connection for the duration of
-            // the block, so sharing the worker's would stall every key lookup behind it.
-            let conn = match Conn::connect(&url, "events").await {
-                Ok(c) => c,
-                Err(e) => {
-                    warn!(error = %e, "could not open a connection for the event stream");
-                    // Say so in the UI. Interactive logs go to a sink, so a silent return
-                    // leaves the queue table claiming it is still "attaching…" forever.
-                    tx.send(Update::EventsStatus(EventsStatus::Unavailable(
-                        e.to_string(),
-                    )))
-                    .await
-                    .ok();
-                    return;
-                }
-            };
-
-            crate::events::run(conn, prefix, queues, tx).await;
-        }));
+        self.task = Some(tokio::spawn(crate::events::follow(
+            url,
+            keylens_conn::ConnOptions::default(),
+            prefix,
+            queues,
+            tx,
+        )));
     }
 }
 
@@ -278,7 +259,6 @@ async fn event_loop(
     terminal: &mut ratatui::DefaultTerminal,
     app: &mut App,
     updates: &mut mpsc::Receiver<Update>,
-    requests: &mpsc::Sender<Request>,
     mut streamer: StreamerHandle,
     rtt: Duration,
 ) -> Result<()> {
@@ -345,7 +325,7 @@ async fn event_loop(
 
             _ = info_tick.tick() => {
                 // Stats go stale while you browse; refreshing them is cheap.
-                requests.try_send(Request::RefreshInfo).ok();
+                app.refresh_info().await;
             }
         }
 

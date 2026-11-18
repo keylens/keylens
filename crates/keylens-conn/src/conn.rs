@@ -16,6 +16,7 @@ use futures::{Stream, StreamExt, future::join_all};
 use std::pin::Pin;
 use tracing::debug;
 
+use crate::bounds::{check_command, check_scan_count, check_xread};
 use crate::capability::{Availability, Capabilities, Feature, classify};
 use crate::error::{ConnError, Result, classify_connect, connect_timeout};
 use crate::server_info::ServerInfo;
@@ -32,33 +33,110 @@ pub struct ScanPage {
 /// A Redis cursor belongs to one server, so a cluster scan cannot be represented by the
 /// single cursor string used by [`ScanPage`]. This wrapper owns fred's per-primary scanner
 /// state and exposes one page at a time without buffering the whole keyspace.
+/// One page from fred: the keys, and how many names were not valid UTF-8.
+type RawPage = std::result::Result<(Vec<String>, u64), fred::error::Error>;
+
 pub struct KeyScanner {
-    pages: Pin<Box<dyn Stream<Item = std::result::Result<ScanResult, fred::error::Error>> + Send>>,
+    pages: Pin<Box<dyn Stream<Item = RawPage> + Send>>,
+    /// Keys whose names are not valid UTF-8, seen so far and not returned.
+    ///
+    /// keylens addresses keys by `String`, so a binary key name cannot be listed or read.
+    /// 0.1.7 dropped them without a trace; the tree then misrepresented the keyspace.
+    /// They are still not shown, but they are counted, and the count is reported.
+    unlisted: u64,
+    /// Deadline for one page.
+    ///
+    /// fred sends scan pages without a response timeout -- `default_command_timeout` does
+    /// not cover them. Measured on a half-open link: an ordinary command failed at 20s, a
+    /// scan page was still waiting at 60s. The worker handles requests in order, so one
+    /// stuck page wedged every queue, pane and `m` request behind it, indefinitely.
+    page_timeout: std::time::Duration,
+    /// Set by the first error, and permanent.
+    ///
+    /// fred's scan stream *ends* after an error -- the cursor that failed is gone. Without
+    /// this, the next call saw the end of the stream and returned `None`, which callers
+    /// rightly read as "every key visited": a scan that died halfway reported itself
+    /// complete.
+    failed: Option<String>,
 }
 
 impl KeyScanner {
+    fn new(
+        pages: Pin<Box<dyn Stream<Item = RawPage> + Send>>,
+        page_timeout: std::time::Duration,
+    ) -> Self {
+        Self {
+            pages,
+            unlisted: 0,
+            page_timeout,
+            failed: None,
+        }
+    }
+
     /// Return the next page, or `None` once every relevant server has returned cursor zero.
+    ///
+    /// # Errors
+    ///
+    /// The scan failed. Every later call fails too: a scan cannot be resumed past a lost
+    /// cursor, so the only honest answers left are "failed" and "start a new scan".
     pub async fn next_page(&mut self) -> Result<Option<Vec<String>>> {
-        match self.pages.next().await {
-            Some(Ok(mut page)) => {
-                let keys = page
-                    .take_results()
-                    .unwrap_or_default()
-                    .into_iter()
-                    .filter_map(|key| key.into_string())
-                    .collect();
-                // Explicitly continue this node. Dropping also continues it, but spelling
-                // this out makes the throttling contract independent of Drop behaviour.
-                page.next();
+        if let Some(why) = &self.failed {
+            return Err(ConnError::Reply {
+                cmd: "SCAN",
+                detail: format!("scan stopped by an earlier error ({why}); rescan to start over"),
+            });
+        }
+        let next = match tokio::time::timeout(self.page_timeout, self.pages.next()).await {
+            Ok(next) => next,
+            Err(_) => Some(Err(fred::error::Error::new(
+                fred::error::ErrorKind::Timeout,
+                format!(
+                    "no SCAN reply within {}s; the connection may be half-open",
+                    self.page_timeout.as_secs()
+                ),
+            ))),
+        };
+        match next {
+            Some(Ok((keys, unlisted))) => {
+                self.unlisted = self.unlisted.saturating_add(unlisted);
                 Ok(Some(keys))
             }
-            Some(Err(source)) => Err(ConnError::Command {
-                cmd: "SCAN",
-                source,
-            }),
+            Some(Err(source)) => {
+                self.failed = Some(source.details().to_string());
+                Err(ConnError::Command {
+                    cmd: "SCAN",
+                    source,
+                })
+            }
             None => Ok(None),
         }
     }
+
+    /// Keys seen whose names are not valid UTF-8, and so were not returned.
+    pub fn unlisted(&self) -> u64 {
+        self.unlisted
+    }
+
+    /// Whether this scan has failed, and so can never complete.
+    pub fn has_failed(&self) -> bool {
+        self.failed.is_some()
+    }
+}
+
+/// Turn one fred scan page into its keys (and a count of non-UTF-8 names), and ask for
+/// the next one.
+fn page_keys(mut page: ScanResult) -> (Vec<String>, u64) {
+    let raw = page.take_results().unwrap_or_default();
+    let total = raw.len();
+    let keys: Vec<String> = raw
+        .into_iter()
+        .filter_map(|key| key.into_string())
+        .collect();
+    let unlisted = u64::try_from(total.saturating_sub(keys.len())).unwrap_or(u64::MAX);
+    // Explicitly continue this node. Dropping also continues it, but spelling this out
+    // makes the throttling contract independent of Drop behaviour.
+    page.next();
+    (keys, unlisted)
 }
 
 impl ScanPage {
@@ -102,8 +180,39 @@ const UNRESPONSIVE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs
 /// discovered by the kernel rather than by the user's next keypress.
 const KEEPALIVE_IDLE: std::time::Duration = std::time::Duration::from_secs(30);
 
+/// Timeouts for one connection.
+///
+/// The defaults suit a TUI on any link from localhost to another continent. Shorter ones
+/// are for tests that need a dead link to be declared dead in seconds, not minutes.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ConnOptions {
+    /// Bound on the whole handshake.
+    pub connect_timeout: std::time::Duration,
+    /// Bound on any single command, and on any single scan page.
+    pub command_timeout: std::time::Duration,
+}
+
+impl Default for ConnOptions {
+    fn default() -> Self {
+        Self {
+            connect_timeout: DEFAULT_CONNECT_TIMEOUT,
+            command_timeout: COMMAND_TIMEOUT,
+        }
+    }
+}
+
 pub struct Conn {
     client: Client,
+    command_timeout: std::time::Duration,
+    /// Set once if the server rejects our credentials on a reconnect.
+    ///
+    /// fred reconnects forever by default, and a reconnect that fails authentication is
+    /// invisible to callers: every command just times out. Measured after a password
+    /// rotation: "Request timed out" on every command, while the client kept retrying the
+    /// stale password in the background -- a retry storm a managed host may lock out.
+    auth_lost: std::sync::Arc<std::sync::OnceLock<String>>,
+    /// Watches fred's connection-error stream for that rejection. Aborted on drop.
+    watcher: tokio::task::JoinHandle<()>,
     server: ServerInfo,
     caps: Capabilities,
     label: String,
@@ -127,11 +236,32 @@ impl Conn {
         label: impl Into<String>,
         timeout: std::time::Duration,
     ) -> Result<Self> {
+        Self::connect_with(
+            url,
+            label,
+            ConnOptions {
+                connect_timeout: timeout,
+                ..ConnOptions::default()
+            },
+        )
+        .await
+    }
+
+    /// Connect with explicit [`ConnOptions`].
+    pub async fn connect_with(
+        url: &str,
+        label: impl Into<String>,
+        options: ConnOptions,
+    ) -> Result<Self> {
+        let ConnOptions {
+            connect_timeout: timeout,
+            command_timeout,
+        } = options;
         let config = Config::from_url(url).map_err(|e| ConnError::Url(e.to_string()))?;
         let client = Builder::from_config(config)
             .with_performance_config(|c| {
                 // See COMMAND_TIMEOUT: fred's default here is "wait forever".
-                c.default_command_timeout = COMMAND_TIMEOUT;
+                c.default_command_timeout = command_timeout;
             })
             .with_connection_config(|c| {
                 // Generous, because these are *per-step* limits and the client's own
@@ -222,8 +352,14 @@ impl Conn {
             }
         };
 
+        let auth_lost = std::sync::Arc::new(std::sync::OnceLock::new());
+        let watcher = watch_for_auth_loss(&client, auth_lost.clone());
+
         Ok(Self {
             client,
+            command_timeout,
+            auth_lost,
+            watcher,
             server,
             caps,
             label: label.into(),
@@ -263,22 +399,35 @@ impl Conn {
 
     /// Start a throttled scan. Cluster connections scan every primary; standalone and
     /// sentinel connections scan their selected server.
+    ///
+    /// # Errors
+    ///
+    /// [`ConnError::Unbounded`] when `count` is zero or above
+    /// [`MAX_SCAN_COUNT`](crate::bounds::MAX_SCAN_COUNT). It is a hint to the server, not a
+    /// bound on the reply -- see [`crate::bounds`].
     pub fn key_scanner(
         &self,
         pattern: Option<&str>,
         count: u32,
         type_filter: Option<&str>,
-    ) -> KeyScanner {
+    ) -> Result<KeyScanner> {
+        check_scan_count(count)?;
         let pattern = pattern.unwrap_or("*").to_string();
         let scan_type = type_filter.and_then(parse_scan_type);
-        let pages: Pin<
-            Box<dyn Stream<Item = std::result::Result<ScanResult, fred::error::Error>> + Send>,
-        > = if self.client.is_clustered() {
-            Box::pin(self.client.scan_cluster(pattern, Some(count), scan_type))
+        let pages: Pin<Box<dyn Stream<Item = RawPage> + Send>> = if self.client.is_clustered() {
+            Box::pin(
+                self.client
+                    .scan_cluster(pattern, Some(count), scan_type)
+                    .map(|page| page.map(page_keys)),
+            )
         } else {
-            Box::pin(self.client.scan(pattern, Some(count), scan_type))
+            Box::pin(
+                self.client
+                    .scan(pattern, Some(count), scan_type)
+                    .map(|page| page.map(page_keys)),
+            )
         };
-        KeyScanner { pages }
+        Ok(KeyScanner::new(pages, self.command_timeout))
     }
 
     /// Re-read `INFO`. Cheap enough for the stats pane's refresh tick.
@@ -303,6 +452,7 @@ impl Conn {
                 detail: "a single cursor cannot scan Redis Cluster; use Conn::key_scanner".into(),
             });
         }
+        check_scan_count(count)?;
         let mut args: Vec<Value> = vec![cursor.into()];
         if let Some(p) = pattern {
             args.push("MATCH".into());
@@ -335,21 +485,38 @@ impl Conn {
 
     /// Run a command through the read-only allowlist used by built-in and third-party
     /// lenses. Capability checks remain the caller's job.
+    ///
+    /// # Errors
+    ///
+    /// [`ConnError::UnsafeCommand`] for a command that is not read-only, and
+    /// [`ConnError::Unbounded`] for one whose arguments ask for an unbounded read. See
+    /// [`crate::bounds`] for exactly what is and is not bounded on the wire.
     pub async fn cmd(&self, name: &'static str, args: Vec<Value>) -> Result<Value> {
-        if !read_only_command(name, &args) {
-            return Err(ConnError::UnsafeCommand(name));
-        }
+        check_command(name, &args)?;
         self.execute(name, args).await
     }
 
+    /// The terminal error once credentials were rejected on reconnect, else `None`.
+    fn auth_failure(&self) -> Option<ConnError> {
+        self.auth_lost
+            .get()
+            .map(|why| ConnError::AuthLost(why.clone()))
+    }
+
     async fn execute(&self, name: &'static str, args: Vec<Value>) -> Result<Value> {
+        if let Some(e) = self.auth_failure() {
+            return Err(e);
+        }
         self.client
             .custom(
                 CustomCommand::new_static(name, ClusterHash::FirstKey, false),
                 args,
             )
             .await
-            .map_err(|source| ConnError::Command { cmd: name, source })
+            .map_err(|source| {
+                self.auth_failure()
+                    .unwrap_or(ConnError::Command { cmd: name, source })
+            })
     }
 
     /// Raw command access for live-test fixture setup only.
@@ -360,6 +527,12 @@ impl Conn {
     }
 
     /// Blocking stream read with the client library's correct routing and connection flags.
+    ///
+    /// # Errors
+    ///
+    /// [`ConnError::Unbounded`] for a zero or oversized `count`, `BLOCK 0` (wait forever),
+    /// a block longer than [`MAX_BLOCK_MS`](crate::bounds::MAX_BLOCK_MS), or `keys` and
+    /// `ids` of different lengths.
     pub async fn xread(
         &self,
         keys: &[String],
@@ -367,12 +540,18 @@ impl Conn {
         count: u64,
         block_ms: u64,
     ) -> Result<Value> {
+        check_xread(keys.len(), ids.len(), count, block_ms)?;
+        if let Some(e) = self.auth_failure() {
+            return Err(e);
+        }
         self.client
             .xread(Some(count), Some(block_ms), keys.to_vec(), ids.to_vec())
             .await
-            .map_err(|source| ConnError::Command {
-                cmd: "XREAD",
-                source,
+            .map_err(|source| {
+                self.auth_failure().unwrap_or(ConnError::Command {
+                    cmd: "XREAD",
+                    source,
+                })
             })
     }
 
@@ -397,11 +576,10 @@ impl Conn {
         &self,
         cmds: &[(&'static str, Vec<Value>)],
     ) -> Result<Vec<Result<Value>>> {
-        if let Some((name, _)) = cmds
-            .iter()
-            .find(|(name, args)| !read_only_command(name, args))
-        {
-            return Err(ConnError::UnsafeCommand(name));
+        // All or nothing: one bad command refuses the batch before anything is sent, so a
+        // caller never gets a partly-executed pipeline it has to reason about.
+        for (name, args) in cmds {
+            check_command(name, args)?;
         }
         self.pipeline_unchecked(cmds).await
     }
@@ -419,6 +597,9 @@ impl Conn {
         &self,
         cmds: &[(&'static str, Vec<Value>)],
     ) -> Result<Vec<Result<Value>>> {
+        if let Some(e) = self.auth_failure() {
+            return Err(e);
+        }
         if self.client.is_clustered() {
             // A regular Redis pipeline is tied to one connection, while arbitrary keys in
             // a cluster can live on different primaries. Preserve correctness by letting
@@ -454,8 +635,19 @@ impl Conn {
                 })?;
         }
 
-        let replies = pipe.try_all::<Value>().await;
+        let mut replies = pipe.try_all::<Value>().await;
         if replies.len() != cmds.len() {
+            // fred answers a pipeline that failed as a whole -- a timeout, a dropped
+            // connection -- with that one error. Report it, not a "reply count" mismatch:
+            // 0.1.7 turned every pipeline timeout into "unexpected reply shape".
+            if let Some(pos) = replies.iter().position(|r| r.is_err())
+                && let Err(source) = replies.swap_remove(pos)
+            {
+                return Err(self.auth_failure().unwrap_or(ConnError::Command {
+                    cmd: "PIPELINE",
+                    source,
+                }));
+            }
             return Err(ConnError::Reply {
                 cmd: "PIPELINE",
                 detail: format!("expected {} replies, got {}", cmds.len(), replies.len()),
@@ -470,59 +662,52 @@ impl Conn {
     }
 }
 
-/// `CONFIG GET` parameters a lens may ask for.
-///
-/// An allowlist rather than "any `GET`", because `CONFIG GET` is read-only in the sense
-/// that matters to the *server* and not in the sense that matters here: `CONFIG GET
-/// requirepass` reads the server's password, and `CONFIG GET *` reads it along with
-/// everything else. Exact names only, so a glob matches nothing.
-///
-/// Only `maxmemory` is used today — by the capability probe. The rest are here because
-/// they are the obvious next asks for a stats pane and none of them is a credential.
-const CONFIG_PARAMS: &[&str] = &[
-    "maxmemory",
-    "maxmemory-policy",
-    "appendonly",
-    "save",
-    "databases",
-    "timeout",
-];
-
-/// The public connection surface is intentionally an allowlist.
-///
-/// **This is a discipline boundary, not a sandbox.** v0.1 lenses are compiled into the
-/// binary, so a lens that wanted to issue `FLUSHALL` could reach past this and call the
-/// client directly — nothing here prevents that, and nothing could. What it does prevent
-/// is the accident: a lens author reaching for `HGETALL` because paging is tedious, or
-/// widening `CONFIG GET` to a glob, and no reviewer noticing that the read-only promise
-/// on the tin quietly stopped being true.
-fn read_only_command(name: &str, args: &[Value]) -> bool {
-    let subcommand = || {
-        args.first()
-            .and_then(Value::as_string)
-            .unwrap_or_default()
-            .to_ascii_uppercase()
-    };
-    let arg_at = |i: usize| args.get(i).and_then(Value::as_string).unwrap_or_default();
-
-    match name {
-        "CLIENT" => matches!(subcommand().as_str(), "INFO" | "LIST"),
-        "CLUSTER" => matches!(subcommand().as_str(), "INFO" | "NODES" | "SHARDS" | "SLOTS"),
-        "CONFIG" => {
-            subcommand() == "GET"
-                && args.len() == 2
-                && CONFIG_PARAMS.contains(&arg_at(1).to_ascii_lowercase().as_str())
-        }
-        "MEMORY" => subcommand() == "USAGE",
-        "MODULE" => subcommand() == "LIST",
-        "PUBSUB" => matches!(subcommand().as_str(), "CHANNELS" | "NUMPAT" | "NUMSUB"),
-        "SLOWLOG" => matches!(subcommand().as_str(), "GET" | "LEN"),
-        "XINFO" => matches!(subcommand().as_str(), "STREAM" | "GROUPS" | "CONSUMERS"),
-        "GETRANGE" | "HGET" | "HMGET" | "HSCAN" | "HLEN" | "LLEN" | "LRANGE" | "PTTL" | "SCAN"
-        | "SCARD" | "SSCAN" | "STRLEN" | "TYPE" | "XLEN" | "XPENDING" | "XRANGE" | "ZCARD"
-        | "ZRANGE" | "ZREVRANGE" => true,
-        _ => false,
+impl Drop for Conn {
+    fn drop(&mut self) {
+        self.watcher.abort();
     }
+}
+
+/// Whether a connection-level error means our credentials no longer work.
+fn is_auth_failure(e: &Error) -> bool {
+    *e.kind() == fred::error::ErrorKind::Auth
+        || ["WRONGPASS", "NOAUTH", "NOPERM"]
+            .iter()
+            .any(|code| e.details().starts_with(code))
+}
+
+/// Watch `client`'s connection errors; on the first authentication failure, record it
+/// and stop the reconnect loop.
+///
+/// Stopping is the point. The rejection will repeat identically on every attempt, and
+/// each attempt is an authentication failure in the server's (or the host's) logs.
+fn watch_for_auth_loss(
+    client: &Client,
+    lost: std::sync::Arc<std::sync::OnceLock<String>>,
+) -> tokio::task::JoinHandle<()> {
+    let mut errors = client.error_rx();
+    let client = client.clone();
+    tokio::spawn(async move {
+        loop {
+            match errors.recv().await {
+                Ok((e, _)) if is_auth_failure(&e) => {
+                    let why = e
+                        .details()
+                        .lines()
+                        .next()
+                        .unwrap_or_default()
+                        .trim()
+                        .to_string();
+                    let _ = lost.set(why);
+                    debug!(error = %e, "credentials rejected on reconnect; stopping");
+                    let _ = client.quit().await;
+                    return;
+                }
+                Ok(_) | Err(tokio::sync::broadcast::error::RecvError::Lagged(_)) => {}
+                Err(tokio::sync::broadcast::error::RecvError::Closed) => return,
+            }
+        }
+    })
 }
 
 fn parse_scan_type(raw: &str) -> Option<ScanType> {
@@ -840,6 +1025,63 @@ mod tests {
         }
     }
 
+    #[tokio::test]
+    async fn a_scan_that_failed_never_reports_itself_complete() {
+        // fred ends its scan stream after an error. 0.1.7 then returned `Ok(None)` on the
+        // next call, and the browser printed "N keys" as though it had walked the lot.
+        let pages = futures::stream::iter(vec![
+            Ok((vec!["a".to_string()], 0)),
+            Err(fred::error::Error::new(
+                fred::error::ErrorKind::Timeout,
+                "Request timed out.",
+            )),
+        ]);
+        let mut scanner = KeyScanner::new(Box::pin(pages), COMMAND_TIMEOUT);
+
+        assert_eq!(
+            scanner.next_page().await.unwrap(),
+            Some(vec!["a".to_string()])
+        );
+        assert!(scanner.next_page().await.is_err());
+        assert!(scanner.has_failed());
+        // The stream is exhausted now -- and the answer must still not be "complete".
+        for _ in 0..3 {
+            assert!(
+                scanner.next_page().await.is_err(),
+                "a failed scan read as finished"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn a_clean_scan_still_completes() {
+        let pages = futures::stream::iter(vec![Ok((vec!["a".to_string()], 2)), Ok((vec![], 1))]);
+        let mut scanner = KeyScanner::new(Box::pin(pages), COMMAND_TIMEOUT);
+        assert!(scanner.next_page().await.unwrap().is_some());
+        assert!(scanner.next_page().await.unwrap().is_some());
+        assert_eq!(scanner.next_page().await.unwrap(), None);
+        assert!(!scanner.has_failed());
+        assert_eq!(
+            scanner.unlisted(),
+            3,
+            "non-UTF-8 names are counted, not lost"
+        );
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn a_scan_page_that_never_arrives_times_out_and_fails_the_scan() {
+        // fred applies no response timeout to scan pages; a half-open link held one for
+        // longer than a minute in a measured run. The page deadline is ours.
+        let pages = futures::stream::pending();
+        let mut scanner = KeyScanner::new(Box::pin(pages), std::time::Duration::from_secs(5));
+        let err = scanner.next_page().await.expect_err("must time out");
+        assert!(err.to_string().contains("no SCAN reply"), "{err}");
+        assert!(
+            scanner.has_failed(),
+            "a timed-out scan cannot continue its cursor"
+        );
+    }
+
     #[test]
     fn scan_page_completion_is_cursor_driven_not_emptiness() {
         // An empty page mid-iteration is normal -- SCAN can return zero keys while the
@@ -872,42 +1114,5 @@ mod tests {
     #[test]
     fn rejects_malformed_scan_reply() {
         assert!(parse_scan_reply(Value::from("nope")).is_err());
-    }
-
-    #[test]
-    fn public_command_surface_rejects_writes_and_unsafe_subcommands() {
-        assert!(read_only_command("TYPE", &[Value::from("k")]));
-        assert!(read_only_command(
-            "CONFIG",
-            &[Value::from("GET"), Value::from("maxmemory")]
-        ));
-        // `CONFIG GET` is read-only to the server and not to us: a glob returns
-        // `requirepass` and `masterauth` along with everything else.
-        assert!(
-            !read_only_command("CONFIG", &[Value::from("GET"), Value::from("*")]),
-            "a glob must not be a way to read every config value"
-        );
-        for secret in ["requirepass", "masterauth", "masteruser", "REQUIREPASS"] {
-            assert!(
-                !read_only_command("CONFIG", &[Value::from("GET"), Value::from(secret)]),
-                "{secret} is a credential, not a statistic"
-            );
-        }
-        assert!(!read_only_command(
-            "CONFIG",
-            &[
-                Value::from("SET"),
-                Value::from("maxmemory"),
-                Value::from("1")
-            ]
-        ));
-        assert!(!read_only_command(
-            "CLIENT",
-            &[Value::from("KILL"), Value::from("ID"), Value::from("1")]
-        ));
-        assert!(!read_only_command(
-            "SET",
-            &[Value::from("k"), Value::from("v")]
-        ));
     }
 }

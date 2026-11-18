@@ -7,6 +7,7 @@
 // guards the production paths would otherwise force `?` into every fixture.
 #![cfg_attr(test, allow(clippy::unwrap_used, clippy::expect_used, clippy::panic))]
 
+pub mod bounds;
 pub mod capability;
 pub mod conn;
 pub mod error;
@@ -25,14 +26,15 @@ pub use fred::prelude::Value;
 /// Re-exported for building RESP3 map replies (tests, and any caller that needs one).
 pub use fred::types::Map;
 
+pub use bounds::Capped;
 pub use capability::{Availability, Capabilities, Feature};
-pub use conn::{Conn, KeyScanner, ScanPage};
-pub use error::{ConnError, Result};
+pub use conn::{Conn, ConnOptions, KeyScanner, ScanPage};
+pub use error::{ConnError, Recovery, Result};
 pub use server::{ClientInfo, ClusterNode, ClusterTopology, PubSubChannel, SlowEntry};
 pub use server_info::{ServerInfo, Vendor};
 pub use stream::{ConsumerInfo, GroupInfo, StreamInfo};
 pub use url::redact_url;
-pub use value::{KeyMeta, KeyValue, Kind, StreamEntry};
+pub use value::{Coverage, KeyMeta, KeyRead, KeyValue, Kind, MAX_STRING_BYTES, PAGE, StreamEntry};
 
 /// Compute the Redis Cluster hash slot for a key, including `{hash-tag}` semantics.
 pub fn key_slot(key: &str) -> u16 {

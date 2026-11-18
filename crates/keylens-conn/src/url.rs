@@ -36,15 +36,65 @@
 /// assert_eq!(redact_url("redis://user@host:6379"), "redis://user@host:6379");
 /// ```
 pub fn redact_url(url: &str) -> String {
-    match url.split_once("://") {
-        Some((scheme, remainder)) => match redact_authority(remainder) {
-            Some(masked) => format!("{scheme}://{masked}"),
-            None => url.to_string(),
-        },
+    let (scheme, remainder) = match url.split_once("://") {
+        Some((scheme, remainder)) => (Some(scheme), remainder),
         // No scheme is not a promise that there are no credentials: `user:pass@host` is a
         // perfectly ordinary thing to find in a config file.
-        None => redact_authority(url).unwrap_or_else(|| url.to_string()),
+        None => (None, url),
+    };
+    let masked = redact_authority(remainder).unwrap_or_else(|| remainder.to_string());
+    let masked = redact_query(&masked);
+    match scheme {
+        Some(scheme) => format!("{scheme}://{masked}"),
+        None => masked,
     }
+}
+
+/// Query parameters whose values are credentials.
+///
+/// fred reads the Sentinel password from `?sentinelPassword=`, so a Sentinel url carries
+/// a secret *outside* the userinfo -- and 0.1.7 printed it verbatim from `keylens probe`,
+/// `keylens connections` and the status bar. Matched by substring, case-insensitively, so
+/// a parameter that merely looks like a credential is masked too: over-redacting is the
+/// only direction of error allowed here.
+const SECRET_PARAMS: &[&str] = &["pass", "pwd", "secret", "token", "auth", "key"];
+
+/// Mask the value of every credential-looking query parameter after the authority.
+fn redact_query(after_scheme: &str) -> String {
+    // The query starts after the authority. The userinfo is already masked (or absent),
+    // so the first `?` after the last `@` is the query's.
+    let authority_end = after_scheme.rfind('@').map_or(0, |at| at + 1);
+    let Some(q) = after_scheme
+        .get(authority_end..)
+        .and_then(|rest| rest.find('?'))
+        .map(|i| i + authority_end)
+    else {
+        return after_scheme.to_string();
+    };
+    let (head, query) = after_scheme.split_at(q);
+    let query = query.trim_start_matches('?');
+    let (query, fragment) = match query.split_once('#') {
+        Some((q, f)) => (q, Some(f)),
+        None => (query, None),
+    };
+    let masked: Vec<String> = query
+        .split('&')
+        .map(|pair| match pair.split_once('=') {
+            Some((k, _)) if is_secret_param(k) => format!("{k}=***"),
+            _ => pair.to_string(),
+        })
+        .collect();
+    let mut out = format!("{head}?{}", masked.join("&"));
+    if let Some(f) = fragment {
+        out.push('#');
+        out.push_str(f);
+    }
+    out
+}
+
+fn is_secret_param(name: &str) -> bool {
+    let lower = name.to_ascii_lowercase();
+    SECRET_PARAMS.iter().any(|s| lower.contains(s))
 }
 
 /// Mask the password in `<userinfo>@<host><suffix>`, or `None` when there is nothing to mask.
@@ -114,6 +164,47 @@ mod tests {
                 "password survived redaction: {url} -> {masked}"
             );
         }
+    }
+
+    #[test]
+    fn masks_the_sentinel_password_in_the_query_string() {
+        // 0.1.7: `keylens probe` printed this url with the sentinel password intact.
+        let url = "redis-sentinel://u:pw@10.0.0.1:26379/0?sentinelServiceName=mymaster\
+                   &sentinelUsername=admin&sentinelPassword=S3ntinelPw&node=10.0.0.2:26379";
+        let masked = redact_url(url);
+        assert!(!masked.contains("S3ntinelPw"), "{masked}");
+        assert!(!masked.contains(":pw@"), "{masked}");
+        assert!(masked.contains("sentinelPassword=***"), "{masked}");
+        // Everything that is not a credential survives, for diagnosis.
+        assert!(masked.contains("sentinelServiceName=mymaster"), "{masked}");
+        assert!(masked.contains("sentinelUsername=admin"), "{masked}");
+        assert!(masked.contains("node=10.0.0.2:26379"), "{masked}");
+    }
+
+    #[test]
+    fn masks_credential_parameters_whatever_their_case_and_with_no_userinfo() {
+        for (url, secret) in [
+            ("redis://host:6379/0?password=hunter2", "hunter2"),
+            ("redis://host:6379?PASS=hunter2", "hunter2"),
+            ("rediss://host?x=1&auth_token=tok123#frag", "tok123"),
+            ("host:6379?sentinelPassword=abc", "abc"),
+        ] {
+            let masked = redact_url(url);
+            assert!(!masked.contains(secret), "{url} -> {masked}");
+        }
+        assert_eq!(
+            redact_url("rediss://host?x=1&auth_token=tok123#frag"),
+            "rediss://host?x=1&auth_token=***#frag"
+        );
+        // No query, nothing touched.
+        assert_eq!(redact_url("redis://host:6379/0"), "redis://host:6379/0");
+    }
+
+    #[test]
+    fn a_question_mark_inside_a_password_is_not_mistaken_for_the_query() {
+        let masked = redact_url("rediss://default:pa?ss=word@db.example.com:25061?x=1");
+        assert!(!masked.contains("word"), "{masked}");
+        assert!(masked.ends_with("@db.example.com:25061?x=1"), "{masked}");
     }
 
     #[test]

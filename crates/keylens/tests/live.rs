@@ -79,7 +79,7 @@ async fn await_failed_jobs(conn: &Conn) -> (String, Vec<(String, f64)>) {
 /// Walk the keyspace the way the browser does, with a bound.
 async fn scan_all(conn: &Conn, pattern: Option<&str>, kind: Option<&str>) -> Vec<String> {
     let mut keys = Vec::new();
-    let mut scanner = conn.key_scanner(pattern, 500, kind);
+    let mut scanner = conn.key_scanner(pattern, 500, kind).unwrap();
     for _ in 0..200 {
         let Some(page) = scanner.next_page().await.unwrap() else {
             break;
@@ -330,7 +330,7 @@ async fn pipelined_queue_counts_match_individual_counts() {
         "need a few queues to catch a misalignment"
     );
 
-    for q in &queues {
+    for q in queues.iter() {
         for state in State::ALL {
             let key = format!("bull:{}:{}", q.name, state.suffix());
             let direct = conn
@@ -342,7 +342,9 @@ async fn pipelined_queue_counts_match_individual_counts() {
 
             // Counts move constantly on a live queue, so compare loosely -- the failure
             // this guards against is a wholesale mix-up, not a few jobs of drift.
-            let piped = q.count(state);
+            let piped = q
+                .count(state)
+                .expect("a healthy queue's counts are all readable");
             let delta = piped.abs_diff(direct);
             assert!(
                 delta < 500,
@@ -567,7 +569,10 @@ async fn reads_consumer_groups_and_pending_state() {
     let conn = conn().await;
     let info = conn.stream_info("keylens:audit").await.unwrap();
 
-    assert!(info.length > 0, "audit stream should have entries");
+    assert!(
+        info.length.is_some_and(|n| n > 0),
+        "audit stream should have entries"
+    );
     assert!(info.entries_added.is_some_and(|n| n > 0));
     assert!(!info.last_generated_id.is_empty());
 
@@ -577,9 +582,9 @@ async fn reads_consumer_groups_and_pending_state() {
         .find(|g| g.name == "processors")
         .expect("the fixture creates a `processors` group");
 
-    assert_eq!(group.consumer_count, 2);
+    assert_eq!(group.consumer_count, Some(2));
     assert!(
-        group.pending > 0,
+        group.pending.is_some_and(|n| n > 0),
         "worker-stuck never acks, so entries stay pending"
     );
     assert!(
@@ -593,14 +598,21 @@ async fn reads_consumer_groups_and_pending_state() {
         .iter()
         .find(|c| c.name == "worker-stuck")
         .expect("stuck consumer should be listed");
-    assert!(stuck.pending > 0, "it holds unacknowledged entries");
+    assert!(
+        stuck.pending.is_some_and(|n| n > 0),
+        "it holds unacknowledged entries"
+    );
 
     let healthy = group
         .consumers
         .iter()
         .find(|c| c.name == "worker-healthy")
         .expect("healthy consumer should be listed");
-    assert_eq!(healthy.pending, 0, "it acknowledges everything it reads");
+    assert_eq!(
+        healthy.pending,
+        Some(0),
+        "it acknowledges everything it reads"
+    );
 
     // Ranking is what makes the pane useful on a group with many consumers.
     let ranked = group.stuck_consumers();
@@ -616,7 +628,7 @@ async fn a_stream_without_groups_reports_none_rather_than_failing() {
     // XINFO GROUPS on a group-less stream returns an empty array, not an error.
     let conn = conn().await;
     let info = conn.stream_info("bull:emails:events").await.unwrap();
-    assert!(info.length > 0);
+    assert!(info.length.is_some_and(|n| n > 0));
     assert!(
         info.groups.is_empty(),
         "BullMQ events streams use XREAD, not consumer groups"
@@ -915,9 +927,14 @@ async fn a_queue_with_a_mistyped_key_still_renders_its_other_counts() {
         .expect("one bad key must not fail the whole listing");
 
     let q = queues.iter().find(|q| q.name == "q").expect("queue listed");
-    assert!(q.paused, "meta still read correctly");
-    assert_eq!(q.count(State::Failed), 1, "the good count survives");
-    assert_eq!(q.count(State::Waiting), 0, "the bad one degrades to zero");
+    assert_eq!(q.paused, Some(true), "meta still read correctly");
+    assert_eq!(q.count(State::Failed), Some(1), "the good count survives");
+    // 0.1.7 asserted this read as 0 -- "nothing waiting" on the one queue that is broken.
+    assert_eq!(
+        q.count(State::Waiting),
+        None,
+        "the bad one is unknown, not zero"
+    );
 
     conn.test_cmd("DEL", vec![meta.into(), wait.into(), failed.into()])
         .await
@@ -1012,7 +1029,7 @@ async fn stream_info_is_skipped_rather_than_failed_without_stream_support() {
     // A stream that exists reads normally through the gate.
     let info = conn.stream_info("bull:emails:events").await.unwrap();
     assert!(
-        info.length > 0 || !info.last_generated_id.is_empty(),
+        info.length.is_some_and(|n| n > 0) || !info.last_generated_id.is_empty(),
         "the fixture events stream should have entries"
     );
 }
@@ -1023,7 +1040,7 @@ async fn every_request_is_answered_even_when_the_scan_is_already_complete() {
     // The UI sets `loading` when it asks for more keys and clears it when a batch arrives.
     // The worker used to `continue` past a `More` on a finished scan, replying with
     // nothing at all -- leaving the status bar spinning on a scan that had ended.
-    use keylens::worker::{Request, Update, Worker};
+    use keylens::worker::{Request, RequestId, ScanProgress, Update, Worker};
     use std::time::Duration;
     use tokio::sync::mpsc;
 
@@ -1031,10 +1048,12 @@ async fn every_request_is_answered_even_when_the_scan_is_already_complete() {
     let (req_tx, req_rx) = mpsc::channel(8);
     let (up_tx, mut up_rx) = mpsc::channel(8);
     tokio::spawn(Worker::new(conn).run(req_rx, up_tx));
+    let scan = RequestId::new(1);
 
     // A pattern that matches nothing, so the scan reaches the end of the keyspace.
     req_tx
         .send(Request::Rescan {
+            scan,
             pattern: Some("keylens:no-such-prefix:*".into()),
             kind: None,
         })
@@ -1047,12 +1066,12 @@ async fn every_request_is_answered_even_when_the_scan_is_already_complete() {
             .await
             .expect("worker answered the rescan")
         {
-            Some(Update::Batch { complete: done, .. }) => {
-                if done {
+            Some(Update::Batch { progress, .. }) => {
+                if progress == ScanProgress::Complete {
                     complete = true;
                     break;
                 }
-                req_tx.send(Request::More).await.unwrap();
+                req_tx.send(Request::More { scan }).await.unwrap();
             }
             other => panic!("unexpected update: {other:?}"),
         }
@@ -1060,15 +1079,15 @@ async fn every_request_is_answered_even_when_the_scan_is_already_complete() {
     assert!(complete, "the scan should reach the end of the keyspace");
 
     // Now ask for more past the end. This must still produce a reply.
-    req_tx.send(Request::More).await.unwrap();
+    req_tx.send(Request::More { scan }).await.unwrap();
     let reply = tokio::time::timeout(Duration::from_secs(5), up_rx.recv())
         .await
         .expect("`More` past the end must be answered, not silently dropped")
         .expect("worker is still alive");
 
     match reply {
-        Update::Batch { complete, keys, .. } => {
-            assert!(complete, "still complete");
+        Update::Batch { progress, keys, .. } => {
+            assert_eq!(progress, ScanProgress::Complete, "still complete");
             assert!(keys.is_empty(), "and there was nothing left to send");
         }
         other => panic!("expected an empty final batch, got {other:?}"),
@@ -1206,7 +1225,7 @@ async fn a_one_round_trip_read_agrees_with_the_sequential_one() {
         .unwrap();
 
     for (key, _, _) in &seed {
-        let (meta, value) = conn.read_key(key).await.unwrap();
+        let keylens_conn::KeyRead { meta, value, .. } = conn.read_key(key).await.unwrap();
 
         // The sequential path, computed independently.
         let head = conn.key_head(key).await.unwrap();
@@ -1229,13 +1248,349 @@ async fn a_one_round_trip_read_agrees_with_the_sequential_one() {
 
     // A key that does not exist reads as missing, not as an error and not as an empty
     // value of whatever type the previous key happened to be.
-    let (meta, value) = conn.read_key("keylens:rk:nope").await.unwrap();
+    let keylens_conn::KeyRead { meta, value, .. } = conn.read_key("keylens:rk:nope").await.unwrap();
     assert_eq!(meta.kind, Kind::None);
-    assert_eq!(meta.size, 0);
+    assert_eq!(meta.size, Some(0));
     assert!(meta.ttl_ms.is_none());
     assert!(matches!(value, KeyValue::Missing), "{value:?}");
 
     for (key, _, _) in &seed {
         conn.test_cmd("UNLINK", vec![(*key).into()]).await.ok();
     }
+}
+
+#[tokio::test]
+#[ignore = "requires docker compose fixtures"]
+async fn every_worker_reply_names_the_request_it_answers() {
+    // The app decides what is stale by id, so the worker must echo the id of the request
+    // each reply answers -- for a detail that was superseded mid-flight as much as for the
+    // one that won, and for a scan whose generation has been replaced.
+    use keylens::worker::{Request, RequestId, Update, Worker};
+    use tokio::sync::mpsc;
+
+    let probe = conn().await;
+    let keys = scan_all(&probe, Some("bull:*:meta"), None).await;
+    let (req_tx, req_rx) = mpsc::channel(16);
+    let (up_tx, mut up_rx) = mpsc::channel(16);
+    tokio::spawn(Worker::new(conn().await).run(req_rx, up_tx));
+    assert!(keys.len() >= 2, "need two keys to switch between: {keys:?}");
+    let (a, b) = (keys[0].clone(), keys[1].clone());
+
+    // Two selections back to back: the first is aborted, but may already have answered.
+    req_tx
+        .send(Request::Select {
+            id: RequestId::new(10),
+            key: a.clone(),
+        })
+        .await
+        .unwrap();
+    req_tx
+        .send(Request::Select {
+            id: RequestId::new(11),
+            key: b.clone(),
+        })
+        .await
+        .unwrap();
+
+    // A `More` for a generation the worker never started must not continue anything.
+    req_tx
+        .send(Request::More {
+            scan: RequestId::new(99),
+        })
+        .await
+        .unwrap();
+
+    let mut saw_b = false;
+    let mut saw_stale_more = false;
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(10);
+    while !(saw_b && saw_stale_more) {
+        let update = tokio::time::timeout_at(deadline, up_rx.recv())
+            .await
+            .expect("worker answered")
+            .expect("worker alive");
+        match update {
+            Update::Detail { id, meta, .. } => {
+                let want = if id == RequestId::new(10) { &a } else { &b };
+                assert_eq!(
+                    &meta.key, want,
+                    "reply {id:?} carried another request's key"
+                );
+                saw_b |= id == RequestId::new(11);
+            }
+            Update::Batch {
+                scan, keys, reset, ..
+            } => {
+                assert_eq!(scan, RequestId::new(99));
+                assert!(keys.is_empty() && !reset, "a stale `More` produced keys");
+                saw_stale_more = true;
+            }
+            other => panic!("unexpected update: {other:?}"),
+        }
+    }
+}
+
+/// Seed `key` with `n` elements of `kind` in batches, replacing whatever was there.
+async fn seed_collection(conn: &Conn, key: &str, cmd: &'static str, n: usize, pairs: bool) {
+    conn.test_cmd("UNLINK", vec![key.into()]).await.ok();
+    for chunk in (0..n).collect::<Vec<_>>().chunks(1_000) {
+        let mut argv: Vec<keylens_conn::Value> = vec![key.into()];
+        for i in chunk {
+            if cmd == "ZADD" {
+                argv.push((*i as i64).into());
+            }
+            argv.push(i.to_string().into());
+            if pairs {
+                argv.push("v".into());
+            }
+        }
+        conn.test_cmd(cmd, argv).await.unwrap();
+    }
+}
+
+#[tokio::test]
+#[ignore = "requires docker compose fixtures"]
+async fn a_first_page_says_whether_it_is_the_whole_value() {
+    // 0.1.7 rendered the first bounded page of every value under `size N` and nothing
+    // else, so 200 rows of a 5,000-element list looked like the list. Coverage must be
+    // `Complete` only when the reply proves it.
+    use keylens_conn::{Coverage, PAGE};
+    let conn = conn().await;
+    if !conn
+        .capabilities()
+        .has(keylens_conn::Feature::CursorCollectionScan)
+    {
+        return; // the sequential path is exercised by the Recached run
+    }
+
+    let cases: [(&str, &str, usize, bool, bool); 6] = [
+        // key, command, elements, field/value pairs, expect complete
+        ("keylens:cov:list-big", "RPUSH", 5_000, false, false),
+        ("keylens:cov:list-page", "RPUSH", PAGE, false, true),
+        ("keylens:cov:list-small", "RPUSH", 3, false, true),
+        ("keylens:cov:hash-big", "HSET", 5_000, true, false),
+        // An intset: SSCAN returns all 500 in one reply with cursor 0, whatever COUNT
+        // says -- so the cap, not the cursor, is what makes this partial.
+        ("keylens:cov:set-intset", "SADD", 500, false, false),
+        ("keylens:cov:zset-small", "ZADD", 10, false, true),
+    ];
+    for (key, cmd, n, pairs, want_complete) in cases {
+        seed_collection(&conn, key, cmd, n, pairs).await;
+        let read = conn.read_key(key).await.unwrap();
+        assert_eq!(read.meta.size, Some(n as u64), "{key}: size");
+        assert_eq!(
+            read.coverage == Coverage::Complete,
+            want_complete,
+            "{key}: {:?} for {n} elements, {} shown",
+            read.coverage,
+            read.value.len()
+        );
+        assert!(read.value.len() <= PAGE, "{key}: page cap exceeded");
+        conn.test_cmd("UNLINK", vec![key.into()]).await.ok();
+    }
+}
+
+#[tokio::test]
+#[ignore = "requires docker compose fixtures"]
+async fn a_string_of_exactly_the_cap_is_complete_and_one_byte_more_is_not() {
+    use keylens_conn::{Coverage, MAX_STRING_BYTES};
+    let conn = conn().await;
+    if !conn.capabilities().has(keylens_conn::Feature::GetRange) {
+        return;
+    }
+    for (len, want) in [
+        (MAX_STRING_BYTES, Coverage::Complete),
+        (
+            MAX_STRING_BYTES + 1,
+            Coverage::Partial {
+                shown: MAX_STRING_BYTES,
+            },
+        ),
+    ] {
+        let key = "keylens:cov:str";
+        conn.test_cmd("SET", vec![key.into(), "x".repeat(len).into()])
+            .await
+            .unwrap();
+        let read = conn.read_key(key).await.unwrap();
+        assert_eq!(read.coverage, want, "{len} bytes");
+        let KeyValue::String(s) = &read.value else {
+            panic!("{:?}", read.value)
+        };
+        assert_eq!(
+            s.contains("truncated"),
+            want != Coverage::Complete,
+            "{len} bytes: truncation marker wrong"
+        );
+        conn.test_cmd("UNLINK", vec![key.into()]).await.ok();
+    }
+}
+
+#[tokio::test]
+#[ignore = "requires docker compose fixtures"]
+async fn a_read_denied_by_acl_is_an_error_not_a_missing_key() {
+    // 0.1.7 read a failed `TYPE` as type `none` and showed "key no longer
+    // exists" -- for a key a pattern ACL merely hides. Redis/Valkey only.
+    let admin = conn().await;
+    if admin.server().vendor == keylens_conn::Vendor::Recached {
+        return;
+    }
+    let user = "keylens-test-pattern";
+    let pass = "keylens-test-pass";
+    let key = "keylens:acl:hash";
+    admin
+        .test_cmd("HSET", vec![key.into(), "f".into(), "v".into()])
+        .await
+        .unwrap();
+    admin
+        .test_cmd(
+            "ACL",
+            vec![
+                "SETUSER".into(),
+                user.into(),
+                "reset".into(),
+                "on".into(),
+                format!(">{pass}").into(),
+                // Key-pattern ACLs are the common production shape. SCAN still lists
+                // every key, but TYPE on one outside the pattern is denied.
+                "~allowed:*".into(),
+                "+@read".into(),
+                "+info".into(),
+                "+ping".into(),
+                "+client|id".into(),
+                "+hello".into(),
+            ],
+        )
+        .await
+        .unwrap();
+
+    let host = url().trim_start_matches("redis://").to_string();
+    let limited = Conn::connect(&format!("redis://{user}:{pass}@{host}"), "acl")
+        .await
+        .expect("restricted user connects");
+    let outcome = limited.read_key(key).await;
+
+    admin
+        .test_cmd("ACL", vec!["DELUSER".into(), user.into()])
+        .await
+        .ok();
+    admin.test_cmd("UNLINK", vec![key.into()]).await.ok();
+
+    match outcome {
+        Err(e) => assert!(
+            e.to_string().to_ascii_lowercase().contains("perm"),
+            "denial should name the permission problem: {e}"
+        ),
+        Ok(read) => assert!(
+            !matches!(read.value, KeyValue::Missing),
+            "a denied read claimed the key no longer exists: {read:?}"
+        ),
+    }
+}
+
+#[tokio::test]
+#[ignore = "requires docker compose fixtures"]
+async fn unbounded_reads_are_refused_before_reaching_the_server() {
+    // Measured with the server's own counter: a refused command must cost nothing.
+    let conn = conn().await;
+    let calls = |info: &str, cmd: &str| -> u64 {
+        info.lines()
+            .find(|l| l.starts_with(&format!("cmdstat_{cmd}:")))
+            .and_then(|l| l.split("calls=").nth(1))
+            .and_then(|r| r.split(',').next())
+            .and_then(|n| n.parse().ok())
+            .unwrap_or(0)
+    };
+    let stats = || async {
+        keylens_conn::value::display_string(
+            &conn
+                .test_cmd("INFO", vec!["commandstats".into()])
+                .await
+                .unwrap(),
+        )
+    };
+    let before = stats().await;
+
+    for (cmd, args) in [
+        ("LRANGE", vec!["k".into(), 0.into(), (-1).into()]),
+        ("XRANGE", vec!["k".into(), "-".into(), "+".into()]),
+        ("SLOWLOG", vec!["GET".into(), (-1).into()]),
+    ] {
+        let err = conn.cmd(cmd, args).await.expect_err("must be refused");
+        assert!(
+            matches!(err, keylens_conn::ConnError::Unbounded { .. }),
+            "{cmd}: {err}"
+        );
+    }
+    assert!(conn.key_scanner(None, 1_000_000, None).is_err());
+
+    let after = stats().await;
+    for cmd in ["lrange", "xrange", "slowlog|get", "slowlog"] {
+        assert_eq!(
+            calls(&before, cmd),
+            calls(&after, cmd),
+            "a refused {cmd} still reached the server"
+        );
+    }
+}
+
+#[tokio::test]
+#[ignore = "requires docker compose fixtures"]
+async fn stream_group_detail_is_one_round_trip_for_any_number_of_groups() {
+    // 0.1.7 issued XINFO CONSUMERS + XPENDING per group, one after another: up to 64
+    // sequential round trips to open one stream key.
+    let conn = conn().await;
+    let key = "keylens:groups:many";
+    conn.test_cmd("UNLINK", vec![key.into()]).await.ok();
+    conn.test_cmd("XADD", vec![key.into(), "*".into(), "f".into(), "v".into()])
+        .await
+        .unwrap();
+    for g in 0..20 {
+        conn.test_cmd(
+            "XGROUP",
+            vec![
+                "CREATE".into(),
+                key.into(),
+                format!("g{g}").into(),
+                "0".into(),
+            ],
+        )
+        .await
+        .unwrap();
+        conn.test_cmd(
+            "XREADGROUP",
+            vec![
+                "GROUP".into(),
+                format!("g{g}").into(),
+                "c".into(),
+                "COUNT".into(),
+                1.into(),
+                "STREAMS".into(),
+                key.into(),
+                ">".into(),
+            ],
+        )
+        .await
+        .unwrap();
+    }
+
+    let started = std::time::Instant::now();
+    let info = conn.stream_info(key).await.unwrap();
+    let elapsed = started.elapsed();
+    conn.test_cmd("UNLINK", vec![key.into()]).await.ok();
+
+    assert_eq!(info.groups.len(), 20);
+    for g in &info.groups {
+        assert_eq!(
+            g.consumers.len(),
+            1,
+            "{}: consumers lost in the pipeline",
+            g.name
+        );
+        assert_eq!(g.pending, Some(1));
+        assert!(
+            !g.pending_min_id.is_empty(),
+            "{}: XPENDING slot misaligned",
+            g.name
+        );
+    }
+    eprintln!("stream_info with 20 groups: {elapsed:?}");
 }

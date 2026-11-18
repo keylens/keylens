@@ -7,10 +7,10 @@
 
 use std::sync::Arc;
 
-use keylens_bullmq::{BullMqLens, EventsStatus, Job, JobRef, QueueSummary, State};
+use keylens_bullmq::{BullMqLens, EventsStatus, Job, JobRef, QueueList, State};
 use keylens_conn::{
-    ClientInfo, ClusterTopology, Conn, Feature, KeyMeta, KeyScanner, KeyValue, Kind, PubSubChannel,
-    ServerInfo, SlowEntry, StreamInfo, Value,
+    Capped, ClientInfo, ClusterTopology, Conn, Coverage, Feature, KeyMeta, KeyScanner, KeyValue,
+    Kind, PubSubChannel, ServerInfo, SlowEntry, StreamInfo, Value,
 };
 use keylens_lens::{Detection, Lens};
 use keylens_ui::PaneState;
@@ -29,79 +29,178 @@ const MAX_TYPED: usize = 1_000;
 const SLOWLOG_ENTRIES: u32 = 128;
 const PUBSUB_CHANNELS: usize = 200;
 /// Job ids fetched per state page.
-const JOB_PAGE: usize = 200;
+pub const JOB_PAGE: usize = 200;
 const JOB_LOG_LINES: usize = 200;
+
+/// Names one request, so its reply can be matched against what the UI still wants.
+///
+/// Replies arrive out of order and after the user has moved on: a key read is cancelled
+/// but may already have sent, a job opened a moment ago answers after the next one was
+/// opened, and a refresh started before a reconnect answers after it. Matching a reply by
+/// its *content* — the key name, the job state — cannot tell those apart, because the
+/// stale reply and the wanted one can name the same thing. An id issued per request can.
+///
+/// Ids are issued by [`crate::app::App`] and are strictly increasing within one session.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Default)]
+pub struct RequestId(u64);
+
+impl RequestId {
+    /// Wrap a raw id. Public so tests and embedders can stage a reply.
+    pub const fn new(raw: u64) -> Self {
+        Self(raw)
+    }
+
+    /// The id after this one. Saturates rather than wrapping: `u64::MAX` requests is
+    /// unreachable, and a wrapped id would match a reply from the very first request.
+    #[must_use]
+    pub const fn next(self) -> Self {
+        Self(self.0.saturating_add(1))
+    }
+}
 
 #[derive(Debug)]
 pub enum Request {
-    /// Start over with a new filter.
+    /// Start over with a new filter. `scan` names the new scan generation; every batch
+    /// produced by it, including the ones `More` asks for, carries it back.
     Rescan {
+        scan: RequestId,
         pattern: Option<String>,
         kind: Option<Kind>,
     },
-    /// Continue the current scan.
-    More,
+    /// Continue the scan generation `scan`.
+    More {
+        scan: RequestId,
+    },
     /// Load metadata and the first value page for one key.
     Select {
+        id: RequestId,
         key: String,
     },
-    RefreshInfo,
+    RefreshInfo {
+        id: RequestId,
+    },
 
-    LoadSlowlog,
-    LoadClients,
-    LoadCluster,
-    LoadPubSub,
+    LoadSlowlog {
+        id: RequestId,
+    },
+    LoadClients {
+        id: RequestId,
+    },
+    LoadCluster {
+        id: RequestId,
+    },
+    LoadPubSub {
+        id: RequestId,
+    },
 
     /// Run every lens detector. Cheap, and it decides whether the queues tab exists.
     Detect,
-    LoadQueues,
+    LoadQueues {
+        id: RequestId,
+    },
     LoadJobs {
+        id: RequestId,
         queue: String,
         state: State,
     },
     LoadJob {
+        id: RequestId,
         queue: String,
-        id: String,
+        job: String,
     },
 }
 
+/// Where a scan stands after a batch.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ScanProgress {
+    /// More of the keyspace is left; `More` continues it.
+    Partial,
+    /// The cursor came back to 0: every key was visited.
+    Complete,
+    /// The scan failed and cannot continue. The batch still carries every key gathered
+    /// before the failure -- they are real keys -- but the tree is not the whole keyspace.
+    Failed(String),
+}
+
+/// A worker reply. Every variant that answers a request carries that request's id, and
+/// that includes the failures: an error is a reply like any other and is just as capable
+/// of being stale.
 #[derive(Debug)]
 pub enum Update {
     Batch {
+        /// The scan generation this batch belongs to (the id of its `Rescan`).
+        scan: RequestId,
         keys: Vec<(String, Option<Kind>)>,
         /// True when this batch starts a new scan, so the UI clears first.
         reset: bool,
-        /// True when the cursor came back to 0 -- the keyspace is fully walked.
-        complete: bool,
+        progress: ScanProgress,
         scanned_pages: usize,
+        /// Keys this scan has seen whose names are not valid UTF-8 and cannot be listed.
+        /// Cumulative for the scan generation.
+        unlisted: u64,
     },
     Detail {
+        id: RequestId,
         meta: Box<KeyMeta>,
         value: Box<KeyValue>,
+        /// Whether `value` is all of it, or the first bounded page.
+        coverage: Coverage,
         /// Groups, consumers and pending state — only for stream keys.
         stream: Option<Box<StreamInfo>>,
     },
-    Info(Box<ServerInfo>),
-    Error(String),
+    /// Reading the key requested by `id` failed.
+    DetailFailed {
+        id: RequestId,
+        key: String,
+        error: String,
+    },
+    Info {
+        id: RequestId,
+        info: Box<ServerInfo>,
+    },
+    /// The stats refresh `id` failed. Reported against the stats pane, never the value
+    /// pane: a failed `INFO` says nothing about the key someone is looking at.
+    InfoFailed {
+        id: RequestId,
+        error: String,
+    },
 
-    Slowlog(PaneState<Vec<SlowEntry>>),
-    Clients(PaneState<Vec<ClientInfo>>),
-    Cluster(PaneState<Box<ClusterTopology>>),
-    PubSub(PaneState<Vec<PubSubChannel>>),
+    Slowlog {
+        id: RequestId,
+        data: PaneState<Vec<SlowEntry>>,
+    },
+    Clients {
+        id: RequestId,
+        data: PaneState<Capped<ClientInfo>>,
+    },
+    Cluster {
+        id: RequestId,
+        data: PaneState<Box<ClusterTopology>>,
+    },
+    PubSub {
+        id: RequestId,
+        data: PaneState<Capped<PubSubChannel>>,
+    },
 
     Detected(Vec<Detection>),
     /// How the live events reader is getting on -- attaching, live, or never going to
     /// work here. The graph reads very differently depending on which.
     EventsStatus(EventsStatus),
     Events(Vec<crate::events::StreamEvent>),
-    Queues(PaneState<Vec<QueueSummary>>),
+    Queues {
+        id: RequestId,
+        data: PaneState<QueueList>,
+    },
     Jobs {
-        state: State,
+        id: RequestId,
         data: PaneState<Vec<JobRef>>,
     },
     /// `None` inside `Ready` means the job was removed between listing and reading, which
     /// happens constantly on a live queue with retention configured.
-    Job(PaneState<Option<Box<JobDetail>>>),
+    Job {
+        id: RequestId,
+        data: PaneState<Option<Box<JobDetail>>>,
+    },
 }
 
 /// A job plus its logs, which are a separate key.
@@ -114,6 +213,10 @@ pub struct JobDetail {
 pub struct Worker {
     conn: Arc<Conn>,
     scanner: Option<tokio::sync::Mutex<KeyScanner>>,
+    /// Generation of `scanner`: the id of the `Rescan` that created it.
+    scan: RequestId,
+    /// Why the current generation's scanner could not be created, if it could not.
+    scan_error: Option<String>,
     pattern: Option<String>,
     kind: Option<Kind>,
     complete: bool,
@@ -152,6 +255,8 @@ impl Worker {
         Self {
             conn: Arc::new(conn),
             scanner: None,
+            scan: RequestId::default(),
+            scan_error: None,
             pattern: None,
             kind: None,
             complete: false,
@@ -167,21 +272,58 @@ impl Worker {
     pub async fn run(mut self, mut rx: Receiver<Request>, tx: Sender<Update>) {
         while let Some(req) = rx.recv().await {
             let update = match req {
-                Request::Rescan { pattern, kind } => {
+                Request::Rescan {
+                    scan,
+                    pattern,
+                    kind,
+                } => {
+                    self.scan = scan;
                     self.pattern = pattern;
                     self.kind = kind;
                     self.complete = false;
-                    self.scanner = Some(tokio::sync::Mutex::new(self.conn.key_scanner(
+                    self.scan_error = None;
+                    match self.conn.key_scanner(
                         self.pattern.as_deref(),
                         SCAN_COUNT,
                         self.server_type_filter(),
-                    )));
-                    self.scan_batch(true).await
+                    ) {
+                        Ok(scanner) => {
+                            self.scanner = Some(tokio::sync::Mutex::new(scanner));
+                            self.scan_batch(true).await
+                        }
+                        Err(e) => {
+                            // Not `None` alone: a missing scanner reads as "nothing left",
+                            // and a `More` would then report this scan complete.
+                            self.scanner = None;
+                            self.scan_error = Some(e.to_string());
+                            Update::Batch {
+                                scan,
+                                keys: Vec::new(),
+                                reset: true,
+                                progress: ScanProgress::Failed(e.to_string()),
+                                scanned_pages: 0,
+                                unlisted: 0,
+                            }
+                        }
+                    }
                 }
                 // A request always gets a reply, including this one. The UI sets `loading`
                 // when it asks for more; answering an already-finished scan with silence
                 // would leave the status bar spinning with nothing on the way.
-                Request::More => self.scan_batch(false).await,
+                //
+                // A `More` for a generation this worker has already replaced cannot
+                // continue the scan it meant. Answering it from the current scanner would
+                // splice the new filter's keys into a tree the UI is about to discard, so
+                // it gets an empty batch under its own generation, which the UI drops.
+                Request::More { scan } if scan != self.scan => Update::Batch {
+                    scan,
+                    keys: Vec::new(),
+                    reset: false,
+                    progress: ScanProgress::Partial,
+                    scanned_pages: 0,
+                    unlisted: 0,
+                },
+                Request::More { .. } => self.scan_batch(false).await,
 
                 // Reading a key runs on its own task, sharing the connection -- fred
                 // multiplexes, so this costs no second handshake.
@@ -190,43 +332,49 @@ impl Worker {
                 // `Detect`, each of which walks up to 40 sequential `SCAN` pages. Against
                 // a server measured at 390ms that queue was sixteen seconds long, and
                 // every keypress made during it looked like a hang.
-                Request::Select { key } => {
-                    self.spawn_detail(key, &tx);
+                Request::Select { id, key } => {
+                    self.spawn_detail(id, key, &tx);
                     continue;
                 }
 
-                Request::RefreshInfo => {
+                Request::RefreshInfo { id } => {
                     // Servers that don't implement `INFO` would otherwise fail this on
                     // every tick and paint the error over whatever pane is open.
                     if !self.conn.has_server_info() {
                         continue;
                     }
-                    self.spawn_info(&tx);
+                    self.spawn_info(id, &tx);
                     continue;
                 }
 
-                Request::LoadSlowlog => Update::Slowlog(
-                    Self::pane(
+                Request::LoadSlowlog { id } => Update::Slowlog {
+                    id,
+                    data: Self::pane(
                         self.conn.capabilities().get(Feature::Slowlog),
                         self.conn.slowlog(SLOWLOG_ENTRIES),
                     )
                     .await,
-                ),
-                Request::LoadClients => Update::Clients(
-                    Self::pane(
+                },
+                Request::LoadClients { id } => Update::Clients {
+                    id,
+                    data: Self::pane(
                         self.conn.capabilities().get(Feature::ClientList),
                         self.conn.client_list(),
                     )
                     .await,
-                ),
-                Request::LoadCluster => Update::Cluster(Self::cluster(self.conn.clone()).await),
-                Request::LoadPubSub => Update::PubSub(
-                    Self::pane(
+                },
+                Request::LoadCluster { id } => Update::Cluster {
+                    id,
+                    data: Self::cluster(self.conn.clone()).await,
+                },
+                Request::LoadPubSub { id } => Update::PubSub {
+                    id,
+                    data: Self::pane(
                         self.conn.capabilities().get(Feature::PubSub),
                         self.conn.pubsub_channels(PUBSUB_CHANNELS),
                     )
                     .await,
-                ),
+                },
 
                 Request::Detect => {
                     let detections = match self.bullmq.detect(&self.conn).await {
@@ -244,15 +392,16 @@ impl Worker {
                     Update::Detected(detections)
                 }
 
-                Request::LoadQueues => {
-                    Update::Queues(match self.bullmq.all_queues(&self.conn).await {
+                Request::LoadQueues { id } => Update::Queues {
+                    id,
+                    data: match self.bullmq.all_queues(&self.conn).await {
                         Ok(q) => PaneState::Ready(q),
                         Err(e) => PaneState::Failed(e.to_string()),
-                    })
-                }
+                    },
+                },
 
-                Request::LoadJobs { queue, state } => Update::Jobs {
-                    state,
+                Request::LoadJobs { id, queue, state } => Update::Jobs {
+                    id,
                     data: match self
                         .bullmq
                         .jobs(&self.conn, &queue, state, 0, JOB_PAGE)
@@ -263,7 +412,10 @@ impl Worker {
                     },
                 },
 
-                Request::LoadJob { queue, id } => Update::Job(self.job(&queue, &id).await),
+                Request::LoadJob { id, queue, job } => Update::Job {
+                    id,
+                    data: self.job(&queue, &job).await,
+                },
             };
 
             // A closed channel means the UI is gone; stop rather than spin.
@@ -276,8 +428,13 @@ impl Worker {
     async fn scan_batch(&mut self, reset: bool) -> Update {
         let mut keys: Vec<String> = Vec::new();
         let mut pages = 0usize;
+        let mut failure: Option<String> = self.scan_error.clone();
 
-        while keys.len() < BATCH_TARGET && pages < MAX_PAGES_PER_BATCH && !self.complete {
+        while failure.is_none()
+            && keys.len() < BATCH_TARGET
+            && pages < MAX_PAGES_PER_BATCH
+            && !self.complete
+        {
             // No scanner means no `Rescan` has been handled yet. In the app that cannot
             // happen — `browse` queues `Rescan` before the event loop starts, and the
             // worker drains the channel in order — but `Worker` is public API, and a
@@ -288,24 +445,37 @@ impl Worker {
                 break;
             };
 
-            let page = match scanner.get_mut().next_page().await {
-                Ok(Some(p)) => p,
+            match scanner.get_mut().next_page().await {
+                Ok(Some(page)) => {
+                    pages += 1;
+                    keys.extend(page);
+                }
                 Ok(None) => {
                     self.complete = true;
                     break;
                 }
-                Err(e) => return Update::Error(e.to_string()),
-            };
-
-            pages += 1;
-            keys.extend(page);
+                // Keep what was gathered: those keys are real. 0.1.7 returned the error
+                // alone, dropping up to 40 pages of keys, and the *next* `More` then saw
+                // the end of fred's stream and reported the keyspace fully walked.
+                Err(e) => {
+                    failure = Some(e.to_string());
+                    break;
+                }
+            }
         }
 
+        let unlisted = self.scanner.as_mut().map_or(0, |s| s.get_mut().unlisted());
         let typed = self.type_keys(keys).await;
         Update::Batch {
+            unlisted,
+            scan: self.scan,
             keys: typed,
             reset,
-            complete: self.complete,
+            progress: match failure {
+                Some(why) => ScanProgress::Failed(why),
+                None if self.complete => ScanProgress::Complete,
+                None => ScanProgress::Partial,
+            },
             scanned_pages: pages,
         }
     }
@@ -352,23 +522,7 @@ impl Worker {
             }
         }
 
-        let requested = self.kind;
-        keys.into_iter()
-            .enumerate()
-            .filter_map(|(i, key)| {
-                // One key failing to type -- deleted mid-batch, say -- costs that key its
-                // tag and nothing else. It used to cost the whole batch its types.
-                let kind = kinds
-                    .get(i)
-                    .and_then(|r| r.as_ref().ok())
-                    .map(|v| Kind::parse(&keylens_conn::value::display_string(v)));
-                if requested.is_some_and(|wanted| kind != Some(wanted)) {
-                    None
-                } else {
-                    Some((key, kind))
-                }
-            })
-            .collect()
+        keep_typed(keys, &kinds, self.kind)
     }
 
     /// Turn a capability + a fallible load into a [`PaneState`].
@@ -438,7 +592,10 @@ impl Worker {
     /// Cancelling is not just tidiness. The UI already discards a reply whose key is no
     /// longer selected, so a superseded read was pure waste -- and on the link this exists
     /// for, waste is measured in whole seconds of the only round trips available.
-    fn spawn_detail(&mut self, key: String, tx: &Sender<Update>) {
+    ///
+    /// Aborting is best effort: the task may already have sent its reply, which is why the
+    /// reply carries `id` and the UI, not this function, decides whether it is current.
+    fn spawn_detail(&mut self, id: RequestId, key: String, tx: &Sender<Update>) {
         if let Some(task) = self.detail_task.take() {
             task.abort();
         }
@@ -446,7 +603,7 @@ impl Worker {
         let conn = self.conn.clone();
         let tx = tx.clone();
         self.detail_task = Some(tokio::spawn(async move {
-            let update = detail(&conn, &key).await;
+            let update = detail(&conn, id, &key).await;
             tx.send(update).await.ok();
         }));
     }
@@ -456,7 +613,7 @@ impl Worker {
     /// Skipping rather than queueing matters once `INFO` takes longer than the tick: the
     /// requests would otherwise stack up, each one spending a round trip the key browser
     /// wanted.
-    fn spawn_info(&mut self, tx: &Sender<Update>) {
+    fn spawn_info(&mut self, id: RequestId, tx: &Sender<Update>) {
         if self.info_task.as_ref().is_some_and(|t| !t.is_finished()) {
             return;
         }
@@ -465,12 +622,47 @@ impl Worker {
         let tx = tx.clone();
         self.info_task = Some(tokio::spawn(async move {
             let update = match conn.refresh_info().await {
-                Ok(info) => Update::Info(Box::new(info)),
-                Err(e) => Update::Error(e.to_string()),
+                Ok(info) => Update::Info {
+                    id,
+                    info: Box::new(info),
+                },
+                Err(e) => Update::InfoFailed {
+                    id,
+                    error: e.to_string(),
+                },
             };
             tx.send(update).await.ok();
         }));
     }
+}
+
+/// Pair each key with its `TYPE` reply, dropping the keys that should not be listed.
+///
+/// One key failing to type -- an ACL on `TYPE`, say -- costs that key its tag and nothing
+/// else. A key whose type came back `none` was deleted between the `SCAN` that listed it
+/// and the `TYPE`, and is dropped: listing it puts a key in the tree the server no longer
+/// holds. With a type filter active, anything not provably of that type is excluded.
+fn keep_typed(
+    keys: Vec<String>,
+    kinds: &[keylens_conn::Result<Value>],
+    requested: Option<Kind>,
+) -> Vec<(String, Option<Kind>)> {
+    keys.into_iter()
+        .enumerate()
+        .filter_map(|(i, key)| {
+            let kind = kinds
+                .get(i)
+                .and_then(|r| r.as_ref().ok())
+                .map(|v| Kind::parse(&keylens_conn::value::display_string(v)));
+            if kind == Some(Kind::None) {
+                return None;
+            }
+            if requested.is_some_and(|wanted| kind != Some(wanted)) {
+                return None;
+            }
+            Some((key, kind))
+        })
+        .collect()
 }
 
 /// One round trip, not five.
@@ -479,15 +671,26 @@ impl Worker {
 /// [`Conn::read_key`] for how, and why it is worth speculating over six types to get it.
 /// Sequentially this was five round trips per keypress, over a second each against a
 /// managed host on another continent, which is what made scrolling the tree feel broken.
-async fn detail(conn: &Conn, key: &str) -> Update {
-    let (meta, value) = match conn.read_key(key).await {
-        Ok(pair) => pair,
-        Err(e) => return Update::Error(e.to_string()),
+async fn detail(conn: &Conn, id: RequestId, key: &str) -> Update {
+    let read = match conn.read_key(key).await {
+        Ok(read) => read,
+        Err(e) => {
+            return Update::DetailFailed {
+                id,
+                key: key.to_string(),
+                error: e.to_string(),
+            };
+        }
     };
 
     // Consumer-group state is the reason to open a stream at all, but it's several extra
     // round trips, so it's fetched only for streams. A failure here degrades to "entries
     // only" rather than failing the whole key.
+    let keylens_conn::KeyRead {
+        meta,
+        value,
+        coverage,
+    } = read;
     let stream = if meta.kind == Kind::Stream {
         conn.stream_info(key).await.ok().map(Box::new)
     } else {
@@ -495,8 +698,50 @@ async fn detail(conn: &Conn, key: &str) -> Update {
     };
 
     Update::Detail {
+        id,
         meta: Box::new(meta),
         value: Box::new(value),
+        coverage,
         stream,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn err() -> keylens_conn::Result<Value> {
+        Err(keylens_conn::ConnError::Reply {
+            cmd: "TYPE",
+            detail: "denied".into(),
+        })
+    }
+
+    #[test]
+    fn keys_deleted_between_scan_and_type_are_not_listed() {
+        // 0.1.7 inserted them with a `-` tag: a key in the tree the server no longer had.
+        let keys = vec![
+            "live".to_string(),
+            "gone".to_string(),
+            "untyped".to_string(),
+        ];
+        let kinds = vec![Ok(Value::from("hash")), Ok(Value::from("none")), err()];
+        let kept = keep_typed(keys, &kinds, None);
+        assert_eq!(
+            kept,
+            vec![
+                ("live".to_string(), Some(Kind::Hash)),
+                ("untyped".to_string(), None),
+            ],
+            "a failed TYPE keeps the key untagged; a `none` drops it"
+        );
+    }
+
+    #[test]
+    fn a_type_filter_excludes_what_it_cannot_prove() {
+        let keys = vec!["h".to_string(), "s".to_string(), "unknown".to_string()];
+        let kinds = vec![Ok(Value::from("hash")), Ok(Value::from("string")), err()];
+        let kept = keep_typed(keys, &kinds, Some(Kind::Hash));
+        assert_eq!(kept, vec![("h".to_string(), Some(Kind::Hash))]);
     }
 }

@@ -9,13 +9,14 @@
 use clap::{Parser, Subcommand};
 use color_eyre::eyre::{Result, eyre};
 
-use keylens::config::{Config, Target};
+use keylens::config::{Config, Target, permission_warning};
 use keylens::{browse, probe};
 use keylens_conn::redact_url;
 
 const DEFAULT_URL: &str = "redis://127.0.0.1:6379";
 
-#[derive(Parser, Debug)]
+// Not `Debug`: it holds the url, password and all.
+#[derive(Parser)]
 #[command(
     name = "keylens",
     version,
@@ -82,6 +83,7 @@ async fn main() -> Result<()> {
         return list_connections();
     }
 
+    warn_if_password_in_argv(&cli);
     let target = resolve_target(&cli)?;
 
     match cli.command {
@@ -114,11 +116,7 @@ fn init_logging(cli: &Cli) -> Result<()> {
 
     match std::env::var_os("KEYLENS_LOG_FILE") {
         Some(path) => {
-            let file = std::fs::OpenOptions::new()
-                .create(true)
-                .append(true)
-                .open(&path)
-                .map_err(|e| eyre!("could not open {}: {e}", path.to_string_lossy()))?;
+            let file = open_log_file(std::path::Path::new(&path))?;
             tracing_subscriber::fmt()
                 .with_env_filter(filter)
                 .with_ansi(false)
@@ -136,9 +134,73 @@ fn init_logging(cli: &Cli) -> Result<()> {
     Ok(())
 }
 
+/// Open the debug log: owner-only, appended, never through a symlink.
+///
+/// Debug logs carry key names, command shapes and server details. 0.1.7 created the file
+/// with the process umask (typically 0644, world-readable) and followed a symlink at the
+/// path, so a pre-planted link in a shared directory redirected the log anywhere the user
+/// could write.
+fn open_log_file(path: &std::path::Path) -> Result<std::fs::File> {
+    if std::fs::symlink_metadata(path).is_ok_and(|m| m.file_type().is_symlink()) {
+        return Err(eyre!(
+            "refusing to log to {}: it is a symbolic link",
+            path.display()
+        ));
+    }
+    let mut options = std::fs::OpenOptions::new();
+    options.create(true).append(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        // Applies when the file is created; an existing file keeps its mode, checked below.
+        options.mode(0o600);
+    }
+    let file = options
+        .open(path)
+        .map_err(|e| eyre!("could not open {}: {e}", path.display()))?;
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        if let Ok(meta) = file.metadata()
+            && meta.permissions().mode() & 0o077 != 0
+        {
+            eprintln!(
+                "warning: log file {} is readable by other users; it can contain key names \
+                 and values. Run: chmod 600 '{}'",
+                path.display(),
+                path.display()
+            );
+        }
+    }
+    Ok(file)
+}
+
+/// Say so, once, when a password arrived on the command line.
+///
+/// Arguments are visible to every local user through `ps` and land in shell history;
+/// the environment and the config file are not visible that way.
+fn warn_if_password_in_argv(cli: &Cli) {
+    let Some(url) = &cli.url else { return };
+    let from_env = std::env::var("KEYLENS_URL").is_ok_and(|env| env == *url);
+    if !from_env && redact_url(url) != *url {
+        eprintln!(
+            "note: the password in --url is visible to other local users via `ps` and is \
+             saved in shell history. Prefer KEYLENS_URL or a named connection in the config \
+             file (`keylens connections` shows where)."
+        );
+    }
+}
+
+fn warn_if_config_is_readable(path: Option<&std::path::Path>, cfg: &Config) {
+    if let Some(warning) = path.and_then(|p| permission_warning(p, cfg)) {
+        eprintln!("{warning}");
+    }
+}
+
 fn list_connections() -> Result<()> {
     let path = Config::default_path();
     let cfg = Config::load_default()?;
+    warn_if_config_is_readable(path.as_deref(), &cfg);
 
     match &path {
         Some(p) => println!("config: {}", p.display()),
@@ -167,8 +229,8 @@ fn list_connections() -> Result<()> {
         // The URL can carry a password, so it is masked rather than printed.
         println!(
             "  {:<width$}  {}{}",
-            c.name,
-            redact_url(&c.url),
+            keylens_ui::format::terminal_safe(&c.name),
+            keylens_ui::format::terminal_safe(&redact_url(&c.url)),
             if c.readonly { "  [readonly]" } else { "" }
         );
     }
@@ -193,6 +255,7 @@ fn resolve_target(cli: &Cli) -> Result<Target> {
         // very different problems and only one of them is the user's to fix by adding an
         // entry they have, in fact, already added.
         let cfg = Config::load_default()?;
+        warn_if_config_is_readable(Config::default_path().as_deref(), &cfg);
         return cfg
             .get(name)
             .map(|c| Target {
